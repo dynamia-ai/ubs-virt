@@ -25,6 +25,7 @@
 #include <thread>
 
 #include "log/ebpf_logger_macros.h"
+#include "utils.h"
 
 void VcpubindCollector::launch(std::string vmName, int timeout, std::atomic<int> &res, double minCpu)
 {
@@ -88,6 +89,12 @@ void VcpubindCollector::monitor_vm_vpu(std::string vmName, int timeout, std::ato
 // Get the binding dictionary
 std::map<std::string, std::string> VcpubindCollector::get_binding_map(std::string vmName)
 {
+    bindmap.clear(); // bindmap 是成员变量，避免上一次调用的结果残留
+    // vmName 会被拼进 shell 命令，只允许字母和数字
+    if (!utils::isValidVmName(vmName)) {
+        EBPF_LOG_ERROR("Invalid vm name, only English letters or numbers are supported.");
+        return bindmap;
+    }
     std::string cmd = "virsh dumpxml " + vmName;
     FILE *pipe = popen(cmd.c_str(), "r");
 

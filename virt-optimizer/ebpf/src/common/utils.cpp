@@ -13,6 +13,7 @@
 
 #include "utils.h"
 
+#include <cctype>
 #include <csignal>
 #include <filesystem>
 #include <fstream>
@@ -147,6 +148,19 @@ const rapidjson::Value getConfigValue(const std::string &prop_path)
     return rapidjson::Value(doc[final_key.c_str()], doc.GetAllocator());
 }
 
+bool isValidVmName(const std::string &vmName)
+{
+    if (vmName.empty()) {
+        return false;
+    }
+    for (auto c : vmName) {
+        if (!isalpha(static_cast<unsigned char>(c)) && !isdigit(static_cast<unsigned char>(c))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 std::string getVmName()
 {
     const rapidjson::Value npuTypeName = getConfigValue("vm_name");
@@ -155,11 +169,9 @@ std::string getVmName()
         return "";
     }
     std::string vmName = npuTypeName.GetString();
-    for (auto c : vmName) {
-        if (!isalpha(c) && !isdigit(c)) {
-            EBPF_LOG_ERROR("Invalid vm name, only English letters or numbers are supported.");
-            return "";
-        }
+    if (!isValidVmName(vmName)) {
+        EBPF_LOG_ERROR("Invalid vm name, only English letters or numbers are supported.");
+        return "";
     }
     return vmName;
 }

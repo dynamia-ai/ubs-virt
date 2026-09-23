@@ -34,6 +34,7 @@ pid_t getDaemonPID(const char *path);
 bool checkProcessName(int pid, const char *name);
 bool checkRunning(const char *path, const char *name);
 const rapidjson::Value getConfigValue(const std::string &key);
+bool isValidVmName(const std::string &vmName);
 std::string getVmName();
 void writeToDisk(const std::vector<std::string> &jsonBuffer, const std::string &outputPath);
 NPUType getNPUType();
