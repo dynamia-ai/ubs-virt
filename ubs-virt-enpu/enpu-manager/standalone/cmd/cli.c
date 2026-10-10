@@ -203,8 +203,8 @@ static void print_usage(const char *prog)
            "[-d <phy_id>] [-u <pod_uid>] [-c <container>]\n");
     printf("                           Allocate vNPU\n");
     printf("                           -r/--request: hbm request (保底预留)\n");
-    printf("                           -l/--limit:   hbm limit (硬边界上�?\n");
-    printf("                           -m:           hbm quota (向后兼容，等同于 -r -l 相同�?\n");
+    printf("                           -l/--limit:   hbm limit (硬边界上限)\n");
+    printf("                           -m:           hbm quota (向后兼容，等同于 -r -l 相同)\n");
     printf("                           -d:           specify physical card ID (>=0 直接分配到该卡；-1 自动选择)\n");
     printf("                           -u:           pod_uid (可选；未指定时默认 pod-<phy>)\n");
     printf("                           -c:           container_name (可选；未指定时默认 container-<phy>-<vnpu>)\n");
@@ -333,8 +333,8 @@ static int cmd_alloc(int argc, char *argv[], const char *host, const char *port)
             return 1;
         }
 
-        int resp_phy_id, resp_vnpu_id, resp_aicore, resp_sched_policy;
-        uint64_t resp_hbm_request, resp_hbm_limit;
+        int resp_phy_id = 0, resp_vnpu_id = 0, resp_aicore = 0, resp_sched_policy = 0;
+        uint64_t resp_hbm_request = 0, resp_hbm_limit = 0;
         char shm_id[128] = "", minor_name[64] = "";
         char resp_pod_uid[128] = "", resp_container[128] = "";
         char resp_die_id[64] = "";
@@ -395,7 +395,7 @@ static int cmd_alloc(int argc, char *argv[], const char *host, const char *port)
         return 1;
     }
 
-    int phy_id_resp, vnpu_id, aicore_quota, sched_policy;
+    int phy_id_resp = 0, vnpu_id = 0, aicore_quota = 0, sched_policy = 0;
     char shm_id[128] = "", minor_name[64] = "";
     char resp_pod_uid[128] = "", resp_container[128] = "";
     char die_id[64] = "";
@@ -549,15 +549,15 @@ static int cmd_swap_status(int argc, char *argv[], const char *host, const char 
 
     char *body = get_body(response);
 
-    uint64_t used, free_space, total;
+    uint64_t used = 0, free_space = 0, total = 0;
     parse_uint64(body, "used", &used);
     parse_uint64(body, "free", &free_space);
     parse_uint64(body, "total", &total);
 
     printf("Swap Buffer Status:\n");
-    printf("  Used:  %llu bytes\n", used);
-    printf("  Free:  %llu bytes\n", free_space);
-    printf("  Total: %llu bytes\n", total);
+    printf("  Used:  %lu bytes\n", used);
+    printf("  Free:  %lu bytes\n", free_space);
+    printf("  Total: %lu bytes\n", total);
     printf("\nSwapped Models:\n%s\n", body);
     return 0;
 }
