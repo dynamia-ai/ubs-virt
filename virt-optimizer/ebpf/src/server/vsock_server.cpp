@@ -137,12 +137,17 @@ void VsockServer::daemonize()
     }
     interval = interval_value.GetInt();
     const rapidjson::Value vmname_value = utils::getConfigValue("vm_name");
-    if (vmname_value.IsNull()) {
+    if (vmname_value.IsNull() || !vmname_value.IsString()) {
         EBPF_LOG_ERROR("Parse config failed, can not find vm_name");
         close(serverFd);
         return;
     }
     std::string vm_name = vmname_value.GetString();
+    if (!utils::isValidVmName(vm_name)) {
+        EBPF_LOG_ERROR("Invalid vm_name in config, only English letters or numbers are supported.");
+        close(serverFd);
+        return;
+    }
     VcpubindCollector::getInstance().launch(vm_name, interval, vcpuRes);
     QEMUCollector::getInstance().launch(vm_name, interval, qemuRes);
     mainLoop(serverFd, context);

@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <fstream>
 #include <iostream>
 #include <map>
 #include <set>
@@ -35,6 +36,23 @@ TEST(VcpuCollectorTest, GetBindingMapSuccess)
     res = collector.get_binding_map("vmname");
 
     EXPECT_EQ(res["1"], "0");
+    VcpuClean();
+}
+
+TEST(VcpuCollectorTest, RejectVmNameInjection)
+{
+    // vm 名里带 shell 元字符时，不能把它拼进命令执行
+    std::string marker = "/tmp/ubs_optimizer_vmname_inject";
+    std::remove(marker.c_str());
+
+    VcpubindCollector &collector = VcpubindCollector::getInstance();
+    std::map<std::string, std::string> res = collector.get_binding_map("vmname; touch " + marker);
+
+    EXPECT_TRUE(res.empty());
+    std::ifstream created(marker);
+    EXPECT_FALSE(created.good());
+    created.close();
+    std::remove(marker.c_str());
     VcpuClean();
 }
 
