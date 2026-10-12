@@ -22,7 +22,7 @@ struct system_event_data {
 
 // Counter for ipi_count
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(key_size, sizeof(u32));
     __uint(value_size, sizeof(u64));
     __uint(max_entries, 1);
@@ -30,7 +30,7 @@ struct {
 
 // Summation of transmission_delay_ns
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(key_size, sizeof(u32));
     __uint(value_size, sizeof(u64));
     __uint(max_entries, 1);
@@ -38,7 +38,7 @@ struct {
 
 // Summation of processing_delay_ns
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(key_size, sizeof(u32));
     __uint(value_size, sizeof(u64));
     __uint(max_entries, 1);
@@ -54,7 +54,7 @@ struct {
 
 // Timestamp of last ipi_entry
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(key_size, sizeof(u32));
     __uint(value_size, sizeof(u64));
     __uint(max_entries, 1);
@@ -80,53 +80,56 @@ undefined
 int handle_ipi_entry()
 {
     u64 now = bpf_ktime_get_ns();
-    bpf_map_update_elem(&ipi_entry_map, &first_item, &now, BPF_ANY);
+    u64 *ipi_entry_timestamp = bpf_map_lookup_elem(&ipi_entry_map, &first_item);
+    if (ipi_entry_timestamp) {
+        *ipi_entry_timestamp = now;
+    }
 
 #if defined(__aarch64__)
     u64 *ipi_raise_timestamp = bpf_map_lookup_elem(&ipi_raise_map, &first_item);
     if (!ipi_raise_timestamp) {
         return 0;
     }
-    u64 *transmission_delay_delta = bpf_map_lookup_elem(&transmission_delay_ns_map, &first_item);
-
-    if (transmission_delay_delta) {
-        __sync_fetch_and_add(transmission_delay_delta, now - (*ipi_raise_timestamp));
-    } else {
-        bpf_map_update_elem(&transmission_delay_ns_map, &first_item, &addr_zero, BPF_ANY);
+    u64 *transmission_delay_accumulator = bpf_map_lookup_elem(&transmission_delay_ns_map, &first_item);
+    if (transmission_delay_accumulator) {
+        *transmission_delay_accumulator += now - (*ipi_raise_timestamp);
     }
 #endif
 
     u64 *last_time = bpf_map_lookup_elem(&last_submit_time, &first_item);
-
     if (!last_time) {
-        bpf_map_update_elem(&last_submit_time, &first_item, &now, BPF_ANY);
         return 0;
     }
-    if (now - (*last_time) > INTERVAL_NS) {
-        bpf_map_update_elem(&last_submit_time, &first_item, &now, BPF_ANY);
-
-        struct system_event_data *event;
-        event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
-        if (!event) {
-            return 0;
-        }
-        u64 *count = bpf_map_lookup_elem(&counter, &first_item);
-        if (count) {
-            event->ipi_count = *count;
-        }
-        u64 *transmission_delay_ns = bpf_map_lookup_elem(&transmission_delay_ns_map, &first_item);
-        if (transmission_delay_ns) {
-            event->transmission_delay_ns = *transmission_delay_ns;
-        }
-        u64 *processing_delay_ns = bpf_map_lookup_elem(&processing_delay_ns_map, &first_item);
-        if (processing_delay_ns) {
-            event->processing_delay_ns = *processing_delay_ns;
-        }
-        bpf_ringbuf_submit(event, 0);
-        bpf_map_update_elem(&counter, &first_item, &addr_zero, BPF_ANY);
-        bpf_map_update_elem(&transmission_delay_ns_map, &first_item, &addr_zero, BPF_ANY);
-        bpf_map_update_elem(&processing_delay_ns_map, &first_item, &addr_zero, BPF_ANY);
+    if (*last_time == 0) {
+        *last_time = now;
+        return 0;
     }
+    if (now - *last_time <= INTERVAL_NS) {
+        return 0;
+    }
+
+    struct system_event_data *event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
+    if (!event) {
+        return 0;
+    }
+
+    u64 *count = bpf_map_lookup_elem(&counter, &first_item);
+    u64 *transmission_delay_ns = bpf_map_lookup_elem(&transmission_delay_ns_map, &first_item);
+    u64 *processing_delay_ns = bpf_map_lookup_elem(&processing_delay_ns_map, &first_item);
+    event->ipi_count = count ? *count : 0;
+    event->transmission_delay_ns = transmission_delay_ns ? *transmission_delay_ns : 0;
+    event->processing_delay_ns = processing_delay_ns ? *processing_delay_ns : 0;
+    if (count) {
+        *count = 0;
+    }
+    if (transmission_delay_ns) {
+        *transmission_delay_ns = 0;
+    }
+    if (processing_delay_ns) {
+        *processing_delay_ns = 0;
+    }
+    *last_time = now;
+    bpf_ringbuf_submit(event, 0);
     return 0;
 }
 
@@ -140,23 +143,17 @@ int handle_ipi_exit()
     u64 now = bpf_ktime_get_ns();
 
     u64 *ipi_entry_timestamp = bpf_map_lookup_elem(&ipi_entry_map, &first_item);
-    if (!ipi_entry_timestamp) {
-        bpf_map_update_elem(&ipi_entry_map, &first_item, &now, BPF_ANY);
+    if (!ipi_entry_timestamp || *ipi_entry_timestamp == 0) {
         return 0;
     }
 
     u64 *count = bpf_map_lookup_elem(&counter, &first_item);
-    if (count) {
-        __sync_fetch_and_add(count, 1);
-    } else {
-        bpf_map_update_elem(&counter, &first_item, &addr_one, BPF_ANY);
-    }
-
     u64 *processing_delay_ns = bpf_map_lookup_elem(&processing_delay_ns_map, &first_item);
+    if (count) {
+        (*count)++;
+    }
     if (processing_delay_ns) {
-        __sync_fetch_and_add(processing_delay_ns, now - (*ipi_entry_timestamp));
-    } else {
-        bpf_map_update_elem(&processing_delay_ns_map, &first_item, &addr_zero, BPF_ANY);
+        *processing_delay_ns += now - (*ipi_entry_timestamp);
     }
     return 0;
 }

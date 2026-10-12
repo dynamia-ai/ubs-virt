@@ -20,6 +20,7 @@
 #include <linux/vm_sockets.h>
 
 #include "log/ebpf_logger_macros.h"
+#include "socket_io.h"
 #include "utils.h"
 
 bool sendData(const DataTable &data)
@@ -35,12 +36,12 @@ bool sendData(const DataTable &data)
         return false;
     }
 
-    // Send structure to server
-
-    auto sentSiz = write(sock, &data, sizeof(data));
-
+    const bool sent = socket_io::writeExact(sock, &data, sizeof(data));
     close(sock);
-    return sentSiz > 0;
+    if (!sent) {
+        EBPF_LOG_WARN("Failed to send complete data to VSOCK server.");
+    }
+    return sent;
 }
 
 // Create and connect a vsock socket
@@ -68,18 +69,13 @@ int createAndConnectVsock(uint32_t host_port)
 
 int getPortBind(void)
 {
-    const rapidjson::Value port_value = utils::getConfigValue("bind_port");
-    if (port_value.IsNull()) {
-        EBPF_LOG_ERROR("Parse config failed, client can not find bind_port");
-        return -1;
-    };
-
-    if (!port_value.IsInt()) {
-        EBPF_LOG_ERROR("bind_port is not an integer");
+    const auto portValue = utils::getConfigUint("bind_port");
+    if (!portValue.has_value()) {
+        EBPF_LOG_ERROR("Parse config failed, bind_port is missing or is not an unsigned integer.");
         return -1;
     }
 
-    int port = port_value.GetInt();
+    int port = static_cast<int>(portValue.value());
     if (port < PORT_LOWER_LIMIT || port > PORT_UPPER_LIMIT) {
         EBPF_LOG_ERROR("bind_port must be a positive integer between 1024 and 49151, current value: " +
                        std::to_string(port));

@@ -97,27 +97,27 @@ void DataDumpThread::doDumpData()
             return;
         }
 
-        std::string dumpDataPath = generateDumpFileName();
-        auto realDumpDataPath = realpath(dumpDataPath.c_str(), nullptr);
-        if (realDumpDataPath == nullptr) {
-            std::cerr << "Failed to normalize path: " << dumpDataPath << std::endl;
-            return;
-        }
-        std::ofstream dst(realDumpDataPath, std::ios::binary);
+        const fs::path dumpDataPath = generateDumpFileName();
+        std::ofstream dst(dumpDataPath, std::ios::binary | std::ios::trunc);
         if (!dst) {
-            std::cerr << "Failed to create backup file: " << dumpDataPath << std::endl;
-            free(realDumpDataPath);
+            std::cerr << "Failed to create backup file: " << dumpDataPath.string() << std::endl;
             return;
         }
         dst << src.rdbuf();
-        EBPF_LOG_INFO("Backup: " + dataPath + " → " + dumpDataPath);
+        if (!dst) {
+            std::cerr << "Failed to write backup file: " << dumpDataPath.string() << std::endl;
+            dst.close();
+            fs::remove(dumpDataPath);
+            return;
+        }
+        dst.close();
+        EBPF_LOG_INFO("Backup: " + dataPath + " -> " + dumpDataPath.string());
         fs::permissions(dumpDataPath, fs::perms::owner_read);
 
         std::ofstream clearFile(dataPath, std::ios::trunc);
         if (!clearFile) {
             std::cerr << "Failed to clear source file: " << dataPath << std::endl;
         }
-        free(realDumpDataPath);
     } catch (const std::exception &ex) {
         std::cerr << "Backup failed: " << ex.what() << std::endl;
     }
@@ -133,7 +133,10 @@ std::string DataDumpThread::generateDumpFileName()
 #else
     localtime_r(&timeT, &tm);
 #endif
-    std::ostringstream oss;
-    oss << dataDir << "/" << dataBaseName << "_" << std::put_time(&tm, "%Y%m%d_%H%M%S") << ".json";
-    return oss.str();
+    std::ostringstream fileName;
+    fileName << dataBaseName << "_" << std::put_time(&tm, "%Y%m%d_%H%M%S") << ".json";
+    if (dataDir.empty()) {
+        return fileName.str();
+    }
+    return (fs::path(dataDir) / fileName.str()).string();
 }

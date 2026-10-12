@@ -69,7 +69,7 @@
           "vm_name": "openeuler",
           "npu_type": "d802",
           "system" : {
-              "ipi_collection": "enable",
+              "ipi_collector": "enable",
               "sched_collector": "enable",
               "numa_collector": "enable"
           }
@@ -84,13 +84,13 @@
       | bind_port | 取值范围：[1024,49151]<br>默认：10101 | 服务侦听端口 | - |
       | vm_name | 默认：openeuler | 虚拟机实例名称 | - |
       | npu_type | 取值：{d802, d803} | NPU设备标识符 | A2使用d802<br>A3 使用d803 |
-      | system-ipi_collector | 取值：{enable, disable}<br>默认：enable | 启用处理器间中断（IPI）监管 | enable：启用<br>disable：关闭 |
-      | system-sched_collector | 取值：{enable, disable}<br>默认：enable | 启用进程调度器分析 | enable：启用<br>disable：关闭 |
-      | system-numa_collector | 取值：{enable, disable}<br>默认：enable | 启用NUMA内存访问监管 | enable：启用<br>disable：关闭 |
+      | system.ipi_collector | 取值：{enable, disable}<br>默认：enable | 启用处理器间中断（IPI）监管 | enable：启用<br>disable：关闭 |
+      | system.sched_collector | 取值：{enable, disable}<br>默认：enable | 启用进程调度器分析 | enable：启用<br>disable：关闭 |
+      | system.numa_collector | 取值：{enable, disable}<br>默认：enable | 启用NUMA内存访问监管 | enable：启用<br>disable：关闭 |
 
       > 说明
       >
-      > - 尽可能将表eBPF指标采集配置说明中的{system-ipi_collector，system-sched_collector，system-numa_collector}全部启用，错误的数据会导致调优项判断异常。
+      > - 尽可能将表eBPF指标采集配置说明中的{system.ipi_collector，system.sched_collector，system.numa_collector}全部启用，错误的数据会导致调优项判断异常。
       > - 虚拟机和物理机的正常通信要求配置免密和主机名解析。
       
    c. 保存配置文件。

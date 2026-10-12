@@ -54,7 +54,11 @@ int main(int argc, char **argv)
                 std::cout << "Stopping ubs-opt-guard failed. ubs-opt-guard is not running." << std::endl;
                 return false;
             }
-            kill(utils::getDaemonPID(PID_FILE_PATH), SIGTERM);
+            const auto pid = utils::getDaemonPID(PID_FILE_PATH);
+            if (!pid.has_value() || kill(pid.value(), SIGTERM) != 0) {
+                std::cout << "Stopping ubs-opt-guard failed. Unable to signal guard." << std::endl;
+                return false;
+            }
             std::cout << "Stopping ubs-opt-guard." << std::endl;
             std::this_thread::sleep_for(std::chrono::seconds(stopTime));
             if (!utils::checkRunning(PID_FILE_PATH, CLI_NAME)) {

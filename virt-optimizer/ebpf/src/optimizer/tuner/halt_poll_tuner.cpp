@@ -15,12 +15,14 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
 #include <iostream>
 #include <queue>
 
 #include "rapidjson/error/en.h"
 
 #include "cmd_executor.h"
+#include "data_file_snapshot.h"
 #include "log/ebpf_logger_macros.h"
 #include "utils.h"
 
@@ -192,29 +194,6 @@ bool HaltPollTuner::checkApply()
 }
 #endif
 
-std::ifstream HaltPollTuner::openDataFile(std::string_view filename)
-{
-    char *dataPath = realpath(std::string().append(DATA_PATH).append(filename).c_str(), nullptr);
-    const std::string path(dataPath);
-    const std::string renamedPath = path + ".bak";
-    if (std::filesystem::exists(renamedPath)) {
-        std::filesystem::remove(renamedPath);
-    }
-    std::filesystem::copy(path, renamedPath);
-    std::ifstream file(renamedPath);
-    free(dataPath);
-    return file;
-}
-
-void HaltPollTuner::closeDataFile(std::string_view filename, std::ifstream &file)
-{
-    char *dataPath = realpath(std::string().append(DATA_PATH).append(filename).append(".bak").c_str(), nullptr);
-    const std::string renamedPath(dataPath);
-    file.close();
-    std::filesystem::remove(renamedPath);
-    free(dataPath);
-}
-
 IPIData HaltPollTuner::parseIPIData(const std::string &rawJson)
 {
     rapidjson::Document doc;
@@ -257,40 +236,37 @@ uint64_t HaltPollTuner::decideHaltpoll(uint64_t maxIPIPerSec)
 void HaltPollTuner::findLastInfer()
 {
     inferData.clear();
-    std::ifstream file;
     try {
-        file = openDataFile(DATA_FILE_NAME);
-        if (!file.is_open()) {
-            isLastCheckSuccess = false;
-            EBPF_LOG_ERROR("Failed to found data file: " + std::string(DATA_PATH) + std::string(DATA_FILE_NAME));
-            return;
+        const std::filesystem::path sourcePath =
+            std::filesystem::path(std::string(DATA_PATH)) / std::string(DATA_FILE_NAME);
+        DataFileSnapshot snapshot(sourcePath);
+        std::ifstream &file = snapshot.stream();
+        std::string rawJson;
+        time_t lastTimestamp = 0;
+        while (std::getline(file, rawJson)) {
+            IPIData ipiData{};
+            try {
+                ipiData = parseIPIData(rawJson);
+            } catch (const std::exception &e) {
+                continue;
+            }
+            if (lastTimestamp != 0 && ipiData.second > lastTimestamp &&
+                ipiData.second - lastTimestamp < MAX_ACCEPTED_INTERVAL &&
+                ipiData.first.ipiCount > static_cast<uint64_t>(INFER_THRESHOLD * (ipiData.second - lastTimestamp))) {
+                // Convert timestamp to duration.
+                ipiData.second = (ipiData.second - lastTimestamp);
+                inferData.push_back(ipiData);
+                // Excessive data is meaningless.
+                if (inferData.size() == MAX_DATA_SIZE) {
+                    break;
+                }
+            }
+            lastTimestamp = ipiData.second;
         }
     } catch (const std::exception &e) {
         isLastCheckSuccess = false;
         EBPF_LOG_WARN("Unable to open data file: " + std::string(e.what()));
         return;
     }
-    std::string rawJson;
-    time_t lastTimestamp = 0;
-    while (std::getline(file, rawJson)) {
-        IPIData ipiData{};
-        try {
-            ipiData = parseIPIData(rawJson);
-        } catch (const std::exception &e) {
-            continue;
-        }
-        if (lastTimestamp != 0 && ipiData.second - lastTimestamp < MAX_ACCEPTED_INTERVAL &&
-            ipiData.first.ipiCount > static_cast<uint64_t>(INFER_THRESHOLD * (ipiData.second - lastTimestamp))) {
-            // Convert timestamp to duration.
-            ipiData.second = (ipiData.second - lastTimestamp);
-            inferData.push_back(ipiData);
-            // Excessive data is meaningless.
-            if (inferData.size() == MAX_DATA_SIZE) {
-                break;
-            }
-        }
-        lastTimestamp = ipiData.second;
-    }
-    closeDataFile(DATA_FILE_NAME, file);
     std::reverse(inferData.begin(), inferData.end());
 }

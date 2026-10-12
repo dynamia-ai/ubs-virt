@@ -14,12 +14,11 @@
 #ifndef UBS_OPT_UTILS_H
 #define UBS_OPT_UTILS_H
 
+#include <optional>
 #include <string>
 #include <vector>
 
 #include <fcntl.h>
-
-#include "rapidjson/document.h"
 
 enum class NPUType
 {
@@ -30,10 +29,11 @@ enum class NPUType
 
 namespace utils {
 pid_t forkWithDir(const char *path);
-pid_t getDaemonPID(const char *path);
+std::optional<pid_t> getDaemonPID(const char *path);
 bool checkProcessName(int pid, const char *name);
 bool checkRunning(const char *path, const char *name);
-const rapidjson::Value getConfigValue(const std::string &key);
+std::optional<std::string> getConfigString(const std::string &key);
+std::optional<unsigned int> getConfigUint(const std::string &key);
 bool isValidVmName(const std::string &vmName);
 std::string getVmName();
 void writeToDisk(const std::vector<std::string> &jsonBuffer, const std::string &outputPath);

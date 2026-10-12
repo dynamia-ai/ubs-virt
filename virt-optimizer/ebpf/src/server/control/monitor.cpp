@@ -13,12 +13,17 @@
 
 #include "monitor.h"
 
+#include <cctype>
+#include <chrono>
 #include <fstream>
+#include <sstream>
+#include <thread>
 
 #include <sys/statvfs.h>
 
 #include "cmd_executor.h"
 #include "log/ebpf_logger_macros.h"
+#include "process_pipe.h"
 
 using u64 = unsigned long long;
 static constexpr const char *DISK_MONITE_PATH = "/var";          // Check the disk space in this directory.
@@ -32,19 +37,42 @@ static constexpr unsigned int OVERLOAD_THRESHOLD = 3; // Overload times == 3 -> 
 
 void Monitor::launch()
 {
+    std::lock_guard<std::mutex> lock(lifecycleMutex_);
+    if (monitorThread_ && monitorThread_->joinable()) {
+        EBPF_LOG_WARN("Disk monitor is already running.");
+        return;
+    }
     guestName = getGuestName();
     if (guestName.empty()) {
         EBPF_LOG_WARN("Monitor failed to start, error code = 2003.");
         return;
     }
+    stopRequested_.store(false, std::memory_order_release);
+    overloadTimes = 0;
     monitorThread_ = std::make_unique<std::thread>(std::thread(&Monitor::mainLoop, this));
 }
 
-[[noreturn]] void Monitor::mainLoop()
+Monitor::~Monitor()
+{
+    stop();
+}
+
+void Monitor::stop()
+{
+    std::lock_guard<std::mutex> lock(lifecycleMutex_);
+    stopRequested_.store(true, std::memory_order_release);
+    stopCondition_.notify_all();
+    if (monitorThread_ && monitorThread_->joinable()) {
+        monitorThread_->join();
+    }
+    monitorThread_.reset();
+}
+
+void Monitor::mainLoop()
 {
     CmdExecutor executor(guestName);
     bool stoppedByAuto = false;
-    while (true) {
+    while (!stopRequested_.load(std::memory_order_acquire)) {
         if (!stoppedByAuto && !checkDisk(DISK_LIMIT) && ++overloadTimes == OVERLOAD_THRESHOLD) {
             EBPF_LOG_WARN("The collector has shut down. Error code: 1001.");
             stoppedByAuto = true;
@@ -62,17 +90,16 @@ void Monitor::launch()
                 EBPF_LOG_WARN("Failed to start the collector. It may have been manually started.");
             }
         }
-        if (!stoppedByAuto) {
-            std::this_thread::sleep_for(std::chrono::seconds(NORMAL_MONITE_INTERVAL_SEC));
-        } else {
-            std::this_thread::sleep_for(std::chrono::seconds(OVERLOAD_MONITE_INTERVAL_SEC));
-        }
+        const auto interval = stoppedByAuto ? OVERLOAD_MONITE_INTERVAL_SEC : NORMAL_MONITE_INTERVAL_SEC;
+        std::unique_lock<std::mutex> lock(waitMutex_);
+        stopCondition_.wait_for(lock, std::chrono::seconds(interval),
+                                [this]() { return stopRequested_.load(std::memory_order_acquire); });
     }
 }
 
 std::string Monitor::getGuestName()
 {
-    FILE *pipe = popen("virsh list", "r");
+    ProcessPipe pipe(popen("virsh list", "r"));
     if (!pipe) {
         EBPF_LOG_ERROR("Failed to retrieve vm information");
         return "";
@@ -81,7 +108,7 @@ std::string Monitor::getGuestName()
     char buffer[BUFFER_SIZE];
     std::string name;
     bool alreadyGet = false;
-    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+    while (fgets(buffer, sizeof(buffer), pipe.get()) != nullptr) {
         unsigned int i = 0;
         while (i < BUFFER_SIZE && buffer[i] == ' ') {
             i += 1;
@@ -99,9 +126,8 @@ std::string Monitor::getGuestName()
         iss >> name >> name;
         alreadyGet = true;
     }
-    pclose(pipe);
-    for (auto c : name) {
-        if (!isalpha(c) && !isdigit(c) && (c != '_') && (c != '-') && c != '.') {
+    for (unsigned char c : name) {
+        if (!std::isalpha(c) && !std::isdigit(c) && (c != '_') && (c != '-') && c != '.') {
             EBPF_LOG_ERROR("The virtual machine name is invalid."
                            "Only characters, numbers, '-', '.' and '_' are allowed.");
             name = "";

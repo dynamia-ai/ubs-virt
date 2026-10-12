@@ -14,11 +14,13 @@
 #include "qemu_isolate_tuner.h"
 
 #include <algorithm>
-#include <cstdlib>
+#include <charconv>
+#include <filesystem>
 #include <iostream>
 #include <string>
 
 #include "cmd_executor.h"
+#include "data_file_snapshot.h"
 #include "log/ebpf_logger_macros.h"
 #include "utils.h"
 
@@ -84,13 +86,12 @@ void QemuIsolTuner::apply()
 
 QemuIsolTuner::ResultCode QemuIsolTuner::checkApply()
 {
-    const rapidjson::Value vmname_value = utils::getConfigValue("vm_name");
-    if (vmname_value.IsNull()) {
+    const std::string vm_name = utils::getVmName();
+    if (vm_name.empty()) {
         isLastCheckSuccess = false;
-        EBPF_LOG_ERROR("Optimizer parse config failed, can not find vm_name.");
+        EBPF_LOG_ERROR("Optimizer parse config failed, vm_name is missing or invalid.");
         return ResultCode::ERROR;
     }
-    std::string vm_name = vmname_value.GetString();
 
     static const char *cmd = "vmtop -b -n 1";
     CmdExecutor executor;
@@ -117,9 +118,23 @@ QemuIsolTuner::ResultCode QemuIsolTuner::checkApply()
         }
         if (line.find(vm_name) != std::string::npos && pid_pos != NOT_FOUND) {
             std::vector<std::string> tokens = splitBySpace(line);
-            pid = static_cast<unsigned int>(std::stoi(tokens[pid_pos]));
+            if (static_cast<size_t>(pid_pos) >= tokens.size()) {
+                EBPF_LOG_WARN("Invalid vmtop output: process row has too few columns.");
+                continue;
+            }
+            const std::string &pidToken = tokens[static_cast<size_t>(pid_pos)];
+            const auto parseResult = std::from_chars(pidToken.data(), pidToken.data() + pidToken.size(), pid);
+            if (parseResult.ec != std::errc() || parseResult.ptr != pidToken.data() + pidToken.size() || pid == 0) {
+                EBPF_LOG_WARN("Invalid vmtop output: PID is not a positive integer.");
+                continue;
+            }
             break;
         }
+    }
+    if (pid == 0) {
+        EBPF_LOG_ERROR("QemuIsolTuner::checkApply did not find a valid QEMU PID.");
+        isLastCheckSuccess = false;
+        return ResultCode::ERROR;
     }
     std::string tasksetCmd = "taskset -p " + std::to_string(pid);
     result = executor.runCommand("taskset -p " + std::to_string(pid));
@@ -176,29 +191,6 @@ std::vector<std::string> QemuIsolTuner::splitBySpace(const std::string &line)
     return tokens;
 }
 
-std::ifstream QemuIsolTuner::openDataFile(std::string_view filename)
-{
-    char *dataPath = realpath(std::string().append(DATA_PATH).append(filename).c_str(), nullptr);
-    const std::string path(dataPath);
-    const std::string renamedPath = path + ".bak";
-    if (std::filesystem::exists(renamedPath)) {
-        std::filesystem::remove(renamedPath);
-    }
-    std::filesystem::copy(path, renamedPath);
-    std::ifstream file(renamedPath);
-    free(dataPath);
-    return file;
-}
-
-void QemuIsolTuner::closeDataFile(std::string_view filename, std::ifstream file)
-{
-    char *dataPath = realpath(std::string().append(DATA_PATH).append(filename).append(".bak").c_str(), nullptr);
-    const std::string renamedPath(dataPath);
-    file.close();
-    std::filesystem::remove(renamedPath);
-    free(dataPath);
-}
-
 void QemuIsolTuner::parseHostData(const std::string &rawJson)
 {
     rapidjson::Document doc;
@@ -233,27 +225,22 @@ void QemuIsolTuner::parseHostData(const std::string &rawJson)
 void QemuIsolTuner::findLastInfer()
 {
     EBPF_LOG_INFO("Checking Qemu isolate tunner.");
-    std::ifstream file;
     try {
-        file = openDataFile(DATA_FILE_NAME);
-        if (!file.is_open()) {
-            isLastCheckSuccess = false;
-            EBPF_LOG_ERROR("Failed to found data file: " + std::string(DATA_PATH) + std::string(DATA_FILE_NAME));
-            return;
+        const std::filesystem::path sourcePath =
+            std::filesystem::path(std::string(DATA_PATH)) / std::string(DATA_FILE_NAME);
+        DataFileSnapshot snapshot(sourcePath);
+        std::ifstream &file = snapshot.stream();
+        std::string rawJson;
+        while (std::getline(file, rawJson)) {
+            try {
+                parseHostData(rawJson);
+            } catch (const std::exception &e) {
+                continue;
+            }
         }
     } catch (const std::exception &e) {
         isLastCheckSuccess = false;
         EBPF_LOG_WARN("Unable to open data file: " + std::string(e.what()));
         return;
     }
-    std::string rawJson;
-    time_t lastTimestamp = 0;
-    while (std::getline(file, rawJson)) {
-        try {
-            parseHostData(rawJson);
-        } catch (const std::exception &e) {
-            continue;
-        }
-    }
-    closeDataFile(DATA_FILE_NAME, std::move(file));
 }

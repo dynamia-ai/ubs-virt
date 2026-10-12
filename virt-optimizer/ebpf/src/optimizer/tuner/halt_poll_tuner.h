@@ -14,7 +14,6 @@
 #ifndef HALT_POLL_TUNER_H
 #define HALT_POLL_TUNER_H
 
-#include <fstream>
 #include <vector>
 
 #include "rapidjson/document.h"
@@ -35,8 +34,6 @@ public:
     void apply() override;
 
 private:
-    static std::ifstream openDataFile(std::string_view filename);
-    static void closeDataFile(std::string_view filename, std::ifstream &file);
     static IPIData parseIPIData(const std::string &rawJson);
     bool checkApply();
     void findLastInfer();

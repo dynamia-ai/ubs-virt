@@ -32,6 +32,7 @@
 #include "data_dump_thread.h"
 #include "data_receiver.h"
 #include "log/ebpf_logger_macros.h"
+#include "socket_io.h"
 #include "utils.h"
 
 namespace fs = std::filesystem;
@@ -42,7 +43,10 @@ constexpr unsigned RECEIVER_BUFFER_SIZE = 10;
 constexpr unsigned FLUSH_INTERVAL = 10;
 constexpr unsigned PORT_NIN_BOUND = 1024;
 constexpr unsigned PORT_MAX_BOUND = 49151;
+constexpr unsigned MIN_SAMPLING_INTERVAL_SEC = 1;
+constexpr unsigned MAX_SAMPLING_INTERVAL_SEC = 600;
 constexpr unsigned LISTEN_QUEUE_SIZE = 5;
+constexpr int CLIENT_READ_TIMEOUT_MS = 5000;
 
 std::atomic<int> qemuRes(-1);
 std::atomic<int> vcpuRes(-1);
@@ -87,9 +91,8 @@ void VsockServer::mainLoop(const int &serverFd, const std::shared_ptr<MutexConte
         }
 
         DataTable data{};
-        ssize_t bytes_read = read(clientFd, &data, sizeof(data));
-        if (bytes_read != sizeof(data)) {
-            EBPF_LOG_WARN("Incomplete data received.");
+        if (!socket_io::readExact(clientFd, &data, sizeof(data), CLIENT_READ_TIMEOUT_MS)) {
+            EBPF_LOG_WARN("Incomplete or timed out VSOCK data received.");
         } else {
             EBPF_LOG_DEBUG("Received JSON:\n" + data.toJson());
             receiver.save(data.toJson(guestName));
@@ -100,7 +103,6 @@ void VsockServer::mainLoop(const int &serverFd, const std::shared_ptr<MutexConte
 
 void stopHandler(int)
 {
-    EBPF_LOG_INFO("Received stop signal.");
     stopFlag = 1;
 }
 
@@ -119,40 +121,63 @@ void VsockServer::daemonize()
         return;
     }
 
-    auto context = std::make_shared<MutexContext>();
     EBPF_LOG_INFO("Starting service.");
-    DataDumpThread dumpThread(data_output_path, context, dumpIntervalSec);
-    dumpThread.start();
-    int serverFd = init();
-    if (serverFd < 0) {
+    const auto intervalValue = utils::getConfigUint("sampling_interval");
+    if (!intervalValue.has_value() || intervalValue.value() < MIN_SAMPLING_INTERVAL_SEC ||
+        intervalValue.value() > MAX_SAMPLING_INTERVAL_SEC) {
+        EBPF_LOG_ERROR("Parse config failed, sampling_interval must be an integer within the range of [" +
+                       std::to_string(MIN_SAMPLING_INTERVAL_SEC) + ", " + std::to_string(MAX_SAMPLING_INTERVAL_SEC) +
+                       "].");
+        unlink(PID_FILE_PATH);
         return;
     }
-    fcntl(serverFd, F_SETFL, O_NONBLOCK);
-    Monitor::getInstance().launch();
-    const rapidjson::Value interval_value = utils::getConfigValue("sampling_interval");
-    if (interval_value.IsNull()) {
-        EBPF_LOG_ERROR("Parse config failed, can not find sampling_interval");
-        close(serverFd);
+    interval = static_cast<int>(intervalValue.value());
+    const auto vmNameValue = utils::getConfigString("vm_name");
+    if (!vmNameValue.has_value()) {
+        EBPF_LOG_ERROR("Parse config failed, vm_name is missing or not a string.");
+        unlink(PID_FILE_PATH);
         return;
     }
-    interval = interval_value.GetInt();
-    const rapidjson::Value vmname_value = utils::getConfigValue("vm_name");
-    if (vmname_value.IsNull() || !vmname_value.IsString()) {
-        EBPF_LOG_ERROR("Parse config failed, can not find vm_name");
-        close(serverFd);
-        return;
-    }
-    std::string vm_name = vmname_value.GetString();
+    const std::string &vm_name = vmNameValue.value();
     if (!utils::isValidVmName(vm_name)) {
         EBPF_LOG_ERROR("Invalid vm_name in config, only English letters or numbers are supported.");
-        close(serverFd);
+        unlink(PID_FILE_PATH);
         return;
     }
+
+    int serverFd = init();
+    if (serverFd < 0) {
+        unlink(PID_FILE_PATH);
+        return;
+    }
+    const int currentFlags = fcntl(serverFd, F_GETFL, 0);
+    if (currentFlags < 0 || fcntl(serverFd, F_SETFL, currentFlags | O_NONBLOCK) < 0) {
+        EBPF_LOG_ERROR("Failed to set VSOCK server socket to non-blocking mode.");
+        close(serverFd);
+        unlink(PID_FILE_PATH);
+        return;
+    }
+
+    stopFlag = 0;
+    qemuRes.store(-1, std::memory_order_release);
+    vcpuRes.store(-1, std::memory_order_release);
+    auto context = std::make_shared<MutexContext>();
+    DataDumpThread dumpThread(data_output_path, context, dumpIntervalSec);
+    dumpThread.start();
+    Monitor::getInstance().launch();
     VcpubindCollector::getInstance().launch(vm_name, interval, vcpuRes);
     QEMUCollector::getInstance().launch(vm_name, interval, qemuRes);
     mainLoop(serverFd, context);
-    unlink(PID_FILE_PATH);
+
+    if (stopFlag) {
+        EBPF_LOG_INFO("Received stop signal.");
+    }
+    QEMUCollector::getInstance().stop();
+    VcpubindCollector::getInstance().stop();
+    Monitor::getInstance().stop();
+    dumpThread.stop();
     close(serverFd);
+    unlink(PID_FILE_PATH);
 }
 
 int VsockServer::init()
@@ -168,19 +193,13 @@ int VsockServer::init()
     addr.svm_cid = VMADDR_CID_HOST; // Host CID=2
 
     // Get the port binding configuration in the configuration file
-    const rapidjson::Value port_value = utils::getConfigValue("bind_port");
-    if (port_value.IsNull()) {
-        EBPF_LOG_ERROR("Parse config failed, server can not find bind_port");
+    const auto portValue = utils::getConfigUint("bind_port");
+    if (!portValue.has_value()) {
+        EBPF_LOG_ERROR("Parse config failed, bind_port is missing or is not an unsigned integer.");
         close(serverFd);
         return -1;
     }
-
-    if (!port_value.IsUint()) {
-        EBPF_LOG_ERROR("bind_port is not an positive integer");
-        close(serverFd);
-        return -1;
-    }
-    auto port = port_value.GetUint();
+    auto port = portValue.value();
     if (port < PORT_NIN_BOUND || port > PORT_MAX_BOUND) {
         EBPF_LOG_ERROR("bind_port must be a positive integer between " + std::to_string(PORT_NIN_BOUND) + " and " +
                        std::to_string(PORT_MAX_BOUND) + ", current value: " + std::to_string(port));
@@ -200,6 +219,6 @@ int VsockServer::init()
         return -1;
     }
 
-    EBPF_LOG_INFO("Server started on port: " + std::to_string(port_value.GetInt()));
+    EBPF_LOG_INFO("Server started on port: " + std::to_string(port));
     return serverFd;
 }

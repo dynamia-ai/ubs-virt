@@ -73,13 +73,11 @@ bool CollectorManager::loadConfig()
 
 void stopHandler(int)
 {
-    EBPF_LOG_INFO("Received stop signal.");
     stopFlag = 1;
 }
 
 void reloadHandler(int)
 {
-    EBPF_LOG_INFO("Received reload signal.");
     reloadFlag = 1;
 }
 
@@ -98,21 +96,27 @@ void CollectorManager::mainLoop()
     struct rlimit rlim = {.rlim_cur = RLIM_INFINITY, .rlim_max = RLIM_INFINITY};
     if (setrlimit(RLIMIT_MEMLOCK, &rlim)) {
         EBPF_LOG_ERROR("Failed to set RLIMIT_MEMLOCK. Collector exit.");
+        unlink(PID_FILE_PATH);
         return;
     }
     if (!loadConfig()) {
         EBPF_LOG_ERROR("Configuration file format error, startup failed.");
+        unlink(PID_FILE_PATH);
         return;
     }
     while (!stopFlag) {
         if (reloadFlag) {
+            reloadFlag = 0;
+            EBPF_LOG_INFO("Received reload signal.");
             if (!loadConfig()) {
                 EBPF_LOG_ERROR("Configuration file format error, ebpf collector exited.");
                 break;
             }
-            reloadFlag = false;
         }
         std::this_thread::sleep_for(std::chrono::seconds(WAITING_SIGNALS_INTERVAL_SEC));
+    }
+    if (stopFlag) {
+        EBPF_LOG_INFO("Received stop signal.");
     }
     for (auto collector : collectors) {
         if (collector.second->checkRunning()) {
@@ -125,7 +129,7 @@ void CollectorManager::mainLoop()
 
 CollectorManager::CollectorManager()
 {
-    collectors.emplace("ipi_collection", &IPICollector::getInstance());
+    collectors.emplace("ipi_collector", &IPICollector::getInstance());
     collectors.emplace("sched_collector", &SchedCollector::getInstance());
     collectors.emplace("numa_collector", &NumaCollector::getInstance());
 }
@@ -174,6 +178,10 @@ bool CollectorManager::launchCollector(const rapidjson::Document &doc)
             EBPF_LOG_ERROR("Config file format error. "
                            "Collector '" +
                            collectorName + "' not found.");
+            return false;
+        }
+        if (!it->value.IsString()) {
+            EBPF_LOG_ERROR("Config file format error. Value of '" + collectorName + "' should be a string.");
             return false;
         }
         std::string flag = it->value.GetString();

@@ -17,6 +17,7 @@
 #include <utility>
 
 #include "log/ebpf_logger_macros.h"
+#include "process_pipe.h"
 
 constexpr unsigned int BUFFER_SIZE = 255; // Buffer for accepting command output
 
@@ -32,23 +33,23 @@ std::pair<bool, std::string> CmdExecutor::runCommand(const std::string &cmd)
         // Whitelist control
         cmdChar = "ssh " + hostname + " \" " + cmd + " \" 2>&1";
     }
-    FILE *pipe = popen(cmdChar.c_str(), "r");
+    ProcessPipe pipe(popen(cmdChar.c_str(), "r"));
     if (!pipe) {
         EBPF_LOG_ERROR("Failed to run command.");
         return std::make_pair(false, "");
     }
     std::string output;
-    static char buf[BUFFER_SIZE];
+    char buf[BUFFER_SIZE];
     // Waiting for the guest to close the pipe.
-    while (fgets(buf, sizeof(buf), pipe) != nullptr) {
+    while (fgets(buf, sizeof(buf), pipe.get()) != nullptr) {
         output.append(buf);
     }
 
-    auto statusCode = static_cast<unsigned int>(pclose(pipe));
+    const int closeResult = pipe.close();
     malloc_trim(0);
-    if (WIFEXITED(statusCode) && (WEXITSTATUS(statusCode) == 0)) {
+    if (closeResult != -1 && WIFEXITED(closeResult) && WEXITSTATUS(closeResult) == 0) {
         return std::make_pair(true, std::move(output));
     }
-    EBPF_LOG_ERROR("Command return non-zero value. Status code: " + std::to_string(statusCode));
+    EBPF_LOG_ERROR("Command return non-zero value. Status code: " + std::to_string(closeResult));
     return std::make_pair(false, std::move(output));
 }

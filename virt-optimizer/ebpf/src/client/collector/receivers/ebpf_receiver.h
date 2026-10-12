@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <thread>
 
 #include "data_struct.h"
@@ -26,18 +27,21 @@ public:
 
     void setSamplingInterval(unsigned int newSamplingInterval);
 
-    static EBPFReceiver &getInstance();
+    void accumulate(const IpiInterrupt &event);
+    void accumulate(const SchedSwitch &event);
+    void accumulate(const NumaSwitch &event);
 
-    std::shared_ptr<DataTable> dataBuffer{std::make_shared<DataTable>()};
+    static EBPFReceiver &getInstance();
 
 private:
     static constexpr unsigned int SAMPLING_INTERVAL_DEFAULT = 30;
 
     [[noreturn]] void mainLoop();
+    DataTable takeSnapshot();
 
     std::atomic<unsigned int> samplingInterval_{SAMPLING_INTERVAL_DEFAULT};
-
-    std::shared_ptr<DataTable> readBuffer_{std::make_shared<DataTable>()};
+    DataTable dataBuffer_{};
+    std::mutex bufferMutex_;
 
     std::unique_ptr<std::thread> receiverThread_{nullptr};
 };

@@ -66,10 +66,22 @@ TEST(CollectorManagerTest, LaunchCollectorTest)
     EXPECT_FALSE(mgr.launchCollector(doc)); // collector 中无有效项
 
     doc.SetObject();
+    rapidjson::Value legacySystemObj(rapidjson::kObjectType);
+    legacySystemObj.AddMember("ipi_collection", "enable", doc.GetAllocator());
+    doc.AddMember("system", legacySystemObj, doc.GetAllocator());
+    EXPECT_FALSE(mgr.launchCollector(doc));
+
+    doc.SetObject();
     rapidjson::Value systemObj2(rapidjson::kObjectType);
-    systemObj2.AddMember("ipi_collection", "invalid", doc.GetAllocator());
+    systemObj2.AddMember("ipi_collector", "invalid", doc.GetAllocator());
     doc.AddMember("system", systemObj2, doc.GetAllocator());
-    EXPECT_FALSE(mgr.launchCollector(doc)); // ipi_collection值不是enable或disable
+    EXPECT_FALSE(mgr.launchCollector(doc)); // ipi_collector 值不是 enable 或 disable
+
+    doc.SetObject();
+    rapidjson::Value systemObj3(rapidjson::kObjectType);
+    systemObj3.AddMember("ipi_collector", 1, doc.GetAllocator());
+    doc.AddMember("system", systemObj3, doc.GetAllocator());
+    EXPECT_FALSE(mgr.launchCollector(doc)); // collector配置值不是字符串
 }
 
 TEST(CollectorManagerTest, DaemonizeTest)

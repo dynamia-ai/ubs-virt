@@ -19,7 +19,17 @@ ubs-opt stop_ebpf
 > 说明
 >
 > 执行该命令后，ubs-optimizer将停止采集虚拟机性能数据。
-说明：
+
+## 重新加载采集配置
+
+```bash
+ubs-opt reload_ebpf
+```
+
+> 说明
+>
+> 修改 `/usr/local/sbin/ubs-optimizer/config.json` 后，在采集进程运行期间执行该命令可重新加载配置。
+> 如果采集进程未运行或信号发送失败，命令会返回失败。
 
 ## 示例
 

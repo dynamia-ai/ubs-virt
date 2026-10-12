@@ -14,6 +14,10 @@
 #ifndef MONITOR_H
 #define MONITOR_H
 
+#include <atomic>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -22,17 +26,23 @@ public:
     Monitor(const Monitor &) = delete;
     Monitor &operator=(const Monitor &) = delete;
     static Monitor &getInstance();
+    ~Monitor();
     void launch();
+    void stop();
 
 private:
     Monitor() = default;
 
-    [[noreturn]] void mainLoop();
+    void mainLoop();
     static bool checkDisk(unsigned int limitPercent);
     static std::string getGuestName();
 
     std::string guestName;
     std::unique_ptr<std::thread> monitorThread_;
+    std::atomic<bool> stopRequested_{false};
+    std::mutex lifecycleMutex_;
+    std::mutex waitMutex_;
+    std::condition_variable stopCondition_;
     unsigned int overloadTimes{0}; // Max value: 3
 };
 

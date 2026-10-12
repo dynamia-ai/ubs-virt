@@ -21,7 +21,7 @@ struct system_event_data {
 
 // Counter for move_count
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(key_size, sizeof(u32));
     __uint(value_size, sizeof(u64));
     __uint(max_entries, 1);
@@ -29,61 +29,63 @@ struct {
 
 // Counter for swap_count
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(key_size, sizeof(u32));
     __uint(value_size, sizeof(u64));
     __uint(max_entries, 1);
 } swap_counter SEC(".maps");
+
+static __always_inline void submit_event_if_due(u64 now)
+{
+    u64 *last_time = bpf_map_lookup_elem(&last_submit_time, &first_item);
+    if (!last_time) {
+        return;
+    }
+    if (*last_time == 0) {
+        *last_time = now;
+        return;
+    }
+    if (now - *last_time <= INTERVAL_NS) {
+        return;
+    }
+
+    struct system_event_data *event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
+    if (!event) {
+        return;
+    }
+    u64 *move_count = bpf_map_lookup_elem(&move_counter, &first_item);
+    u64 *swap_count = bpf_map_lookup_elem(&swap_counter, &first_item);
+    event->move_count = move_count ? *move_count : 0;
+    event->swap_count = swap_count ? *swap_count : 0;
+    if (move_count) {
+        *move_count = 0;
+    }
+    if (swap_count) {
+        *swap_count = 0;
+    }
+    *last_time = now;
+    bpf_ringbuf_submit(event, 0);
+}
 
 SEC("tracepoint/sched/sched_move_numa")
 int handle_sched_move_numa()
 {
     u64 *count = bpf_map_lookup_elem(&move_counter, &first_item);
     if (count) {
-        __sync_fetch_and_add(count, 1);
-    } else {
-        bpf_map_update_elem(&move_counter, &first_item, &addr_one, BPF_ANY);
+        (*count)++;
     }
-
+    submit_event_if_due(bpf_ktime_get_ns());
     return 0;
 }
 
 SEC("tracepoint/sched/sched_swap_numa")
 int handle_sched_swap_numa()
 {
-    u64 now = bpf_ktime_get_ns();
-    u64 *count = bpf_map_lookup_elem(&swap_counter, &first_item);
-    if (count) {
-        __sync_fetch_and_add(count, 1);
-    } else {
-        bpf_map_update_elem(&swap_counter, &first_item, &addr_one, BPF_ANY);
+    u64 *swap_count = bpf_map_lookup_elem(&swap_counter, &first_item);
+    if (swap_count) {
+        (*swap_count)++;
     }
-
-    u64 *last_time = bpf_map_lookup_elem(&last_submit_time, &first_item);
-    if (!last_time) {
-        bpf_map_update_elem(&last_submit_time, &first_item, &now, BPF_ANY);
-        return 0;
-    }
-
-    if (now - (*last_time) > INTERVAL_NS) {
-        bpf_map_update_elem(&last_submit_time, &first_item, &now, BPF_ANY);
-        struct system_event_data *event;
-        event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
-        if (!event) {
-            return 0;
-        }
-        u64 *move_count = bpf_map_lookup_elem(&move_counter, &first_item);
-        if (move_count) {
-            event->move_count = *move_count;
-        }
-        u64 *swap_count = bpf_map_lookup_elem(&swap_counter, &first_item);
-        if (swap_count) {
-            event->swap_count = *swap_count;
-        }
-        bpf_ringbuf_submit(event, 0);
-        bpf_map_update_elem(&move_counter, &first_item, &addr_zero, BPF_ANY);
-        bpf_map_update_elem(&swap_counter, &first_item, &addr_zero, BPF_ANY);
-    }
+    submit_event_if_due(bpf_ktime_get_ns());
     return 0;
 }
 

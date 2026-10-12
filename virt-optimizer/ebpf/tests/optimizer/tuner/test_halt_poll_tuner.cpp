@@ -2,6 +2,7 @@
  * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
  */
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <vector>
@@ -239,15 +240,5 @@ TEST(HaltPollTunerTest, FindLastInferCase1)
     MOCKER(&HaltPollTuner::parseIPIData).stubs().will(returnObjectList(std::make_pair(ipiInterrupt, timestamp)));
     std::shared_ptr<HaltPollTuner> tuner = std::make_shared<HaltPollTuner>();
     tuner->findLastInfer();
-    Mock_Clean();
-}
-
-TEST(HaltPollTunerTest, FindLastInferCase2)
-{
-    char ret[] = "abc";
-    char *cur = ret;
-    MOCKER(&realpath).expects(once()).with(any()).will(returnValue(cur));
-    std::shared_ptr<HaltPollTuner> tuner = std::make_shared<HaltPollTuner>();
-    EXPECT_NO_THROW(tuner->findLastInfer());
     Mock_Clean();
 }

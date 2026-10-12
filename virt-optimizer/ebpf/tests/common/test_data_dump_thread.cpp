@@ -79,22 +79,34 @@ TEST_F(DataDumpThreadTest, IsOversizeTest)
 // 测试 doDumpData() 方法
 TEST_F(DataDumpThreadTest, DoDumpDataTest)
 {
-    DataDumpThread thread("test_data.json", createContext(), 1);
-
-    // 生成备份文件名
-    std::string dumpPath = thread.generateDumpFileName();
+    const fs::path sourcePath = "test_dump_dir/test_data.json";
+    std::ofstream source(sourcePath);
+    source << "test content";
+    source.close();
+    DataDumpThread thread(sourcePath.string(), createContext(), 1);
 
     // 执行备份
     thread.doDumpData();
 
-    // 验证备份文件存在
-    EXPECT_FALSE(fs::exists(dumpPath));
-
     // 验证原文件被清空
-    std::ifstream src("test_data.json");
+    std::ifstream src(sourcePath);
     EXPECT_TRUE(src);
     std::string content((std::istreambuf_iterator<char>(src)), std::istreambuf_iterator<char>());
-    EXPECT_FALSE(content.empty());
+    EXPECT_TRUE(content.empty());
+
+    fs::path dumpPath;
+    for (const auto &entry : fs::directory_iterator("test_dump_dir")) {
+        const std::string fileName = entry.path().filename().string();
+        if (fileName.rfind("test_data_", 0) == 0) {
+            dumpPath = entry.path();
+            break;
+        }
+    }
+    ASSERT_FALSE(dumpPath.empty());
+    std::ifstream backup(dumpPath);
+    ASSERT_TRUE(backup);
+    std::string backupContent((std::istreambuf_iterator<char>(backup)), std::istreambuf_iterator<char>());
+    EXPECT_EQ(backupContent, "test content");
     mockcpp::GlobalMockObject::verify();
     mockcpp::GlobalMockObject::reset();
 }

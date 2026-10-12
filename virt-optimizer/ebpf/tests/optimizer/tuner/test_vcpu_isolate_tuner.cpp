@@ -48,16 +48,6 @@ TEST(VCPUIsolTunerTest, ApplyAdvice)
     EXPECT_NE(output.find("Enable Exclusive vCPU"), std::string::npos);
 }
 
-TEST(VCPUIsolTunerTest, OpenNonExistentFile)
-{
-    VCPUIsolTuner tuner;
-    try {
-        tuner.openDataFile("non_existent.json");
-        FAIL() << "Expected exception not thrown";
-    } catch (const std::exception &e) {
-    }
-}
-
 TEST(VCPUIsolTunerTest, ParseInvalidJson)
 {
     const std::string invalidJson = {"invalid_key"};
@@ -141,15 +131,26 @@ TEST(VCPUIsolTunerTest, ParseValidJsonWithIntervalIsZero)
     EXPECT_THROW(tuner.parseHostData(validJson), std::runtime_error);
 }
 
-TEST(VCPUIsolTunerTest, TestFindLastInferCase1)
+TEST(VCPUIsolTunerTest, ParseRejectsIntervalAboveConfiguredMaximum)
 {
-    char ret_vcpu[] = "abc";
-    char *cur_vcpu = ret_vcpu;
-    MOCKER(realpath).stubs().with(any()).will(returnValue(cur_vcpu));
+    const std::string json = R"({
+        "guest_name": "test",
+        "data_table": {"host_preempt_vmcore_count": 10},
+        "interval": 601
+    })";
     VCPUIsolTuner tuner;
-    EXPECT_NO_THROW(tuner.findLastInfer());
-    mockcpp::GlobalMockObject::verify();
-    mockcpp::GlobalMockObject::reset();
+    EXPECT_THROW(tuner.parseHostData(json), std::runtime_error);
+}
+
+TEST(VCPUIsolTunerTest, ParseRejectsNegativePreemptCount)
+{
+    const std::string json = R"({
+        "guest_name": "test",
+        "data_table": {"host_preempt_vmcore_count": -1},
+        "interval": 30
+    })";
+    VCPUIsolTuner tuner;
+    EXPECT_THROW(tuner.parseHostData(json), std::runtime_error);
 }
 
 TEST(VCPUIsolTunerTest, CheckCase1)

@@ -89,3 +89,60 @@ TEST(VcpuCollectorTest, MonitorVmVcpuSuccess)
     EXPECT_EQ(res, 1);
     VcpuClean();
 }
+
+TEST(VcpuCollectorTest, ParseTopOutputSkipsMalformedRows)
+{
+    VcpubindCollector &collector = VcpubindCollector::getInstance();
+    collector.pcpu_preempt_count = 0;
+    const std::set<std::string> boundCores = {"1"};
+    const std::string data = "PID USER %CPU COMMAND P\n"
+                             "\n"
+                             "100 root\n"
+                             "101 root invalid worker 1\n"
+                             "102 root 5.0 worker 1\n";
+
+    EXPECT_NO_THROW(collector.parse_top_output(data, boundCores, 1.0));
+    EXPECT_EQ(collector.pcpu_preempt_count, 1);
+}
+
+TEST(VcpuCollectorTest, SetIndexRejectsMissingRequiredColumns)
+{
+    VcpubindCollector &collector = VcpubindCollector::getInstance();
+
+    EXPECT_FALSE(collector.set_index("PID USER %CPU COMMAND"));
+    EXPECT_TRUE(collector.set_index("PID USER %CPU COMMAND P"));
+}
+
+TEST(VcpuCollectorTest, StopInterruptsWaitAndCanBeCalledTwice)
+{
+    VcpubindCollector &collector = VcpubindCollector::getInstance();
+    collector.stop();
+    collector.stopRequested_.store(false);
+    collector.vcpubindCollectorThread_ = std::make_unique<std::thread>([&collector]() {
+        std::unique_lock<std::mutex> lock(collector.waitMutex_);
+        collector.stopCondition_.wait_for(lock, std::chrono::hours(1),
+                                          [&collector]() { return collector.stopRequested_.load(); });
+    });
+
+    collector.stop();
+    EXPECT_EQ(collector.vcpubindCollectorThread_.get(), nullptr);
+    EXPECT_NO_THROW(collector.stop());
+}
+
+TEST(VcpuCollectorTest, LaunchDoesNotReplaceRunningThread)
+{
+    VcpubindCollector &collector = VcpubindCollector::getInstance();
+    collector.stop();
+    collector.stopRequested_.store(false);
+    collector.vcpubindCollectorThread_ = std::make_unique<std::thread>([&collector]() {
+        std::unique_lock<std::mutex> lock(collector.waitMutex_);
+        collector.stopCondition_.wait_for(lock, std::chrono::hours(1),
+                                          [&collector]() { return collector.stopRequested_.load(); });
+    });
+    std::thread *runningThread = collector.vcpubindCollectorThread_.get();
+    std::atomic<int> result{-1};
+
+    collector.launch("testvm", 1, result);
+    EXPECT_EQ(collector.vcpubindCollectorThread_.get(), runningThread);
+    collector.stop();
+}
