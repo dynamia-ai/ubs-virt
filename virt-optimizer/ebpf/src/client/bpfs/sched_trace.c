@@ -21,7 +21,7 @@ struct system_event_data {
 
 // Counter for sched_switch_count
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(key_size, sizeof(u32));
     __uint(value_size, sizeof(u64));
     __uint(max_entries, 1);
@@ -29,66 +29,63 @@ struct {
 
 // Counter for sched_migrate_count
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(key_size, sizeof(u32));
     __uint(value_size, sizeof(u64));
     __uint(max_entries, 1);
 } sched_migrate_counter SEC(".maps");
+
+static __always_inline void submit_event_if_due(u64 now)
+{
+    u64 *last_time = bpf_map_lookup_elem(&last_submit_time, &first_item);
+    if (!last_time) {
+        return;
+    }
+    if (*last_time == 0) {
+        *last_time = now;
+        return;
+    }
+    if (now - *last_time <= INTERVAL_NS) {
+        return;
+    }
+
+    struct system_event_data *event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
+    if (!event) {
+        return;
+    }
+    u64 *switch_count = bpf_map_lookup_elem(&sched_switch_counter, &first_item);
+    u64 *migrate_count = bpf_map_lookup_elem(&sched_migrate_counter, &first_item);
+    event->sched_switch_count = switch_count ? *switch_count : 0;
+    event->sched_migrate_count = migrate_count ? *migrate_count : 0;
+    if (switch_count) {
+        *switch_count = 0;
+    }
+    if (migrate_count) {
+        *migrate_count = 0;
+    }
+    *last_time = now;
+    bpf_ringbuf_submit(event, 0);
+}
 
 SEC("tracepoint/sched/sched_switch")
 int handle_sched_switch()
 {
     u64 *count = bpf_map_lookup_elem(&sched_switch_counter, &first_item);
     if (count) {
-        __sync_fetch_and_add(count, 1);
-    } else {
-        bpf_map_update_elem(&sched_switch_counter, &first_item, &addr_one, BPF_ANY);
+        (*count)++;
     }
+    submit_event_if_due(bpf_ktime_get_ns());
     return 0;
 }
 
 SEC("tracepoint/sched/sched_migrate_task")
 int handle_sched_migrate()
 {
-    u64 now = bpf_ktime_get_ns();
-
-    u64 *count = bpf_map_lookup_elem(&sched_migrate_counter, &first_item);
-    if (count) {
-        __sync_fetch_and_add(count, 1);
-    } else {
-        bpf_map_update_elem(&sched_migrate_counter, &addr_zero, &addr_one, BPF_ANY);
+    u64 *migrate_count = bpf_map_lookup_elem(&sched_migrate_counter, &first_item);
+    if (migrate_count) {
+        (*migrate_count)++;
     }
-
-    u64 *last_time = bpf_map_lookup_elem(&last_submit_time, &first_item);
-    if (!last_time) {
-        bpf_map_update_elem(&last_submit_time, &addr_zero, &now, BPF_ANY);
-        return 0;
-    }
-
-    if (now - (*last_time) > INTERVAL_NS) {
-        bpf_map_update_elem(&last_submit_time, &first_item, &now, BPF_ANY);
-        struct system_event_data *event;
-        event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
-        if (!event) {
-            return 0;
-        }
-        u64 *switch_count = bpf_map_lookup_elem(&sched_switch_counter, &first_item);
-        if (switch_count) {
-            event->sched_switch_count = *switch_count;
-        } else {
-            event->sched_switch_count = 0;
-        }
-        u64 *migrate_count = bpf_map_lookup_elem(&sched_migrate_counter, &first_item);
-        if (migrate_count) {
-            event->sched_migrate_count = *migrate_count;
-        } else {
-            event->sched_migrate_count = 0;
-        }
-
-        bpf_ringbuf_submit(event, 0);
-        bpf_map_update_elem(&sched_switch_counter, &first_item, &addr_zero, BPF_ANY);
-        bpf_map_update_elem(&sched_migrate_counter, &first_item, &addr_zero, BPF_ANY);
-    }
+    submit_event_if_due(bpf_ktime_get_ns());
     return 0;
 }
 

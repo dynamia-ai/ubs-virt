@@ -15,6 +15,8 @@
 #define QEMU_COLLECTOR_H
 
 #include <atomic>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -27,7 +29,10 @@ public:
 
     QEMUCollector &operator=(const QEMUCollector &) = delete;
 
+    ~QEMUCollector();
+
     void launch(std::string vm_name, double timeout, std::atomic<int> &res);
+    void stop();
 
 private:
     void monitor_qemu_threads(std::string vm_name, double timeout, std::atomic<int> &res);
@@ -39,6 +44,8 @@ private:
     int findPIndex(const std::vector<std::string> &tokens);
 
     std::unique_ptr<std::thread> QEMUCollectorThread_;
+    std::atomic<bool> stopRequested_{false};
+    std::mutex lifecycleMutex_;
 
     int cpu_pos = -1;
     int mv_count = -1;

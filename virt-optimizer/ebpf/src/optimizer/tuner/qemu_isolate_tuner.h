@@ -37,8 +37,6 @@ private:
         FALSE,
         ERROR,
     };
-    static std::ifstream openDataFile(std::string_view);
-    static void closeDataFile(std::string_view, std::ifstream);
     static void parseHostData(const std::string &rawJson);
     void findLastInfer();
     QemuIsolTuner::ResultCode checkApply();

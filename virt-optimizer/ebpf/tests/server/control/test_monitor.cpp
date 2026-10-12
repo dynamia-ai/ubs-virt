@@ -1,8 +1,12 @@
 /*
 * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
  */
+#include <chrono>
 #include <cstdio>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <sys/statvfs.h>
@@ -94,4 +98,37 @@ TEST(MonitorTest, TestGetInstance)
     Monitor &instance2 = Monitor::getInstance();
     EXPECT_EQ(&instance1, &instance2); // 确保返回的是同一个实例
     MonitorClean();
+}
+
+TEST(MonitorTest, StopInterruptsWaitAndCanBeCalledTwice)
+{
+    Monitor &monitor = Monitor::getInstance();
+    monitor.stop();
+    monitor.stopRequested_.store(false);
+    monitor.monitorThread_ = std::make_unique<std::thread>([&monitor]() {
+        std::unique_lock<std::mutex> lock(monitor.waitMutex_);
+        monitor.stopCondition_.wait_for(lock, std::chrono::hours(1),
+                                        [&monitor]() { return monitor.stopRequested_.load(); });
+    });
+
+    monitor.stop();
+    EXPECT_EQ(monitor.monitorThread_.get(), nullptr);
+    EXPECT_NO_THROW(monitor.stop());
+}
+
+TEST(MonitorTest, LaunchDoesNotReplaceRunningThread)
+{
+    Monitor &monitor = Monitor::getInstance();
+    monitor.stop();
+    monitor.stopRequested_.store(false);
+    monitor.monitorThread_ = std::make_unique<std::thread>([&monitor]() {
+        std::unique_lock<std::mutex> lock(monitor.waitMutex_);
+        monitor.stopCondition_.wait_for(lock, std::chrono::hours(1),
+                                        [&monitor]() { return monitor.stopRequested_.load(); });
+    });
+    std::thread *runningThread = monitor.monitorThread_.get();
+
+    monitor.launch();
+    EXPECT_EQ(monitor.monitorThread_.get(), runningThread);
+    monitor.stop();
 }

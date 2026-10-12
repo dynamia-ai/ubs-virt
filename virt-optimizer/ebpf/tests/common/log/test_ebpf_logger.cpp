@@ -1,6 +1,10 @@
 /*
  * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
  */
+#include <fstream>
+#include <thread>
+#include <vector>
+
 #include <gtest/gtest.h>
 #include "common/log/ebpf_logger.h"
 
@@ -60,4 +64,38 @@ TEST_F(EbpfLoggerTest, LevelToStringCase1)
 {
     logger.logMessage(EbpfLogger::LogLevel::FATAL, "debug message", __FILE__, __FUNCTION__, __LINE__);
     SUCCEED();
+}
+
+TEST_F(EbpfLoggerTest, ConcurrentMessagesAreFlushedBeforeCleanup)
+{
+    const std::string logPath = "/tmp/test_ebpf_concurrent.log";
+    std::filesystem::remove(logPath);
+    ASSERT_TRUE(logger.init(logPath, EbpfLogger::LogLevel::INFO, false, false, 10 * 1024 * 1024));
+
+    constexpr int THREAD_COUNT = 4;
+    constexpr int MESSAGE_COUNT = 50;
+    std::vector<std::thread> writers;
+    for (int threadIndex = 0; threadIndex < THREAD_COUNT; ++threadIndex) {
+        writers.emplace_back([this, threadIndex]() {
+            for (int messageIndex = 0; messageIndex < MESSAGE_COUNT; ++messageIndex) {
+                logger.logMessage(EbpfLogger::LogLevel::INFO,
+                                  "concurrent-" + std::to_string(threadIndex) + "-" + std::to_string(messageIndex),
+                                  __FILE__, __FUNCTION__, __LINE__);
+            }
+        });
+    }
+    for (auto &writer : writers) {
+        writer.join();
+    }
+    logger.cleanup();
+
+    std::ifstream logFile(logPath);
+    ASSERT_TRUE(logFile);
+    size_t lineCount = 0;
+    std::string line;
+    while (std::getline(logFile, line)) {
+        ++lineCount;
+    }
+    EXPECT_EQ(lineCount, static_cast<size_t>(THREAD_COUNT * MESSAGE_COUNT));
+    std::filesystem::remove(logPath);
 }

@@ -20,17 +20,40 @@ const char *DATA_LOCAL_PATH = "/var/ubs-opt/data/data.json";
 
 void EBPFReceiver::mainLoop()
 {
-    std::atomic_load(&dataBuffer)->clear();
     while (true) {
         std::this_thread::sleep_for(std::chrono::seconds(samplingInterval_));
-        std::atomic_load(&readBuffer_)->clear();
-        auto data = std::atomic_exchange(&dataBuffer, readBuffer_);
-        if (!sendData(*std::atomic_load(&data))) {
+        const DataTable data = takeSnapshot();
+        if (!sendData(data)) {
             EBPF_LOG_WARN("Failed to send collected data. Data will be saved locally.");
-            utils::writeToDisk({data->toJson()}, DATA_LOCAL_PATH);
+            utils::writeToDisk({data.toJson()}, DATA_LOCAL_PATH);
         }
-        atomic_store(&readBuffer_, data);
     }
+}
+
+void EBPFReceiver::accumulate(const IpiInterrupt &event)
+{
+    std::lock_guard<std::mutex> lock(bufferMutex_);
+    dataBuffer_.ipiInterrupt += event;
+}
+
+void EBPFReceiver::accumulate(const SchedSwitch &event)
+{
+    std::lock_guard<std::mutex> lock(bufferMutex_);
+    dataBuffer_.schedSwitch += event;
+}
+
+void EBPFReceiver::accumulate(const NumaSwitch &event)
+{
+    std::lock_guard<std::mutex> lock(bufferMutex_);
+    dataBuffer_.numaSwitch += event;
+}
+
+DataTable EBPFReceiver::takeSnapshot()
+{
+    std::lock_guard<std::mutex> lock(bufferMutex_);
+    DataTable snapshot = dataBuffer_;
+    dataBuffer_.clear();
+    return snapshot;
 }
 
 void EBPFReceiver::launch()

@@ -136,7 +136,7 @@ virt-optimizer/
 - `bind_port`：1024～49151 的整数
 - `vm_name`：虚拟机名称/libvirt 域名
 - `npu_type`：`d802` 或 `d803`
-- `system.ipi_collection`、`system.sched_collector`、`system.numa_collector`：`enable` 或 `disable`
+- `system.ipi_collector`、`system.sched_collector`、`system.numa_collector`：`enable` 或 `disable`
 
 虚拟机采集器运行期间修改安装后的配置文件，应使用 `ubs-opt reload_ebpf` 重新加载配置。
 

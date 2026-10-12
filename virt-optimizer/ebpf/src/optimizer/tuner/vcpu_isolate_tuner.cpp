@@ -13,15 +13,18 @@
 
 #include "vcpu_isolate_tuner.h"
 
-#include <cstdlib>
+#include <cstdint>
+#include <filesystem>
 #include <iostream>
 
 #include "cmd_executor.h"
+#include "data_file_snapshot.h"
 #include "log/ebpf_logger_macros.h"
 
 const std::string_view DATA_PATH = "/var/ubs-opt/data/";
 const std::string_view DATA_FILE_NAME = "data.json";
 constexpr const int TUNER_THRESHOLD = 5;
+constexpr const int MAX_SAMPLING_INTERVAL = 600;
 int maxPcpuPreemptCount = -1;
 int VCPUIsolTuner::interval;
 
@@ -60,7 +63,8 @@ bool VCPUIsolTuner::check()
     EBPF_LOG_INFO("VCPUIsolTuner configuration has not been set up. ");
     isLastCheckSuccess = true;
     findLastInfer();
-    if (maxPcpuPreemptCount < (interval * TUNER_THRESHOLD)) {
+    const int64_t tuneThreshold = static_cast<int64_t>(interval) * TUNER_THRESHOLD;
+    if (static_cast<int64_t>(maxPcpuPreemptCount) < tuneThreshold) {
         EBPF_LOG_INFO("VCPUIsolTuner configuration is not needed.");
         return false;
     }
@@ -95,29 +99,6 @@ VCPUIsolTuner::ResultCode VCPUIsolTuner::checkApply()
     return ResultCode::SUCCESS;
 }
 
-std::ifstream VCPUIsolTuner::openDataFile(std::string_view filename)
-{
-    char *dataPath = realpath(std::string().append(DATA_PATH).append(filename).c_str(), nullptr);
-    const std::string path(dataPath);
-    const std::string renamedPath = path + ".bak";
-    if (std::filesystem::exists(renamedPath)) {
-        std::filesystem::remove(renamedPath);
-    }
-    std::filesystem::copy(path, renamedPath);
-    std::ifstream file(renamedPath);
-    free(dataPath);
-    return file;
-}
-
-void VCPUIsolTuner::closeDataFile(std::string_view filename, std::ifstream file)
-{
-    char *dataPath = realpath(std::string().append(DATA_PATH).append(filename).append(".bak").c_str(), nullptr);
-    const std::string renamedPath(dataPath);
-    file.close();
-    std::filesystem::remove(renamedPath);
-    free(dataPath);
-}
-
 void VCPUIsolTuner::parseHostData(const std::string &rawJson)
 {
     rapidjson::Document doc;
@@ -133,6 +114,9 @@ void VCPUIsolTuner::parseHostData(const std::string &rawJson)
         const rapidjson::Value &host_data = doc["data_table"];
         if (host_data.HasMember("host_preempt_vmcore_count") && host_data["host_preempt_vmcore_count"].IsInt()) {
             int preempt_count = host_data["host_preempt_vmcore_count"].GetInt();
+            if (preempt_count < 0) {
+                throw ::std::runtime_error("host_preempt_vmcore_count must not be negative.");
+            }
             maxPcpuPreemptCount = std::max(maxPcpuPreemptCount, preempt_count);
         }
     }
@@ -141,8 +125,8 @@ void VCPUIsolTuner::parseHostData(const std::string &rawJson)
         throw ::std::runtime_error("Does not have 'interval' or 'interval' is not int.");
     }
 
-    if (doc["interval"].GetInt() <= 0) {
-        throw ::std::runtime_error("interval must be a positive integer, current value: " +
+    if (doc["interval"].GetInt() <= 0 || doc["interval"].GetInt() > MAX_SAMPLING_INTERVAL) {
+        throw ::std::runtime_error("interval must be an integer within [1, 600], current value: " +
                                    std::to_string(doc["interval"].GetInt()));
     }
 
@@ -152,27 +136,22 @@ void VCPUIsolTuner::parseHostData(const std::string &rawJson)
 void VCPUIsolTuner::findLastInfer()
 {
     EBPF_LOG_INFO("Checking vcpu isolate tunner.");
-    std::ifstream file;
     try {
-        file = openDataFile(DATA_FILE_NAME);
-        if (!file.is_open()) {
-            isLastCheckSuccess = false;
-            EBPF_LOG_ERROR("Failed to found data file: " + std::string(DATA_PATH) + std::string(DATA_FILE_NAME));
-            return;
+        const std::filesystem::path sourcePath =
+            std::filesystem::path(std::string(DATA_PATH)) / std::string(DATA_FILE_NAME);
+        DataFileSnapshot snapshot(sourcePath);
+        std::ifstream &file = snapshot.stream();
+        std::string rawJson;
+        while (std::getline(file, rawJson)) {
+            try {
+                parseHostData(rawJson);
+            } catch (const std::exception &e) {
+                continue;
+            }
         }
     } catch (const std::exception &e) {
         isLastCheckSuccess = false;
         EBPF_LOG_WARN("Unable to open data file: " + std::string(e.what()));
         return;
     }
-    std::string rawJson;
-    time_t lastTimestamp = 0;
-    while (std::getline(file, rawJson)) {
-        try {
-            parseHostData(rawJson);
-        } catch (const std::exception &e) {
-            continue;
-        }
-    }
-    closeDataFile(DATA_FILE_NAME, std::move(file));
 }

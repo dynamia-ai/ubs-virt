@@ -4,9 +4,8 @@
     "vm_name": "openeuler",
     "npu_type": "d802",
     "system" : {
-      "ipi_collection": "enable",
+      "ipi_collector": "enable",
       "sched_collector": "enable",
       "numa_collector": "enable"
     }
 }
-  

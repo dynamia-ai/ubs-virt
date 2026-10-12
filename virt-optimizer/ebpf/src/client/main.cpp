@@ -48,7 +48,11 @@ bool handleStopEbpf()
         std::cout << "Stop eBPF collector failed. Collector is already stopped." << std::endl;
         return false;
     }
-    kill(utils::getDaemonPID(PID_FILE_PATH), SIGTERM);
+    const auto pid = utils::getDaemonPID(PID_FILE_PATH);
+    if (!pid.has_value() || kill(pid.value(), SIGTERM) != 0) {
+        std::cout << "Stop eBPF collector failed. Unable to signal collector." << std::endl;
+        return false;
+    }
     std::cout << "Stopping eBPF collector" << std::endl;
     std::this_thread::sleep_for(std::chrono::seconds(stopTime));
     if (!utils::checkRunning(PID_FILE_PATH, CLI_NAME)) {
@@ -65,7 +69,11 @@ bool handleReloadEbpf()
         std::cout << "Failed to reload config. Collector is not running." << std::endl;
         return false;
     }
-    kill(utils::getDaemonPID(PID_FILE_PATH), SIGHUP);
+    const auto pid = utils::getDaemonPID(PID_FILE_PATH);
+    if (!pid.has_value() || kill(pid.value(), SIGHUP) != 0) {
+        std::cout << "Failed to reload config. Unable to signal collector." << std::endl;
+        return false;
+    }
     std::cout << "Reload eBPF collector config successfully." << std::endl;
     return true;
 }

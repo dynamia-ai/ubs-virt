@@ -37,8 +37,6 @@ private:
         FALSE,
         ERROR,
     };
-    static std::ifstream openDataFile(std::string_view filename);
-    static void closeDataFile(std::string_view filename, std::ifstream file);
     static void parseHostData(const std::string &rawJson);
     void findLastInfer();
     VCPUIsolTuner::ResultCode checkApply();

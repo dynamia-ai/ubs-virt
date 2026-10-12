@@ -61,9 +61,10 @@ TEST(QEMUCollectorTest, MonitorQemuThreadsSuccess)
     double timeout = 20;
     std::atomic<int> mv_count(-1);
     QEMUCollector &collector = QEMUCollector::getInstance();
+    collector.stopRequested_.store(false);
 
-    // 使用echo模拟 vmtop的回显，打印四行数据
-    std::string data = "\"VM/task-name P\nopeneuler 100\nopeneuler 200\n xxxxx\"";
+    // 使用echo模拟 vmtop回显，其中包含字段缺失和非数字CPU值
+    std::string data = "\"VM/task-name P\nopeneuler\nopeneuler invalid\nopeneuler 100\nopeneuler 200\n xxxxx\n yyyyy\"";
     std::string cmd = "echo -e " + data;
     FILE *pipe = popen(cmd.c_str(), "r");
 
@@ -87,4 +88,38 @@ TEST(QEMUCollectorTest, MonitorQemuThreadsSuccess)
 
     EXPECT_EQ(res, 1);
     QEMUClean();
+}
+
+TEST(QEMUCollectorTest, StopJoinsThreadAndCanBeCalledTwice)
+{
+    QEMUCollector &collector = QEMUCollector::getInstance();
+    collector.stop();
+    collector.stopRequested_.store(false);
+    collector.QEMUCollectorThread_ = std::make_unique<std::thread>([&collector]() {
+        while (!collector.stopRequested_.load()) {
+            std::this_thread::yield();
+        }
+    });
+
+    collector.stop();
+    EXPECT_EQ(collector.QEMUCollectorThread_.get(), nullptr);
+    EXPECT_NO_THROW(collector.stop());
+}
+
+TEST(QEMUCollectorTest, LaunchDoesNotReplaceRunningThread)
+{
+    QEMUCollector &collector = QEMUCollector::getInstance();
+    collector.stop();
+    collector.stopRequested_.store(false);
+    collector.QEMUCollectorThread_ = std::make_unique<std::thread>([&collector]() {
+        while (!collector.stopRequested_.load()) {
+            std::this_thread::yield();
+        }
+    });
+    std::thread *runningThread = collector.QEMUCollectorThread_.get();
+    std::atomic<int> result{-1};
+
+    collector.launch("test-vm", 1, result);
+    EXPECT_EQ(collector.QEMUCollectorThread_.get(), runningThread);
+    collector.stop();
 }

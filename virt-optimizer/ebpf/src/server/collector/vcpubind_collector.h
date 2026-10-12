@@ -15,8 +15,10 @@
 #define VCPUBIND_COLLECTOR_H
 
 #include <atomic>
+#include <condition_variable>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <thread>
@@ -30,7 +32,10 @@ public:
 
     VcpubindCollector &operator=(const VcpubindCollector &) = delete;
 
+    ~VcpubindCollector();
+
     void launch(std::string vmName, int timeout, std::atomic<int> &res, double minCpu = 1);
+    void stop();
 
 private:
     VcpubindCollector() = default;
@@ -38,17 +43,21 @@ private:
     void monitor_vm_vpu(std::string vmName, int timeout, std::atomic<int> &res, double minCpu = 1);
     void process_line(const std::string &line, std::map<std::string, std::string> &binding);
     void parse_top_output(const std::string &topOutput, const std::set<std::string> &boundCores, double minCpu);
-    void set_index(std::string line);
+    bool set_index(const std::string &line);
     std::map<std::string, std::string> get_binding_map(std::string vmName);
 
     std::unique_ptr<std::thread> vcpubindCollectorThread_;
+    std::atomic<bool> stopRequested_{false};
+    std::mutex lifecycleMutex_;
+    std::mutex waitMutex_;
+    std::condition_variable stopCondition_;
 
     std::map<std::string, std::string> bindmap;
     int pcpu_preempt_count = 0;
-    int pid_index = 0;
-    int cpupercent_index = 0;
-    int command_index = 0;
-    int pcpu_index = 0;
+    int pid_index = -1;
+    int cpupercent_index = -1;
+    int command_index = -1;
+    int pcpu_index = -1;
 };
 
 #endif

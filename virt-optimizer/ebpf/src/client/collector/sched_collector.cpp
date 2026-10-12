@@ -18,13 +18,12 @@
 
 static int handle_event(void *ctx, void *data, unsigned long size)
 {
-    auto event = static_cast<SchedSwitch *>(data);
-    if (!event) {
+    if (data == nullptr || size < sizeof(SchedSwitch)) {
         EBPF_LOG_WARN("Event data broken, skipping...");
         return 1;
     }
-    auto buffer = std::atomic_load(&EBPFReceiver::getInstance().dataBuffer);
-    buffer->schedSwitch += *event;
+    auto event = static_cast<SchedSwitch *>(data);
+    EBPFReceiver::getInstance().accumulate(*event);
     return 0;
 }
 

@@ -14,9 +14,11 @@
 #include "utils.h"
 
 #include <cctype>
+#include <charconv>
 #include <csignal>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <string>
 
@@ -35,6 +37,58 @@ namespace utils {
 namespace fs = std::filesystem;
 // Configuration file path
 const char *CONFIG_PATH = "/usr/local/sbin/ubs-optimizer/config.json";
+
+namespace {
+bool loadConfigDocument(rapidjson::Document &doc)
+{
+    std::ifstream ifs(CONFIG_PATH);
+    if (!ifs.is_open()) {
+        EBPF_LOG_ERROR("Open config file failed: " + std::string(CONFIG_PATH));
+        return false;
+    }
+
+    std::stringstream buffer;
+    buffer << ifs.rdbuf();
+    rapidjson::ParseResult ok = doc.Parse(buffer.str().c_str());
+    if (!ok) {
+        EBPF_LOG_ERROR("Parse config file failed, due to: " + std::string(rapidjson::GetParseError_En(ok.Code())) +
+                       " (offset: " + std::to_string(ok.Offset()) + ")");
+        return false;
+    }
+    if (!doc.IsObject()) {
+        EBPF_LOG_ERROR("Config file format error. Root element should be an object.");
+        return false;
+    }
+    return true;
+}
+
+const rapidjson::Value *findConfigValue(const rapidjson::Document &doc, const std::string &propPath)
+{
+    if (propPath.empty()) {
+        EBPF_LOG_ERROR("Config path is empty.");
+        return nullptr;
+    }
+
+    const rapidjson::Value *current = &doc;
+    size_t start = 0;
+    while (start < propPath.size()) {
+        size_t end = propPath.find('.', start);
+        std::string key = propPath.substr(start, end == std::string::npos ? end : end - start);
+        if (key.empty() || !current->IsObject() || !current->HasMember(key.c_str())) {
+            EBPF_LOG_ERROR("Config key not found: " + key + " in path: " + propPath);
+            return nullptr;
+        }
+        current = &((*current)[key.c_str()]);
+        if (end == std::string::npos) {
+            return current;
+        }
+        start = end + 1;
+    }
+
+    EBPF_LOG_ERROR("Config path must not end with '.': " + propPath);
+    return nullptr;
+}
+} // namespace
 
 pid_t forkWithDir(const char *path)
 {
@@ -58,17 +112,25 @@ pid_t forkWithDir(const char *path)
     return pid;
 }
 
-pid_t getDaemonPID(const char *path)
+std::optional<pid_t> getDaemonPID(const char *path)
 {
-    char *pidPath = realpath(path, nullptr);
-    if (pidPath == nullptr) {
-        return 0;
+    if (path == nullptr) {
+        return std::nullopt;
     }
-    std::ifstream pidFile(pidPath);
-    pid_t pid;
-    pidFile >> pid;
-    free(pidPath);
-    return pid;
+    std::ifstream pidFile(path);
+    std::string pidText;
+    std::string trailingText;
+    if (!(pidFile >> pidText) || (pidFile >> trailingText)) {
+        return std::nullopt;
+    }
+
+    long long parsedPid = 0;
+    const auto result = std::from_chars(pidText.data(), pidText.data() + pidText.size(), parsedPid);
+    if (result.ec != std::errc() || result.ptr != pidText.data() + pidText.size() || parsedPid <= 1 ||
+        parsedPid > std::numeric_limits<pid_t>::max()) {
+        return std::nullopt;
+    }
+    return static_cast<pid_t>(parsedPid);
 }
 
 bool checkProcessName(int pid, const char *name)
@@ -96,56 +158,39 @@ bool checkRunning(const char *path, const char *name)
         return false;
     }
     auto pid = utils::getDaemonPID(path);
-    if (kill(pid, 0) != 0) {
+    if (!pid.has_value() || kill(pid.value(), 0) != 0) {
         return false;
     }
 
-    return checkProcessName(pid, name);
+    return checkProcessName(pid.value(), name);
 }
 
-// Get the value in config.json.Normally,it returns a string of the value.Otherwise,it returns an empty string.
-const rapidjson::Value getConfigValue(const std::string &prop_path)
+std::optional<std::string> getConfigString(const std::string &key)
 {
-    std::ifstream ifs(CONFIG_PATH);
-    if (!ifs.is_open()) {
-        EBPF_LOG_ERROR("Open config file failed: " + std::string(CONFIG_PATH));
-        return rapidjson::Value();
-    }
-    std::stringstream buffer;
-    buffer << ifs.rdbuf();
-    std::string jsonStr = buffer.str();
-    ifs.close();
-
     rapidjson::Document doc;
-    rapidjson::ParseResult ok = doc.Parse(jsonStr.c_str());
-    if (!ok) {
-        EBPF_LOG_ERROR("Parse config file failed, due to: " + std::string(rapidjson::GetParseError_En(ok.Code())) +
-                       " (offset: " + std::to_string(ok.Offset()) + ")");
-        return rapidjson::Value();
+    if (!loadConfigDocument(doc)) {
+        return std::nullopt;
     }
-
-    size_t start = 0;
-    size_t end = prop_path.find('.');
-    const rapidjson::Value *current = &doc;
-
-    while (end != std::string::npos) {
-        std::string key = prop_path.substr(start, end - start);
-        if (!current->IsObject() || !current->HasMember(key.c_str())) {
-            EBPF_LOG_ERROR("Config key not found: " + key + " in path: " + prop_path);
-            return rapidjson::Value();
-        }
-        current = &((*current)[key.c_str()]);
-        start = end + 1;
-        end = prop_path.find('.', start);
+    const rapidjson::Value *value = findConfigValue(doc, key);
+    if (value == nullptr || !value->IsString()) {
+        EBPF_LOG_ERROR("Config value is missing or is not a string: " + key);
+        return std::nullopt;
     }
+    return std::string(value->GetString(), value->GetStringLength());
+}
 
-    std::string final_key = prop_path.substr(start);
-    if (!current->IsObject() || !current->HasMember(final_key.c_str())) {
-        EBPF_LOG_ERROR("Config key not found: " + final_key + " in path: " + prop_path);
-        return rapidjson::Value();
+std::optional<unsigned int> getConfigUint(const std::string &key)
+{
+    rapidjson::Document doc;
+    if (!loadConfigDocument(doc)) {
+        return std::nullopt;
     }
-
-    return rapidjson::Value(doc[final_key.c_str()], doc.GetAllocator());
+    const rapidjson::Value *value = findConfigValue(doc, key);
+    if (value == nullptr || !value->IsUint()) {
+        EBPF_LOG_ERROR("Config value is missing or is not an unsigned integer: " + key);
+        return std::nullopt;
+    }
+    return value->GetUint();
 }
 
 bool isValidVmName(const std::string &vmName)
@@ -163,12 +208,12 @@ bool isValidVmName(const std::string &vmName)
 
 std::string getVmName()
 {
-    const rapidjson::Value npuTypeName = getConfigValue("vm_name");
-    if (npuTypeName.IsNull() || !npuTypeName.IsString()) {
+    const auto vmNameValue = getConfigString("vm_name");
+    if (!vmNameValue.has_value()) {
         EBPF_LOG_ERROR("Parse config failed, vm_name is missing or not a string.");
         return "";
     }
-    std::string vmName = npuTypeName.GetString();
+    const std::string &vmName = vmNameValue.value();
     if (!isValidVmName(vmName)) {
         EBPF_LOG_ERROR("Invalid vm name, only English letters or numbers are supported.");
         return "";
@@ -211,12 +256,12 @@ void writeToDisk(const std::vector<std::string> &jsonBuffer, const std::string &
 
 NPUType getNPUType()
 {
-    const rapidjson::Value npuTypeName = utils::getConfigValue("npu_type");
-    if (npuTypeName.IsNull() || !npuTypeName.IsString()) {
+    const auto npuTypeName = utils::getConfigString("npu_type");
+    if (!npuTypeName.has_value()) {
         EBPF_LOG_ERROR("Parse config failed, npu_type is missing or not a string.");
         return NPUType::UNKNOWN;
     }
-    std::string typeStr = npuTypeName.GetString();
+    const std::string &typeStr = npuTypeName.value();
     if (typeStr == "d802") {
         return NPUType::ALLOWED_NPU_D802;
     }

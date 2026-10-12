@@ -24,6 +24,7 @@
 #include <iostream>
 #include <sstream>
 #include <thread>
+#include <utility>
 
 EbpfLogger::EbpfLogger()
     : running_(false),
@@ -82,12 +83,11 @@ bool EbpfLogger::init(const std::string &logFile, LogLevel level, bool useSyslog
 
 void EbpfLogger::cleanup()
 {
-    if (!running_) {
-        return;
-    }
-
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (!running_ && !logWorkerThread_.joinable()) {
+            return;
+        }
         running_ = false;
     }
     condVar_.notify_all();
@@ -116,6 +116,9 @@ void EbpfLogger::logMessage(LogLevel level, const std::string &message, const ch
         << "[" << fs::path(file).filename().string() << ":" << function << ":" << line << "] " << message;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (!running_) {
+            return;
+        }
         logQueue_.push(oss.str());
     }
 
@@ -124,33 +127,33 @@ void EbpfLogger::logMessage(LogLevel level, const std::string &message, const ch
 
 void EbpfLogger::logThread()
 {
-    while (running_ || !logQueue_.empty()) {
+    bool shouldStop = false;
+    while (!shouldStop) {
         std::unique_lock<std::mutex> lock(mutex_);
         condVar_.wait(lock, [this] { return !logQueue_.empty() || !running_; });
-
-        while (!logQueue_.empty()) {
-            std::string entry = logQueue_.front();
-            logQueue_.pop();
-            lock.unlock();
-
-            if (logFileStream_.is_open()) {
-                logFileStream_ << entry << std::endl;
-                logFileStream_.flush();
-            }
-
-            if (useSyslog_) {
-                syslog(LOG_INFO, "%s", entry.c_str());
-            }
-
-            if (useConsole_) {
-                std::cout << entry << std::endl;
-                fflush(stdout);
-            }
-
-            dumpLogFile();
-
-            lock.lock();
+        shouldStop = logQueue_.empty() && !running_;
+        if (shouldStop) {
+            continue;
         }
+        std::string entry = std::move(logQueue_.front());
+        logQueue_.pop();
+        lock.unlock();
+
+        if (logFileStream_.is_open()) {
+            logFileStream_ << entry << std::endl;
+            logFileStream_.flush();
+        }
+
+        if (useSyslog_) {
+            syslog(LOG_INFO, "%s", entry.c_str());
+        }
+
+        if (useConsole_) {
+            std::cout << entry << std::endl;
+            fflush(stdout);
+        }
+
+        dumpLogFile();
     }
 }
 

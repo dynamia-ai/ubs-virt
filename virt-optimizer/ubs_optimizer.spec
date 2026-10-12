@@ -80,7 +80,7 @@ cp -f %{_builddir}/%{name}_%{version}/rpm/usr/local/sbin/ubs-opt-tuner %{buildro
 cp -f %{_builddir}/%{name}_%{version}/rpm/usr/local/sbin/ubs-optimizer/config.json %{buildroot}/usr/local/sbin/ubs-optimizer/
 
 %files
-%dir %attr(600,root,root) /usr/local/sbin/ubs-optimizer
+%dir %attr(700,root,root) /usr/local/sbin/ubs-optimizer
 %attr(500,root,root) /usr/local/sbin/ubs-opt
 %attr(500,root,root) /usr/local/sbin/ubs-opt-guard
 %attr(500,root,root) /usr/local/sbin/ubs-opt-tuner

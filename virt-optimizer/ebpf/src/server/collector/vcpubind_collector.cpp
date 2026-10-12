@@ -13,6 +13,7 @@
 
 #include "vcpubind_collector.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -23,67 +24,102 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 
 #include "log/ebpf_logger_macros.h"
+#include "process_pipe.h"
 #include "utils.h"
 
 void VcpubindCollector::launch(std::string vmName, int timeout, std::atomic<int> &res, double minCpu)
 {
-    vcpubindCollectorThread_ = std::make_unique<std::thread>(&VcpubindCollector::monitor_vm_vpu, this, std::ref(vmName),
-                                                             timeout, std::ref(res), minCpu);
+    std::lock_guard<std::mutex> lock(lifecycleMutex_);
+    if (vcpubindCollectorThread_ && vcpubindCollectorThread_->joinable()) {
+        EBPF_LOG_WARN("vCPU binding collector is already running.");
+        return;
+    }
+    stopRequested_.store(false, std::memory_order_release);
+    pcpu_preempt_count = 0;
+    bindmap.clear();
+    vcpubindCollectorThread_ = std::make_unique<std::thread>(&VcpubindCollector::monitor_vm_vpu, this,
+                                                             std::move(vmName), timeout, std::ref(res), minCpu);
+}
+
+VcpubindCollector::~VcpubindCollector()
+{
+    stop();
+}
+
+void VcpubindCollector::stop()
+{
+    std::lock_guard<std::mutex> lock(lifecycleMutex_);
+    stopRequested_.store(true, std::memory_order_release);
+    stopCondition_.notify_all();
+    if (vcpubindCollectorThread_ && vcpubindCollectorThread_->joinable()) {
+        vcpubindCollectorThread_->join();
+    }
+    vcpubindCollectorThread_.reset();
 }
 
 // 监控主循环
 void VcpubindCollector::monitor_vm_vpu(std::string vmName, int timeout, std::atomic<int> &res, double minCpu)
 {
-    auto start_time = std::chrono::system_clock::now();
-    std::chrono::seconds exec_time(timeout);
-    std::map<std::string, std::string> binding = get_binding_map(vmName);
-    if (binding.empty()) {
-        EBPF_LOG_ERROR("No binding information found for VM: " + vmName);
-        return;
-    }
-
-    std::set<std::string> bound_cores;
-    for (const auto &pair : binding) {
-        bound_cores.insert(pair.second); // Insert value into set
-    }
-
-    while (true) {
-        std::string cmd = "/usr/bin/top -b -n 1 -o %CPU -w 128";
-        FILE *pipe = popen(cmd.c_str(), "r");
-        if (!pipe) {
-            EBPF_LOG_ERROR("Failed to open pipe");
+    try {
+        auto start_time = std::chrono::system_clock::now();
+        std::map<std::string, std::string> binding = get_binding_map(vmName);
+        if (binding.empty()) {
+            EBPF_LOG_ERROR("No binding information found for VM: " + vmName);
             return;
         }
 
-        std::string top_output;
-        char buffer[512];
-
-        while (fgets(buffer, sizeof(buffer), pipe)) {
-            top_output += buffer;
-        }
-        int ret = pclose(pipe);
-        if (ret != 0) {
-            EBPF_LOG_WARN("Failed to pclose pipe, the ret: " + std::to_string(ret));
-            continue;
+        std::set<std::string> boundCores;
+        for (const auto &pair : binding) {
+            boundCores.insert(pair.second); // Insert value into set
         }
 
-        // Key processing logic
-        parse_top_output(top_output, bound_cores, minCpu);
+        while (!stopRequested_.load(std::memory_order_acquire)) {
+            std::string cmd = "/usr/bin/top -b -n 1 -o %CPU -w 128";
+            ProcessPipe pipe(popen(cmd.c_str(), "r"));
+            if (!pipe) {
+                EBPF_LOG_ERROR("Failed to open pipe");
+                return;
+            }
 
-        auto stop_time = std::chrono::system_clock::now();
-        auto elapsed_time = std::chrono::duration_cast<std::chrono::seconds>(stop_time - start_time);
+            std::string topOutput;
+            char buffer[512];
 
-        if (elapsed_time.count() > timeout) {
-            res.store(pcpu_preempt_count, std::memory_order_release);
-            pcpu_preempt_count = 0;
-            start_time = std::chrono::system_clock::now();
-            elapsed_time = std::chrono::seconds(0);
+            char *readResult = fgets(buffer, sizeof(buffer), pipe.get());
+            while (readResult != nullptr) {
+                topOutput += buffer;
+                readResult = fgets(buffer, sizeof(buffer), pipe.get());
+            }
+            if (ferror(pipe.get()) != 0) {
+                EBPF_LOG_WARN("Failed to read top output from pipe.");
+                continue;
+            }
+            int ret = pipe.close();
+            if (ret != 0) {
+                EBPF_LOG_WARN("Failed to pclose pipe, the ret: " + std::to_string(ret));
+                continue;
+            }
+
+            // Key processing logic
+            parse_top_output(topOutput, boundCores, minCpu);
+
+            auto stopTime = std::chrono::system_clock::now();
+            auto elapsedTime = std::chrono::duration_cast<std::chrono::seconds>(stopTime - start_time);
+
+            if (elapsedTime.count() > timeout) {
+                res.store(pcpu_preempt_count, std::memory_order_release);
+                pcpu_preempt_count = 0;
+                start_time = std::chrono::system_clock::now();
+            }
+            std::unique_lock<std::mutex> lock(waitMutex_);
+            stopCondition_.wait_for(lock, std::chrono::seconds(1),
+                                    [this]() { return stopRequested_.load(std::memory_order_acquire); });
         }
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+    } catch (const std::exception &e) {
+        EBPF_LOG_ERROR("vCPU binding collector stopped after an unexpected error: " + std::string(e.what()));
     }
-    return;
 }
 
 // Get the binding dictionary
@@ -96,7 +132,7 @@ std::map<std::string, std::string> VcpubindCollector::get_binding_map(std::strin
         return bindmap;
     }
     std::string cmd = "virsh dumpxml " + vmName;
-    FILE *pipe = popen(cmd.c_str(), "r");
+    ProcessPipe pipe(popen(cmd.c_str(), "r"));
 
     if (!pipe) {
         EBPF_LOG_ERROR("Failed to open pipe");
@@ -105,7 +141,7 @@ std::map<std::string, std::string> VcpubindCollector::get_binding_map(std::strin
 
     while (true) {
         char buffer[512];
-        if (!fgets(buffer, sizeof(buffer), pipe)) {
+        if (!fgets(buffer, sizeof(buffer), pipe.get())) {
             break; // Process ends
         }
         std::string line(buffer);
@@ -113,7 +149,6 @@ std::map<std::string, std::string> VcpubindCollector::get_binding_map(std::strin
         process_line(line, bindmap);
     }
 
-    pclose(pipe);
     return bindmap;
 }
 
@@ -128,7 +163,10 @@ void VcpubindCollector::parse_top_output(const std::string &topOutput, const std
     while (std::getline(iss, line)) {
         if (in_header) {
             if (line.find("PID") != std::string::npos && line.find("USER") != std::string::npos) {
-                set_index(line);
+                if (!set_index(line)) {
+                    EBPF_LOG_WARN("Invalid top output: required columns are missing.");
+                    return;
+                }
                 in_header = false;
             }
             continue;
@@ -139,15 +177,25 @@ void VcpubindCollector::parse_top_output(const std::string &topOutput, const std
         while (line_stream >> field) {
             fields.push_back(field);
         }
-        if ((std::stod(fields[cpupercent_index]) > minCpu) && (boundCores.count(fields[pcpu_index]) != 0) &&
-            (fields[command_index] != "top")) {
-            pcpu_preempt_count++;
+        const size_t maxIndex = static_cast<size_t>(std::max({cpupercent_index, pcpu_index, command_index}));
+        if (fields.size() <= maxIndex) {
+            EBPF_LOG_WARN("Invalid top output: process row has too few columns.");
+            continue;
+        }
+        try {
+            if ((std::stod(fields[static_cast<size_t>(cpupercent_index)]) > minCpu) &&
+                (boundCores.count(fields[static_cast<size_t>(pcpu_index)]) != 0) &&
+                (fields[static_cast<size_t>(command_index)] != "top")) {
+                pcpu_preempt_count++;
+            }
+        } catch (const std::exception &) {
+            EBPF_LOG_WARN("Invalid top output: CPU usage is not a number.");
         }
     }
 }
 
 // Get the index of the required element in top
-void VcpubindCollector::set_index(std::string line)
+bool VcpubindCollector::set_index(const std::string &line)
 {
     std::istringstream line_stream(line);
     std::vector<std::string> fields;
@@ -156,6 +204,10 @@ void VcpubindCollector::set_index(std::string line)
         fields.push_back(field);
     }
 
+    pid_index = -1;
+    cpupercent_index = -1;
+    command_index = -1;
+    pcpu_index = -1;
     for (int i = 0; i < static_cast<int>(fields.size()); i++) {
         if (fields[i] == "PID") {
             pid_index = i;
@@ -167,6 +219,7 @@ void VcpubindCollector::set_index(std::string line)
             pcpu_index = i;
         }
     }
+    return pid_index >= 0 && cpupercent_index >= 0 && command_index >= 0 && pcpu_index >= 0;
 }
 
 // Process a single line,extract vcpu and pcpu and add them to the binding dictionary

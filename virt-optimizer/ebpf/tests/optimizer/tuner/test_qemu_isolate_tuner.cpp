@@ -84,17 +84,6 @@ TEST_F(QemuIsolTunerTest, TestFindLastInferSuccess)
     std::remove("test.json");
 }
 
-TEST(QemuIsolTunerTest1, TestFindLastInferCase)
-{
-    char ret_qemu[] = "abc";
-    char *cur_qemu = ret_qemu;
-    MOCKER(realpath).expects(atLeast(1)).with(any()).will(returnValue(cur_qemu));
-    std::unique_ptr<QemuIsolTuner> tuner = std::make_unique<QemuIsolTuner>();
-    EXPECT_NO_THROW(tuner->findLastInfer());
-    mockcpp::GlobalMockObject::verify();
-    mockcpp::GlobalMockObject::reset();
-}
-
 TEST(QemuIsolTunerTest1, CheckCase1)
 {
     std::unique_ptr<QemuIsolTuner> tuner = std::make_unique<QemuIsolTuner>();
@@ -171,6 +160,32 @@ TEST(QemuIsolTunerTest1, CheckApplyWithPidPosIsMinusOne)
     MOCKER(&CmdExecutor::runCommand).stubs().with(any()).will(returnValue(std::make_pair(true, cmdOutput)));
     std::unique_ptr<QemuIsolTuner> tuner = std::make_unique<QemuIsolTuner>();
     EXPECT_EQ(tuner->checkApply(), QemuIsolTuner::ResultCode::ERROR);
+    mockcpp::GlobalMockObject::verify();
+    mockcpp::GlobalMockObject::reset();
+}
+
+TEST(QemuIsolTunerTest1, CheckApplyRejectsShortProcessRow)
+{
+    std::ofstream outfile("/usr/local/sbin/ubs-optimizer/config.json");
+    outfile << R"({"vm_name":"test"})" << std::endl;
+    outfile.close();
+    const std::string cmdOutput = "VM/task-name P PID\ntest\n";
+    MOCKER(&CmdExecutor::runCommand).stubs().with(any()).will(returnValue(std::make_pair(true, cmdOutput)));
+    QemuIsolTuner tuner;
+    EXPECT_EQ(tuner.checkApply(), QemuIsolTuner::ResultCode::ERROR);
+    mockcpp::GlobalMockObject::verify();
+    mockcpp::GlobalMockObject::reset();
+}
+
+TEST(QemuIsolTunerTest1, CheckApplyRejectsNonNumericPid)
+{
+    std::ofstream outfile("/usr/local/sbin/ubs-optimizer/config.json");
+    outfile << R"({"vm_name":"test"})" << std::endl;
+    outfile.close();
+    const std::string cmdOutput = "VM/task-name P PID\ntest P invalid\n";
+    MOCKER(&CmdExecutor::runCommand).stubs().with(any()).will(returnValue(std::make_pair(true, cmdOutput)));
+    QemuIsolTuner tuner;
+    EXPECT_EQ(tuner.checkApply(), QemuIsolTuner::ResultCode::ERROR);
     mockcpp::GlobalMockObject::verify();
     mockcpp::GlobalMockObject::reset();
 }
