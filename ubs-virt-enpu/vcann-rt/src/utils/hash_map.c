@@ -150,7 +150,7 @@ int hashmap_get_capture_status(HashMap *map, void *key, bool *capture_status)
         }
         node = node->next;
     }
-    LOG_ERROR("Hashmap get capture status failed.");
+    LOG_DEBUG("Hashmap get capture status failed.");
     return -1;
 }
 
