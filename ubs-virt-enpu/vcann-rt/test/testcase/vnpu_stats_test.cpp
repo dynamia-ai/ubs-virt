@@ -575,10 +575,11 @@ TEST_F(VnpuStatsTest, add_sample_record_success)
     remove_sample_records(sample_record_head);
 }
 
-TEST_F(VnpuStatsTest, core_limit_off_return_false)
+TEST_F(VnpuStatsTest, core_limit_off_still_samples)
 {
     MOCKER(is_core_limit).stubs().will(invoke(stub_is_core_limiter));
-    EXPECT_FALSE(is_random_sampling());
+    MOCKER(read).stubs().will(invoke(stub_read_success));
+    EXPECT_TRUE(is_random_sampling());
 }
 
 TEST_F(VnpuStatsTest, open_fail_return_false)
