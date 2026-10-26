@@ -26,6 +26,7 @@
 typedef struct vnpu_policy_entry {
     int32_t vnpu_id;
     int32_t sched_policy;
+    int32_t priority;
 } vnpu_policy_entry_t;
 
 struct npu_node {
@@ -671,7 +672,7 @@ int npu_tree_update_quota(npu_tree_t *tree, npu_node_t *node, int32_t aicore_del
     return ENPU_SUCCESS;
 }
 
-int npu_tree_attach_policy(npu_tree_t *tree, npu_node_t *node, int vnpu_id, int32_t sched_policy)
+int npu_tree_attach_policy(npu_tree_t *tree, npu_node_t *node, int vnpu_id, int32_t sched_policy, int32_t priority)
 {
     CHECK_NULL_RET(tree, ENPU_INVALID_PARAM);
     CHECK_NULL_RET(node, ENPU_INVALID_PARAM);
@@ -695,6 +696,7 @@ int npu_tree_attach_policy(npu_tree_t *tree, npu_node_t *node, int vnpu_id, int3
     if (node->policy_entry_count < MAX_VNPU_PER_DIE) {
         node->policy_entries[node->policy_entry_count].vnpu_id = vnpu_id;
         node->policy_entries[node->policy_entry_count].sched_policy = sched_policy;
+        node->policy_entries[node->policy_entry_count].priority = priority;
         node->policy_entry_count++;
         atomic_fetch_add(&node->allocatable.vnpu_count, 1);
     }
@@ -938,6 +940,9 @@ int npu_node_validate_policy(npu_node_t *node, int32_t sched_policy)
     pthread_mutex_lock(&node->lock);
 
     for (int i = 0; i < node->policy_entry_count; i++) {
+        if (node->policy_entries[i].priority == VNPU_PRIORITY_HIGH) {
+            continue;
+        }
         if (node->policy_entries[i].sched_policy != sched_policy) {
             pthread_mutex_unlock(&node->lock);
             return ENPU_FAIL;

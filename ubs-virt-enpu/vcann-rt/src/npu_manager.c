@@ -93,6 +93,11 @@ uint8_t get_vnpu_id(void)
     return g_npu_info.vnpu_id;
 }
 
+uint8_t get_vnpu_priority(void)
+{
+    return g_npu_info.vnpu_priority;
+}
+
 char *get_vnpu_shm_id(void)
 {
     return g_npu_info.shm_id;
@@ -158,6 +163,7 @@ int enpu_config_info_init()
 
     g_npu_info.pnpu_id = config.phy_npu_id;
     g_npu_info.vnpu_id = config.vnpu_id;
+    g_npu_info.vnpu_priority = (uint8_t)config.priority;
     g_npu_info.sched_policy = config.scheduling_policy;
 
     int ret = strcpy_s(g_npu_info.shm_id, sizeof(g_npu_info.shm_id), config.shm_id);

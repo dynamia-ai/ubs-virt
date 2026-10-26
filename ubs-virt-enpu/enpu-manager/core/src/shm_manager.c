@@ -108,7 +108,17 @@ int shm_struct_init(const char *shm_id, vnpu_time_slice_sched_t **sched_out)
         atomic_store(&sched->last_kernel_time_ns[i], 0ULL);
         atomic_store(&sched->vnpu_schedule_turn[i], 0);
         atomic_store(&sched->vnpu_core_limit_quota[i], 0);
+        atomic_store(&sched->vnpu_priority[i], VNPU_PRIORITY_NORMAL);
+        atomic_store(&sched->vnpu_quota_timeslice[i], 0ULL);
+        atomic_store(&sched->vnpu_cur_timeslice[i], 0ULL);
+        atomic_store(&sched->vnpu_quota_injected_for_turn[i], (uint_fast8_t)0xFF);
+        atomic_store(&sched->vnpu_sync_expected[i], 0);
+        atomic_store(&sched->vnpu_sync_completed[i], 0);
+        atomic_store(&sched->vnpu_turn_max_sync[i], 0ULL);
+        atomic_store(&sched->vnpu_timeslice_for_turn[i], 0ULL);
     }
+
+    pthread_mutex_init(&sched->npu_utilization_monitor_mutex, &attr);
 
     pthread_mutexattr_destroy(&attr);
 

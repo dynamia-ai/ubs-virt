@@ -30,6 +30,9 @@ static atomic_bool g_vnpu_stats_enable = true;
 
 cache_streams_t g_cache_streams = {.num_streams = 0, .streams = {NULL}};
 
+static bool is_normal_priority_vnpu(int vnpu_id);
+bool is_vnpu_alive(int vnpu_id);
+
 HashMap *stream_map = NULL;
 HashMap *event_map = NULL;
 
@@ -122,6 +125,45 @@ void restore_streams(rtStream_t stream)
     return;
 }
 
+/*
+ * Give normal-priority vNPUs a small periodic submission window while any
+ * high-priority vNPU is alive. High-priority launches are held during the
+ * same window. This is an admission-control guarantee: work already queued on
+ * the device cannot be preempted by the host runtime.
+ */
+static void wait_for_priority_fairness_window(void)
+{
+    if (g_vnpu_sched_context == NULL) {
+        return;
+    }
+
+    bool high_priority_alive = false;
+    bool normal_priority_alive = false;
+    for (int i = 0; i < MAX_VNPU; ++i) {
+        if (!is_vnpu_alive(i)) {
+            continue;
+        }
+        if (is_normal_priority_vnpu(i)) {
+            normal_priority_alive = true;
+        } else {
+            high_priority_alive = true;
+        }
+    }
+    if (!high_priority_alive || !normal_priority_alive) {
+        return;
+    }
+
+    bool is_high_priority = get_vnpu_priority() == VNPU_PRIORITY_HIGH;
+    while (!g_terminate) {
+        uint64_t phase = ns_now() % VNPU_NORMAL_FAIRNESS_PERIOD;
+        bool in_normal_window = phase < VNPU_NORMAL_FAIRNESS_WINDOW;
+        if ((is_high_priority && !in_normal_window) || (!is_high_priority && in_normal_window)) {
+            return;
+        }
+        ns_sleep(WAITING_SLEEP_PERIOD);
+    }
+}
+
 void add_stream(rtStream_t stream)
 {
     if (hashmap_contains(stream_map, (void *)stream)) {
@@ -135,6 +177,11 @@ void add_stream(rtStream_t stream)
 
 void core_limiter(rtStream_t stream, core_function func, void *param)
 {
+    /* Priority admission must also cover high-priority best-effort vNPUs,
+     * which intentionally have no core quota and therefore bypass the normal
+     * policy limiter below. */
+    wait_for_priority_fairness_window();
+
     // when schedule policy is 3
     if (!is_core_limit()) {
         return;
@@ -189,6 +236,12 @@ bool is_vnpu_alive(int vnpu_id)
     return check_timeout(&g_vnpu_sched_context->last_alive_time_ns[vnpu_id], VNPU_TIMEOUT_PERIOD);
 }
 
+static bool is_normal_priority_vnpu(int vnpu_id)
+{
+    return vnpu_id >= 0 && vnpu_id < MAX_VNPU &&
+           atomic_load(&g_vnpu_sched_context->vnpu_priority[vnpu_id]) == VNPU_PRIORITY_NORMAL;
+}
+
 /* 刷新本 vNPU 的最近任务时间戳: swap 换入完成后由 swap_hook 调用,
  * 供换出决策依据 last kernel time 判断该 vNPU 是否有活跃业务 */
 void update_last_kernel_time_now(void)
@@ -203,7 +256,7 @@ void vnpu_idling(void)
 {
     int npu_core_limit_quota = 0;
     for (int i = 0; i < MAX_VNPU; ++i) {
-        if (is_vnpu_alive(i)) {
+        if (is_vnpu_alive(i) && is_normal_priority_vnpu(i)) {
             npu_core_limit_quota += atomic_load(&g_vnpu_sched_context->vnpu_core_limit_quota[i]);
         }
         if (npu_core_limit_quota > HUNDRED_PERCENT) {
@@ -218,8 +271,9 @@ int select_next_owner(int vnpu_id)
     int next_vnpu_id = -1;
 
     for (int i = 1; i <= MAX_VNPU; ++i) {
-        if (is_vnpu_alive((vnpu_id + i) % MAX_VNPU)) {
-            next_vnpu_id = (vnpu_id + i) % MAX_VNPU;
+        int candidate = (vnpu_id + i) % MAX_VNPU;
+        if (is_vnpu_alive(candidate) && is_normal_priority_vnpu(candidate)) {
+            next_vnpu_id = candidate;
             break;
         }
     }
@@ -468,7 +522,7 @@ bool slide_window_check(int owner)
             return true;
         }
         // The slide window only contains alive vnpu.
-        if (is_vnpu_alive(next_vnpu)) {
+        if (is_vnpu_alive(next_vnpu) && is_normal_priority_vnpu(next_vnpu)) {
             slide_windows_len -= 1;
         }
     }
@@ -637,6 +691,7 @@ int share_mem_init(vnpu_time_slice_sched_t *vnpu_sched_shm)
             atomic_store(&g_vnpu_sched_context->last_alive_time_ns[i], 0ULL);
             atomic_store(&g_vnpu_sched_context->last_kernel_time_ns[i], 0ULL);
             atomic_store(&g_vnpu_sched_context->vnpu_core_limit_quota[i], 0);
+            atomic_store(&g_vnpu_sched_context->vnpu_priority[i], VNPU_PRIORITY_NORMAL);
             atomic_store(&g_vnpu_sched_context->vnpu_schedule_turn[i], 0);
             atomic_store(&g_vnpu_sched_context->vnpu_quota_timeslice[i], 0ULL);
             atomic_store(&g_vnpu_sched_context->vnpu_cur_timeslice[i], 0ULL);
@@ -672,6 +727,12 @@ int vnpu_scheduler_init(vnpu_time_slice_sched_t *vnpu_sched_shm)
     g_vnpu_id = get_vnpu_id();
 
     uint8_t aicore_limit_percent = get_core_limit_quota();
+    uint8_t priority = get_vnpu_priority();
+    atomic_store(&g_vnpu_sched_context->vnpu_priority[g_vnpu_id], priority);
+    if (priority == VNPU_PRIORITY_HIGH) {
+        // High priority vNPU is excluded from owner rotation and runs tasks directly.
+        return ENPU_SUCCESS;
+    }
     atomic_store(&g_vnpu_sched_context->vnpu_core_limit_quota[g_vnpu_id], aicore_limit_percent);
     uint64_t aicore_cur_timesilice = aicore_limit_percent * VNPU_SCHEULE_PERIOD / HUNDRED_PERCENT;
     atomic_store(&g_vnpu_sched_context->vnpu_quota_timeslice[g_vnpu_id], aicore_cur_timesilice);
@@ -681,16 +742,18 @@ int vnpu_scheduler_init(vnpu_time_slice_sched_t *vnpu_sched_shm)
 
 int vnpu_scheduler_start(void)
 {
-    pthread_t vnpu_scheduler_tid;
-    int rc = pthread_create(&vnpu_scheduler_tid, NULL, vnpu_scheduler_thread, NULL);
-    if (rc != 0) {
-        LOG_ERROR("Failed to create vnpu scheduler thread, error=%d.", rc);
-        return ENPU_FAIL;
+    int rc = 0;
+    if (get_vnpu_priority() == VNPU_PRIORITY_NORMAL) {
+        pthread_t vnpu_scheduler_tid;
+        rc = pthread_create(&vnpu_scheduler_tid, NULL, vnpu_scheduler_thread, NULL);
+        if (rc != 0) {
+            LOG_ERROR("Failed to create vnpu scheduler thread, error=%d.", rc);
+            return ENPU_FAIL;
+        }
+        pthread_detach(vnpu_scheduler_tid);
     }
     /* 立即 detach：下面那次 create 一旦失败就直接返回, 再也无法 join 这个线程, 
      * 不 detach 会泄漏线程描述符和栈.  */
-    pthread_detach(vnpu_scheduler_tid);
-
     pthread_t vnpu_alive_tid;
     rc = pthread_create(&vnpu_alive_tid, NULL, vnpu_scheduler_flush_thread, NULL);
     if (rc != 0) {

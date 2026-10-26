@@ -29,6 +29,7 @@ typedef struct eval_request {
     uint64_t hbm_limit;
     int32_t vnpu_count;
     int32_t sched_policy;
+    int32_t priority;
     int32_t predicate_phy_id;
     double oversub_ratio_per_die[MAX_NPU_PER_NODE];
     uint64_t allocated_hbm_limit_per_die[MAX_NPU_PER_NODE]; /* 每 DIE 已分配的 hbm_limit 总和（MB）, 索引=phy_id */

@@ -45,6 +45,7 @@ typedef struct alloc_request {
     uint64_t hbm_limit;
     int32_t sched_policy;
     int32_t swap_priority;
+    int32_t priority;
     int32_t predicate_phy_id; /* -1=自动选择；>=0直接分配到指定物理卡 */
     char predicate_node[MAX_NAME_LEN];
     uint64_t predicate_time;
@@ -62,6 +63,7 @@ typedef struct alloc_response {
     uint64_t hbm_quota;
     uint64_t hbm_limit;
     int32_t sched_policy;
+    int32_t priority;
     char minor_name[MAX_NAME_LEN];
     int32_t result;
     char error_msg[MAX_PATH_LEN];

@@ -29,6 +29,7 @@ typedef struct vnpu_config {
     uint64_t memory_request;
     uint64_t memory_limit;
     int32_t scheduling_policy;
+    int32_t priority;
     char shm_id[SHM_ID_LEN];
 } vnpu_config_t;
 

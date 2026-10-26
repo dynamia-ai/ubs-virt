@@ -85,6 +85,7 @@ static int file_adapter_save(storage_adapter_t *adapter, allocation_t **allocs, 
         cJSON_AddNumberToObject(item, "hbm_limit", alloc->hbm_limit);
         cJSON_AddNumberToObject(item, "sched_policy", alloc->sched_policy);
         cJSON_AddNumberToObject(item, "swap_priority", alloc->swap_priority);
+        cJSON_AddNumberToObject(item, "priority", alloc->priority);
         cJSON_AddNumberToObject(item, "create_time_ns", alloc->create_time_ns);
         cJSON_AddNumberToObject(item, "update_time_ns", alloc->update_time_ns);
         cJSON_AddNumberToObject(item, "swap_offset", alloc->swap_offset);
@@ -217,6 +218,7 @@ static int file_adapter_load(storage_adapter_t *adapter, allocation_t *allocs, i
         cJSON *hbm_limit = cJSON_GetObjectItem(item, "hbm_limit");
         cJSON *sched_policy = cJSON_GetObjectItem(item, "sched_policy");
         cJSON *swap_priority = cJSON_GetObjectItem(item, "swap_priority");
+        cJSON *priority = cJSON_GetObjectItem(item, "priority");
         cJSON *create_time_ns = cJSON_GetObjectItem(item, "create_time_ns");
         cJSON *update_time_ns = cJSON_GetObjectItem(item, "update_time_ns");
         cJSON *swap_offset = cJSON_GetObjectItem(item, "swap_offset");
@@ -266,6 +268,11 @@ static int file_adapter_load(storage_adapter_t *adapter, allocation_t *allocs, i
         }
         if (sched_policy) {
             alloc->sched_policy = sched_policy->valueint;
+        }
+        if (priority && (priority->valueint == VNPU_PRIORITY_NORMAL || priority->valueint == VNPU_PRIORITY_HIGH)) {
+            alloc->priority = priority->valueint;
+        } else {
+            alloc->priority = VNPU_PRIORITY_NORMAL;
         }
         if (swap_priority && swap_priority->valueint >= SWAP_PRIORITY_HIGH &&
             swap_priority->valueint <= SWAP_PRIORITY_LOW) {

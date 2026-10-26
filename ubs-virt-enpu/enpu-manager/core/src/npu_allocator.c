@@ -324,7 +324,8 @@ int npu_allocator_init(npu_allocator_t *a)
                                      .aicore_quota = loaded[i].aicore_quota,
                                      .memory_request = loaded[i].hbm_quota,
                                      .memory_limit = loaded[i].hbm_limit,
-                                     .scheduling_policy = loaded[i].sched_policy};
+                                     .scheduling_policy = loaded[i].sched_policy,
+                                     .priority = loaded[i].priority};
                 alloc_copy_str(cfg.shm_id, SHM_ID_LEN, loaded[i].die_id);
                 if (config_manager_write_config(a->config_mgr, loaded[i].pod_uid, loaded[i].container_name, &cfg) !=
                     ENPU_SUCCESS) {
@@ -443,7 +444,7 @@ static void set_alive_time_now(npu_allocator_t *a, int32_t phy_id, int32_t vnpu_
 
 /* 若 (phy_id, vnpu_id) 已存在则先释放 */
 static int shm_apply_vnpu_locked(npu_allocator_t *a, int32_t phy_id, const char *die_id, uint64_t hbm_total,
-                                 vnpu_shm_entry_t *entry, char *shm_id_out, int shm_id_out_len)
+                                 vnpu_shm_entry_t *entry, int32_t priority, char *shm_id_out, int shm_id_out_len)
 {
     if (a == NULL || die_id == NULL || entry == NULL) {
         return ENPU_INVALID_PARAM;
@@ -483,6 +484,10 @@ static int shm_apply_vnpu_locked(npu_allocator_t *a, int32_t phy_id, const char 
     }
 
     /* 5) 启动宽限期 */
+    vnpu_time_slice_sched_t *sched = shm_manager_get_sched_struct(a->shm_mgr, phy_id);
+    if (sched != NULL) {
+        atomic_store(&sched->vnpu_priority[entry->vnpu_id], (uint8_t)priority);
+    }
     set_alive_time_now(a, phy_id, entry->vnpu_id);
 
     return ENPU_SUCCESS;
@@ -539,6 +544,7 @@ static int shm_release_vnpu_locked(npu_allocator_t *a, int32_t phy_id, int32_t v
     if (sched != NULL) {
         atomic_store(&sched->last_alive_time_ns[vnpu_id], 0ULL);
         atomic_store(&sched->last_kernel_time_ns[vnpu_id], 0ULL);
+        atomic_store(&sched->vnpu_priority[vnpu_id], VNPU_PRIORITY_NORMAL);
     }
 
     LOG("shm_release: phy=%d vnpu=%d cleaned", phy_id, vnpu_id);
@@ -551,7 +557,18 @@ int npu_allocator_allocate(npu_allocator_t *a, alloc_request_t *req, alloc_respo
     CHECK(req, ENPU_INVALID_PARAM);
     CHECK(resp, ENPU_INVALID_PARAM);
 
-    if (req->aicore_quota <= 0) {
+    if (req->priority != VNPU_PRIORITY_NORMAL && req->priority != VNPU_PRIORITY_HIGH) {
+        alloc_snprintf(resp->error_msg, MAX_PATH_LEN, "priority must be 0 (normal) or 1 (high), got %d",
+                       req->priority);
+        resp->result = ENPU_INVALID_PARAM;
+        return ENPU_INVALID_PARAM;
+    }
+
+    if (req->priority == VNPU_PRIORITY_HIGH) {
+        // High priority does not reserve software AICore quota or participate in policy matching.
+        req->aicore_quota = 0;
+        req->sched_policy = SCHED_POLICY_BEST_EFFORT;
+    } else if (req->aicore_quota <= 0) {
         ERR("Invalid aicore_quota: %d", req->aicore_quota);
         alloc_snprintf(resp->error_msg, MAX_PATH_LEN, "aicore_quota must > 0, got %d", req->aicore_quota);
         resp->result = ENPU_INVALID_PARAM;
@@ -604,6 +621,7 @@ int npu_allocator_allocate(npu_allocator_t *a, alloc_request_t *req, alloc_respo
         resp->hbm_quota = existing.hbm_quota;
         resp->hbm_limit = existing.hbm_limit;
         resp->sched_policy = existing.sched_policy;
+        resp->priority = existing.priority;
         alloc_copy_str(resp->shm_id, SHM_ID_LEN, existing.shm_id);
         resp->result = ENPU_ALREADY_EXISTS;
         alloc_snprintf(resp->error_msg, MAX_PATH_LEN, "vNPU already exists: pod=%s container=%s phy=%d vnpu=%d",
@@ -629,6 +647,7 @@ int npu_allocator_allocate(npu_allocator_t *a, alloc_request_t *req, alloc_respo
     eval_req.hbm_limit = hbm_limit;
     eval_req.vnpu_count = (req->aicore_quota > HUNDRED_CORE) ? (req->aicore_quota / HUNDRED_CORE) : 1;
     eval_req.sched_policy = req->sched_policy;
+    eval_req.priority = req->priority;
     eval_req.predicate_phy_id = req->predicate_phy_id;
     if (memcpy_s(eval_req.oversub_ratio_per_die, sizeof(eval_req.oversub_ratio_per_die), a->oversub_ratio,
                  sizeof(a->oversub_ratio)) != 0) {
@@ -708,6 +727,7 @@ int npu_allocator_allocate(npu_allocator_t *a, alloc_request_t *req, alloc_respo
     alloc.hbm_quota = hbm_request;
     alloc.hbm_limit = hbm_limit;
     alloc.sched_policy = req->sched_policy;
+    alloc.priority = req->priority;
     alloc.swap_priority = (req->swap_priority >= SWAP_PRIORITY_HIGH && req->swap_priority <= SWAP_PRIORITY_LOW) ?
                               req->swap_priority :
                               SWAP_PRIORITY_MEDIUM;
@@ -740,7 +760,7 @@ int npu_allocator_allocate(npu_allocator_t *a, alloc_request_t *req, alloc_respo
     rollback_log_append(a->rollback_log, STEP_UPDATE_QUOTA, phy_id, alloc.vnpu_id, -alloc.aicore_quota,
                         -(int64_t)alloc.hbm_quota, 0, "", "", "");
 
-    ret = npu_tree_attach_policy(a->tree, node, alloc.vnpu_id, alloc.sched_policy);
+    ret = npu_tree_attach_policy(a->tree, node, alloc.vnpu_id, alloc.sched_policy, alloc.priority);
     if (ret != ENPU_SUCCESS) {
         rollback_log_rollback(a->rollback_log, a);
         alloc_snprintf(resp->error_msg, MAX_PATH_LEN, "attach_policy failed (phy=%d vnpu=%d sched_policy=%d): ret=%d",
@@ -762,8 +782,8 @@ int npu_allocator_allocate(npu_allocator_t *a, alloc_request_t *req, alloc_respo
     build_shm_entry(&shm_entry, alloc.vnpu_id, hbm_request, hbm_limit, alloc.sched_policy, alloc.swap_priority,
                     a->oversub_ratio[phy_id] > 0);
 
-    ret = shm_apply_vnpu_locked(a, phy_id, alloc.die_id, npu_node_get_total_memory(node), &shm_entry, resp->shm_id,
-                                SHM_ID_LEN);
+    ret = shm_apply_vnpu_locked(a, phy_id, alloc.die_id, npu_node_get_total_memory(node), &shm_entry, alloc.priority,
+                                resp->shm_id, SHM_ID_LEN);
     if (ret != ENPU_SUCCESS) {
         rollback_log_rollback(a->rollback_log, a);
         alloc_snprintf(resp->error_msg, MAX_PATH_LEN, "shm_apply_vnpu_locked failed (phy=%d die=%s vnpu=%d): ret=%d",
@@ -784,6 +804,7 @@ int npu_allocator_allocate(npu_allocator_t *a, alloc_request_t *req, alloc_respo
     registry_alloc.hbm_quota = hbm_request;
     registry_alloc.hbm_limit = hbm_limit;
     registry_alloc.sched_policy = alloc.sched_policy;
+    registry_alloc.priority = alloc.priority;
     registry_alloc.swap_priority = alloc.swap_priority;
     registry_alloc.create_time_ns = alloc.create_time_ns;
     alloc_copy_str(registry_alloc.pod_uid, MAX_UUID_LEN, req->pod_uid);
@@ -796,6 +817,7 @@ int npu_allocator_allocate(npu_allocator_t *a, alloc_request_t *req, alloc_respo
                             .memory_request = registry_alloc.hbm_quota,
                             .memory_limit = registry_alloc.hbm_limit,
                             .scheduling_policy = registry_alloc.sched_policy};
+    config.priority = registry_alloc.priority;
     alloc_copy_str(config.shm_id, SHM_ID_LEN, registry_alloc.shm_id);
 
     ret = config_manager_write_config(a->config_mgr, req->pod_uid, req->container_name, &config);
@@ -821,6 +843,7 @@ int npu_allocator_allocate(npu_allocator_t *a, alloc_request_t *req, alloc_respo
     resp->hbm_quota = registry_alloc.hbm_quota;
     resp->hbm_limit = registry_alloc.hbm_limit;
     resp->sched_policy = registry_alloc.sched_policy;
+    resp->priority = registry_alloc.priority;
     alloc_copy_str(resp->shm_id, SHM_ID_LEN, registry_alloc.shm_id);
     alloc_copy_str(resp->minor_name, MAX_NAME_LEN, npu_node_get_uuid(node));
     resp->result = ENPU_SUCCESS;
@@ -970,7 +993,7 @@ int npu_allocator_recover(npu_allocator_t *a)
 
         npu_tree_mark_vnpu_occupied(a->tree, node, alloc->vnpu_id);
         npu_tree_update_quota(a->tree, node, -alloc->aicore_quota, -(int64_t)alloc->hbm_quota);
-        npu_tree_attach_policy(a->tree, node, alloc->vnpu_id, alloc->sched_policy);
+        npu_tree_attach_policy(a->tree, node, alloc->vnpu_id, alloc->sched_policy, alloc->priority);
 
         /* 恢复 shm_state（共享内存） */
         char shm_id_out[SHM_ID_LEN] = {0};
@@ -981,6 +1004,10 @@ int npu_allocator_recover(npu_allocator_t *a)
         }
 
         shm_state_t *state = shm_manager_get_state(a->shm_mgr, alloc->phy_id);
+        vnpu_time_slice_sched_t *sched = shm_manager_get_sched_struct(a->shm_mgr, alloc->phy_id);
+        if (sched != NULL) {
+            atomic_store(&sched->vnpu_priority[alloc->vnpu_id], (uint8_t)alloc->priority);
+        }
         if (state != NULL) {
             shm_manager_init_state(a->shm_mgr, alloc->phy_id, npu_node_get_total_memory(node));
             vnpu_bitmap_set(state->vnpu_bitmap, alloc->vnpu_id);
@@ -1001,6 +1028,7 @@ int npu_allocator_recover(npu_allocator_t *a)
             .memory_request = alloc->hbm_quota,
             .memory_limit = alloc->hbm_limit,
             .scheduling_policy = alloc->sched_policy,
+            .priority = alloc->priority,
         };
         alloc_copy_str(config.shm_id, SHM_ID_LEN, alloc->shm_id);
         if (config_manager_write_config(a->config_mgr, alloc->pod_uid, alloc->container_name, &config) !=

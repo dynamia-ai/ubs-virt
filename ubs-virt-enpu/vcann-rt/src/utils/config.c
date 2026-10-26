@@ -26,6 +26,7 @@ void reset_config()
     config.memory_request = 0;
     config.memory_limit = 0;
     config.scheduling_policy = INVALID_VALUE;
+    config.priority = VNPU_PRIORITY_NORMAL;
     (void)memset_s(config.shm_id, sizeof(config.shm_id), 0, sizeof(config.shm_id));
 }
 
@@ -71,6 +72,15 @@ int check_shm_id(const char *str, const char *option_name)
 
 int check_config()
 {
+    if (config.priority != VNPU_PRIORITY_NORMAL && config.priority != VNPU_PRIORITY_HIGH) {
+        LOG_ERROR("\"%s\" must be 0 (normal) or 1 (high), got %d", OPTION_PRIORITY, config.priority);
+        return 0;
+    }
+    if (config.priority == VNPU_PRIORITY_HIGH) {
+        // High priority bypasses compute scheduling; quota and scheduling-policy are unused.
+        config.aicore_quota = 0;
+        config.scheduling_policy = 3;
+    }
     if (config.memory_request == 0 && config.memory_limit == 0) {
         if (config.memory_quota == INVALID_VALUE) {
             LOG_ERROR("Neither \"memory_quota\" nor \"memory_request\"/\"memory_limit\" is configured. Please "
@@ -163,6 +173,8 @@ int save2config(const char *key, const char *value)
         rc = load_uint64(key, value, &config.memory_limit);
     } else if (strcmp(key, OPTION_SCHEDULING_POLICY) == 0) {
         rc = load_int32(key, value, &config.scheduling_policy);
+    } else if (strcmp(key, OPTION_PRIORITY) == 0) {
+        rc = load_int32(key, value, &config.priority);
     } else if (strcmp(key, OPTION_SHM_ID) == 0) {
         rc = load_str(key, value, config.shm_id, SHM_ID_LEN);
     } else {
