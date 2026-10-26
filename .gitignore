@@ -11,3 +11,6 @@ coverage.info
 test.info
 output
 .arts
+
+# ENPU image build context
+/.build/
