@@ -81,10 +81,6 @@ bool is_random_sampling(void)
         return false;
     }
 
-    if (!is_core_limit()) {
-        return false;
-    }
-
     int fd = get_random_fd();
     if (fd < 0) {
         return false;
