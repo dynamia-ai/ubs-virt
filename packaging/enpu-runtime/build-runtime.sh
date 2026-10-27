@@ -23,10 +23,11 @@ printf '%s\n' /usr/local/enpu/vcann-rt/lib/libvruntime.so > /output/ld.so.preloa
 chmod 0644 /output/ld.so.preload
 
 cp /input/LICENSE.ubs-virt /output/LICENSE.ubs-virt
-python3 - "$cann_version" "$2" <<'PYTHON'
+python3 - "$cann_version" "$2" "$3" <<'PYTHON'
 import hashlib, json, pathlib, struct, sys
 out = pathlib.Path('/output')
 source = json.loads(pathlib.Path('/input/source.json').read_text())
+assert source['commit'] == sys.argv[3], 'Source revision does not match image metadata'
 assert hashlib.sha256(pathlib.Path('/input/source.tar').read_bytes()).hexdigest() == source['archive_sha256']
 for name in ('libvruntime.so', 'enpu-monitor'):
     header = (out / name).read_bytes()[:20]

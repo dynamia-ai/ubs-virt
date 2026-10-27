@@ -11,7 +11,7 @@
 | 官方构建镜像 | `swr.cn-north-4.myhuaweicloud.com/ubscore/ubs-virt:oe2403-v1@sha256:f42bfc52ba01eaf1652421477b88425631a37ecd990191bf26c94084ce1a2c10` |
 | 构建平台 | `linux/arm64` |
 
-打包脚本从固定提交导出源码，与当前工作分支的运行库代码无关。构建过程使用镜像内的 CANN 和驱动 SDK，不需要 NPU、宿主机驱动或设备挂载；编译阶段禁用网络。
+打包脚本默认从固定提交导出源码；持续构建流程显式传入本次提交。构建过程使用镜像内的 CANN 和驱动 SDK，不需要 NPU、宿主机驱动或设备挂载；编译阶段禁用网络。
 
 ## 构建
 
@@ -38,7 +38,44 @@ docker buildx build --platform linux/arm64 --provenance=false \
 
 `ENPU runtime image` 工作流在相关文件变更时只构建。需要发布时，在 `master` 上手动运行并启用 `publish`。工作流拒绝覆盖已存在的版本；修改运行库、SDK 或打包方式时，应更新版本中的 `r1` 修订号或对应组件版本。
 
-首次发布后，将 GHCR package 的可见性设为 Public，并在没有凭据的环境验证拉取。保留实际发布的 digest，供消费者固定使用；不要使用浮动的 `latest` 标签。
+首次发布后，将 GHCR package 的可见性设为 Public，并在没有凭据的环境验证拉取。保留实际发布的 digest，供消费者固定使用。
+
+## 主分支持续构建
+
+`ENPU runtime latest` 工作流使用当次提交的 `ubs-virt-enpu/vcann-rt` 源码和许可证，仍使用固定 digest 的构建环境及 CANN 9.1.0。
+
+| 触发条件 | 行为 |
+| --- | --- |
+| PR 修改运行库、许可证、打包目录或 latest 工作流 | 验证 PR 合并提交的 ARM64 构建，不登录或推送 GHCR |
+| `master` 每次 push | 构建当次提交，发布源码 SHA 标签；确认仍是当前 `master` 后更新浮动标签 |
+| 在 `master` 手动运行 | 重新构建该提交并发布；其他分支不发布 |
+
+发布到 `ghcr.io/dynamia-ai/enpu-runtime` 的标签包含 CANN 版本：
+
+- `latest-cann9.1.0`：CANN 9.1.0 对应的最新成功主分支产物。
+- `sha-<完整提交 SHA>-cann9.1.0`：用于追溯源码的标签。同一提交重新构建可能更新此标签，需要严格固定产物时使用 digest。
+
+发布流程串行执行。构建期间 `master` 前进时，旧运行只保留 SHA 标签，不回写浮动标签；新版本构建失败时，浮动标签保留此前成功产物。更新浮动标签前通过 GitHub API 检查提交，API 或镜像复制失败会使运行失败。
+
+新增 CANN 版本时，应同时选择包含该 SDK 的构建镜像 digest，并配置对应的版本化标签；不能只修改标签文本。没有不带 CANN 版本的裸 `latest` 标签。
+
+本地验证当前源码：
+
+```sh
+source_sha=$(git rev-parse HEAD)
+bash packaging/enpu-runtime/prepare-context.sh '' "$source_sha" HEAD
+docker buildx build --platform linux/arm64 --provenance=false \
+  --build-arg SOURCE_REVISION="$source_sha" \
+  --build-arg IMAGE_VERSION="sha-$source_sha-cann9.1.0" \
+  --output type=oci,dest=enpu-runtime-current.oci.tar \
+  .build/enpu-runtime
+```
+
+源码提交会同时写入镜像标签和 `build-info.json`，构建时检查两者的源码版本一致。固定版本发布流程仍取 1.0.0 源码，不受主分支浮动标签影响。
+
+## 消费镜像
+
+开发验证可以选择 `latest-cann9.1.0`。device-plugin 的可复现构建继续使用明确版本及 digest，不会随浮动标签自动更新。
 
 消费者显式选择 ARM64 资产阶段，即使最终镜像也提供 AMD64 版本：
 
