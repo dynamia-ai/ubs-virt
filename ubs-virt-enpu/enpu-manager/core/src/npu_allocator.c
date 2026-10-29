@@ -11,6 +11,7 @@
  */
 
 #include "../internal/npu_allocator.h"
+#include <limits.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -44,6 +45,13 @@
             return (r);          \
         }                        \
     } while (0)
+
+/* vNPU ID must fit the tree's 64-bit mask and both shared-memory arrays. */
+static bool vnpu_id_is_valid(int32_t vnpu_id)
+{
+    return vnpu_id >= 0 && vnpu_id < (int32_t)(sizeof(uint64_t) * CHAR_BIT) && vnpu_id < MAX_VNPU_SCHED &&
+           vnpu_id < MAX_VNPU_PER_DIE;
+}
 
 /* 统一安全格式化写入定长缓冲（错误消息/默认值组装）：
  * 内部使用 securec 的 vsnprintf_s 并处理返回值, 调用点无需重复检查 */
@@ -708,6 +716,13 @@ int npu_allocator_allocate(npu_allocator_t *a, alloc_request_t *req, alloc_respo
 
     int32_t phy_id = npu_node_get_phy_id(node);
     int32_t vnpu_id = eval_resp.vnpu_ids[0];
+    if (!vnpu_id_is_valid(vnpu_id)) {
+        alloc_snprintf(resp->error_msg, MAX_PATH_LEN, "invalid vnpu_id selected: %d", vnpu_id);
+        resp->result = ENPU_INVALID_PARAM;
+        free(eval_resp.nodes);
+        pthread_mutex_unlock(&a->lock);
+        return ENPU_INVALID_PARAM;
+    }
 
     /* pod_uid / container_name 是可选字段, 用户未指定时填默认值 */
     if (req->pod_uid[0] == '\0') {
@@ -984,6 +999,11 @@ int npu_allocator_recover(npu_allocator_t *a)
     int recovered_count = 0;
     for (int i = 0; i < count; i++) {
         allocation_t *alloc = &allocs[i];
+
+        if (!vnpu_id_is_valid(alloc->vnpu_id)) {
+            ERR("Skip recovery: invalid vnpu_id=%d for phy=%d", alloc->vnpu_id, alloc->phy_id);
+            continue;
+        }
 
         npu_node_t *node = npu_tree_get_leaf(a->tree, alloc->phy_id);
         if (!node) {
