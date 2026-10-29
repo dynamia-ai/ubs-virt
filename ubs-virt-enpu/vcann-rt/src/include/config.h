@@ -27,6 +27,9 @@ extern "C" {
 #define OPTION_MEMORY_LIMIT "memory-limit"
 #define OPTION_SHM_ID "shm-id"
 #define OPTION_SCHEDULING_POLICY "scheduling-policy"
+#define OPTION_VNPU_PRIORITY "vnpu_priority"
+#define VNPU_PRIORITY_NORMAL 0
+#define VNPU_PRIORITY_HIGH 1
 #define INVALID_VALUE (-1)
 
 struct Config {
@@ -37,6 +40,7 @@ struct Config {
     uint64_t memory_request;
     uint64_t memory_limit;
     int32_t scheduling_policy;
+    int32_t vnpu_priority;
     char shm_id[SHM_ID_LEN];
 };
 

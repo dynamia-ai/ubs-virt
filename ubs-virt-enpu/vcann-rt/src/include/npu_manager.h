@@ -50,6 +50,7 @@ typedef struct shared_memory {
     atomic_uint_fast64_t last_kernel_time_ns[MAX_VNPU];
     atomic_uint_fast8_t vnpu_schedule_turn[MAX_VNPU];
     atomic_uint_fast8_t vnpu_core_limit_quota[MAX_VNPU];
+    atomic_uint_fast8_t vnpu_priority[MAX_VNPU];
     atomic_int owner;
     atomic_uint_fast32_t magic_number;
     atomic_int slide_window_len;
@@ -70,6 +71,7 @@ typedef struct npu_info {
     int card_id;
     int device_id;
     uint8_t vnpu_id;
+    uint8_t vnpu_priority;
     bool in_used;
     size_t mem_request_quota;
     size_t mem_limit_quota;
@@ -98,6 +100,7 @@ extern char *get_vnpu_shm_id(void);
 extern int get_mem_used(size_t *used);
 extern int get_device_id(void);
 extern uint8_t get_vnpu_id(void);
+extern uint8_t get_vnpu_priority(void);
 extern int get_card_id(void);
 extern schedule_policy_t get_sched_policy(void);
 extern bool check_init_success(void);

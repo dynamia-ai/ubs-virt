@@ -22,6 +22,7 @@ typedef struct allocation {
     uint64_t hbm_limit;
     int32_t sched_policy;
     int32_t swap_priority;
+    int32_t vnpu_priority;
     uint64_t create_time_ns;
     uint64_t update_time_ns;
     uint64_t swap_offset;

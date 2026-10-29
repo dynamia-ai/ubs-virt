@@ -77,7 +77,8 @@ int npu_tree_mark_free(npu_tree_t *tree, npu_node_t *node, int vnpu_id);
 int npu_tree_mark_vnpu_occupied(npu_tree_t *tree, npu_node_t *node, int vnpu_id);
 int npu_tree_mark_vnpu_free(npu_tree_t *tree, npu_node_t *node, int vnpu_id);
 int npu_tree_update_quota(npu_tree_t *tree, npu_node_t *node, int32_t aicore_delta, int64_t hbm_delta);
-int npu_tree_attach_policy(npu_tree_t *tree, npu_node_t *node, int vnpu_id, int32_t sched_policy);
+int npu_tree_attach_policy(npu_tree_t *tree, npu_node_t *node, int vnpu_id, int32_t sched_policy,
+                           int32_t vnpu_priority);
 int npu_tree_detach_policy(npu_tree_t *tree, npu_node_t *node, int vnpu_id);
 int npu_node_validate_policy(npu_node_t *node, int32_t sched_policy);
 

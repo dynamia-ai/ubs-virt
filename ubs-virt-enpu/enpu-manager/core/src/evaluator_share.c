@@ -29,6 +29,7 @@ typedef struct share_candidate {
     uint64_t avail_hbm;
     int32_t vnpu_count;
     int32_t minor_id;
+    int32_t vnpu_priority;
     bool policy_ok;
     bool die_oversub_enabled; /* 该 die 是否启用显存超分（oversub_ratio > 0） */
 } share_candidate_t;
@@ -73,10 +74,28 @@ static int compare_anti_fragment(const void *a, const void *b)
     return ca->minor_id - cb->minor_id;
 }
 
+static int compare_load_balance(const void *a, const void *b)
+{
+    const share_candidate_t *ca = (const share_candidate_t *)a;
+    const share_candidate_t *cb = (const share_candidate_t *)b;
+
+    if (ca->vnpu_count != cb->vnpu_count) {
+        return ca->vnpu_count - cb->vnpu_count;
+    }
+    if (ca->avail_hbm != cb->avail_hbm) {
+        return (ca->avail_hbm < cb->avail_hbm) ? 1 : -1;
+    }
+    return ca->minor_id - cb->minor_id;
+}
+
 static int compare_share_candidates(const void *a, const void *b)
 {
     const share_candidate_t *ca = (const share_candidate_t *)a;
     const share_candidate_t *cb = (const share_candidate_t *)b;
+
+    if (ca->vnpu_priority == VNPU_PRIORITY_HIGH) {
+        return compare_load_balance(a, b);
+    }
 
     /* 非超分 die 优先：vNPU 不支持显存超分时, 候选里既有 oversub die 又有非 oversub die, 
      * 把非 oversub die 排前面. vNPU 支持超分时所有候选都是 oversub die, 此规则不生效.  */
@@ -101,11 +120,16 @@ static int evaluator_share_evaluate(evaluator_t *eval, npu_tree_t *tree, eval_re
     // evaluator_share_init_with_strategy 在初始化阶段写入（值来自 conf 的 share-strategy）,
     // compare_share_candidates 直接读它, 无需在此从 private_data 中转拷贝.
 
-    if (req->aicore_quota <= 0 || req->hbm_quota == 0) {
+    if ((req->vnpu_priority == VNPU_PRIORITY_NORMAL && req->aicore_quota <= 0) || req->hbm_quota == 0) {
         return ENPU_INVALID_PARAM;
     }
 
-    if (req->sched_policy < SCHED_POLICY_FIXED_SHARE || req->sched_policy > SCHED_POLICY_BEST_EFFORT) {
+    if (req->vnpu_priority != VNPU_PRIORITY_NORMAL && req->vnpu_priority != VNPU_PRIORITY_HIGH) {
+        return ENPU_INVALID_PARAM;
+    }
+
+    if (req->vnpu_priority == VNPU_PRIORITY_NORMAL &&
+        (req->sched_policy < SCHED_POLICY_FIXED_SHARE || req->sched_policy > SCHED_POLICY_BEST_EFFORT)) {
         return ENPU_INVALID_PARAM;
     }
 
@@ -214,7 +238,9 @@ static int evaluator_share_evaluate(evaluator_t *eval, npu_tree_t *tree, eval_re
         candidates[candidate_count].avail_hbm = avail_hbm;
         candidates[candidate_count].vnpu_count = npu_node_get_vnpu_count(node);
         candidates[candidate_count].minor_id = npu_node_get_minor_id(node);
-        candidates[candidate_count].policy_ok = (npu_node_validate_policy(node, req->sched_policy) == ENPU_SUCCESS);
+        candidates[candidate_count].vnpu_priority = req->vnpu_priority;
+        candidates[candidate_count].policy_ok = (req->vnpu_priority == VNPU_PRIORITY_HIGH) ||
+                                                (npu_node_validate_policy(node, req->sched_policy) == ENPU_SUCCESS);
         candidates[candidate_count].die_oversub_enabled = die_oversub_enabled;
         LOG_INFO("candidate[%d]: phy_id=%d vnpu_count=%d avail_aicore=%d avail_hbm=%lu -> vnpu_id=%d policy_ok=%d",
                  candidate_count, phy_id, candidates[candidate_count].vnpu_count, avail_aicore,

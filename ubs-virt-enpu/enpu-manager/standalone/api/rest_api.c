@@ -442,10 +442,11 @@ static int route_request(rest_api_server_t *server, const char *method, const ch
                          "{\"phy_id\":%d,\"vnpu_id\":%d,\"pod_uid\":\"%s\",\"container_name\":\"%s\","
                          "\"die_id\":\"%s\",\"shm_id\":\"%s\","
                          "\"aicore_quota\":%d,\"hbm_quota\":%lu,\"hbm_limit\":%lu,\"sched_policy\":%d,"
+                         "\"vnpu_priority\":%d,"
                          "\"minor_name\":\"%s\",\"result\":%d,\"error_msg\":\"%s\"}",
                          resp.phy_id, resp.vnpu_id, resp.pod_uid, resp.container_name, resp.die_id, resp.shm_id,
-                         resp.aicore_quota, resp.hbm_quota, resp.hbm_limit, resp.sched_policy, resp.minor_name,
-                         resp.result, resp.error_msg);
+                         resp.aicore_quota, resp.hbm_quota, resp.hbm_limit, resp.sched_policy, resp.vnpu_priority,
+                         resp.minor_name, resp.result, resp.error_msg);
         CHECK_COND_LOG_(ret < 0, "snprintf_s response failed.");
         return result == ENPU_SUCCESS ? HTTP_STATUS_OK : HTTP_STATUS_BAD_REQUEST;
     }
@@ -699,6 +700,10 @@ static int parse_json_alloc_request(const char *body, alloc_request_t *req)
     if (num != NULL) {
         req->swap_priority = (int)strtol(num, NULL, 10);
     }
+    num = json_number_value(body, "\"vnpu_priority\"");
+    if (num != NULL) {
+        req->vnpu_priority = (int)strtol(num, NULL, 10);
+    }
     num = json_number_value(body, "\"phy_id\"");
     if (num != NULL) {
         req->predicate_phy_id = (int)strtol(num, NULL, 10);
@@ -891,10 +896,10 @@ static char *format_allocations_json(enpu_manager_t *mgr)
                              "\"phy_id\":%d,\"vnpu_id\":%d,"
                              "\"die_id\":\"%s\",\"aicore_quota\":%d,"
                              "\"hbm_quota\":%lu,\"hbm_limit\":%lu,\"sched_policy\":%d,"
-                             "\"swap_priority\":%d}",
+                             "\"swap_priority\":%d,\"vnpu_priority\":%d}",
                              alloc->pod_uid, alloc->container_name, alloc->phy_id, alloc->vnpu_id, alloc->die_id,
                              alloc->aicore_quota, alloc->hbm_quota, alloc->hbm_limit, alloc->sched_policy,
-                             alloc->swap_priority);
+                             alloc->swap_priority, alloc->vnpu_priority);
         if (fmt_ret < 0) {
             goto overflow;
         }
