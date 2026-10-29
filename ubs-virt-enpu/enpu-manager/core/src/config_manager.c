@@ -77,9 +77,10 @@ static int generate_config_content(vnpu_config_t *config, char *content, int max
                          "memory-request=%lu\n"
                          "memory-limit=%lu\n"
                          "shm-id=%s\n"
-                         "scheduling-policy=%d\n",
+                         "scheduling-policy=%d\n"
+                         "vnpu_priority=%d\n",
                          config->phy_npu_id, config->vnpu_id, config->aicore_quota, config->memory_request,
-                         config->memory_limit, config->shm_id, config->scheduling_policy);
+                         config->memory_limit, config->shm_id, config->scheduling_policy, config->vnpu_priority);
 
     if (written < 0) {
         return ENPU_FAIL;

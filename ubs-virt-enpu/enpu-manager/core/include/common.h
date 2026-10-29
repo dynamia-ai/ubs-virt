@@ -30,6 +30,8 @@
 #define MAX_NPU_PER_NODE 16
 #define MAX_VNPU_PER_DIE 128
 #define HUNDRED_CORE 100
+#define VNPU_PRIORITY_NORMAL 0
+#define VNPU_PRIORITY_HIGH 1
 #define MAX_ALLOC_COUNT 1024
 #define DEFAULT_CHECKPOINT_PATH "/var/lib/enpu-manager/checkpoint.json"
 #define MAX_PATH_LEN 256

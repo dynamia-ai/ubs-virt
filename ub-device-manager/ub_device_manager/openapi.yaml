@@ -1,0 +1,1039 @@
+﻿#-- coding: utf-8 -- #Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
+# ubs-optimizer is licensed under Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+# http://license.coscl.org.cn/MulanPSL2
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+
+openapi: 3.0.3
+info:
+  title: UB Device Manager
+  version: 1.0.0
+  description: UDS HTTP service that runs only on the local node
+servers:
+  - url: http://localhost
+tags:
+  - name: VM
+    description: Lifecycle management APIs for creating, deleting, and managing VMs
+  - name: SSU
+    description: SSU storage resource management APIs
+  - name: UB
+    description: UB/NPU device query APIs
+  - name: Task
+    description: Async task status query APIs
+paths:
+
+  /ssu-ns/{name}:
+    get:
+      summary: Get storage space namespace information
+      description: Query capacity usage of each namespace under a storage space, including total and used capacity
+      operationId: show_ssu_ns_status
+      tags:
+        - SSU
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Storage space identifier
+
+
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: array
+                description: Namespace statistics list
+                items:
+                  $ref: '#/components/schemas/SsuNsStatus'
+  /ssu-ns/connect-info:
+    get:
+      summary: Query NVMe connection information for a storage space on a specified VFE
+      description: Query NVMe connection information for a storage space on a specified VFE, including subsystem NQN, host NQN, namespace ID, etc.
+      operationId: get_ns_connnect_info
+      tags:
+        - SSU
+      parameters:
+        - name: name
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Storage space identifier
+        - name: vfe_guid
+          in: query
+          required: false
+          schema:
+            type: string
+          description: vfe_guid
+          example: "0000-0-00000000"
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: array
+                description: Namespace statistics list
+                items:
+                  $ref: '#/components/schemas/NsConnectInfo'
+
+
+  /ssu:
+    get:
+      summary: List all allocated storage spaces
+      description: Get details of all allocated SSU storage spaces in the system, including namespace list, capacity, LBA format, and usage type
+      operationId: get_ssu_list      # [optional] unique operation identifier (often used as the function name during code generation)
+      tags:
+        - SSU
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: array
+                description: List of SSU allocation results
+                items:
+                  $ref: '#/components/schemas/SsuInfo'
+
+  /ssu/{name}:
+    get:
+      summary: Get allocated storage space information by name
+      description: Get allocated storage space information by name, including namespace list, capacity, LBA format, and usage type
+      operationId: show_ssu_alloc_info
+      tags:
+        - SSU
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+          description: SSU name
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SsuInfo'
+    delete:
+      summary: Free SSU space
+      description: Free the space resource corresponding to the given SSU name
+      operationId: free_ssu
+      tags:
+        - SSU
+      parameters:
+        - name: name
+          in: path
+          required: true
+          description: SSU name
+          schema:
+            type: string
+            example: "ssu-volume-001"
+      responses:
+        '200':
+          description: SSU freed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+
+  /ssu/alloc:
+    post:
+      summary: Allocate SSU storage space
+      description: Allocate a specified number and size of namespaces based on the request parameters; supports both sequential and distributed allocation strategies
+      operationId: ssu_alloc
+      tags:
+        - SSU
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SsuAllocSpaceReq'
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SsuInfo'
+
+
+  /ssu/add-perm:
+    post:
+      summary: Add SSU access permission
+      description: Add NQN access permission for a specific host to the specified SSU volume
+      operationId: add_ssu_perm
+      tags:
+        - SSU
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SsuPermReq'
+      responses:
+        '200':
+          description: Permission added successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '400':
+          description: Invalid request parameters (e.g., malformed NQN or empty SSU name)
+        '404':
+          description: Specified SSU resource not found
+
+  /ssu/rm-perm:
+    post:
+      summary: Remove SSU access permission
+      description: Remove the NQN access permission of a specific host from the specified SSU volume
+      operationId: remove_ssu_perm
+      tags:
+        - SSU
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SsuPermReq'
+      responses:
+        '200':
+          description: Permission removed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '400':
+          description: Invalid request parameters (e.g., malformed NQN or empty SSU name)
+        '404':
+          description: Specified SSU resource not found
+
+
+  /ssu/attach:
+    post:
+      summary: Attach an allocated SSU storage space
+      description: Attach the specified storage space to the system and return the device paths after attaching
+      operationId: ssu_attach
+      tags:
+        - SSU
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SsuSpaceReq'
+      responses:
+        '200':
+          description: Attached successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SsuAttachResult'
+
+  /ssu/detach:
+    post:
+      summary: Detach an allocated SSU storage space
+      description: Detach the specified storage space from the system and release the device
+      operationId: ssu_detach
+      tags:
+        - SSU
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SsuSpaceReq'
+      responses:
+        '200':
+          description: Detached successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+
+
+
+
+  /ssu-vfe:
+    get:
+      summary: List all SSU-specific VFEs
+      description: Query VFE information used for SSU connection setup
+      operationId: get_ssu_vfe_list
+      tags:
+        - SSU
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: array
+                description: List of SSU-specific VFEs
+                items:
+                  $ref: '#/components/schemas/VfeForSsu'
+
+  /ssu-vfe/bind:
+    post:
+      summary: Bind the specified VFE to the bus
+      description: Bind the specified VFE to the bus so that the VM can communicate with the physical machine through this VFE; when bus_guid is omitted, it is allocated automatically
+      operationId: bind_ssu_vfe_bus
+      tags:
+        - SSU
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BindSsuVfeReq'
+
+      responses:
+        '200':
+          description: Permission added successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+
+  /ssu-vfe/unbind:
+    post:
+      summary: Unbind the specified VFE from bus_guid
+      description: Pass in the VFE GUID, wrap it as a VFE object, look up the corresponding bus_guid via UBSE, and call the unbind API with the combination. Because a VM can use only one ssu-vfe, the parameter is a unique vfe_guid
+      operationId: unbind_ssu_vfe
+      tags:
+        - SSU
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UnbindSsuVfeReq'
+      responses:
+        '200':
+          description: Bus unbound successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+  /npu:
+    get:
+      summary: List all NPU devices
+      description: Get details of all NPU devices on the current node, including ID, GUID, and bus instance GUID
+      operationId: get_npu_list      # [optional] unique operation identifier (often used as the function name during code generation)
+      tags:
+        - UB
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: array
+                description: NPU information list
+                items:
+                  $ref: '#/components/schemas/NpuDeviceInfo'
+  /npu/bind:
+    post:
+      summary: Enable UB devices
+      description: >
+        Validate and select the specified UB devices (when need_nic is true, NIC devices are added automatically based on NPU affinity),
+        call UBSE to allocate devices to obtain the bus instance GUID, then query the tid, uba, and size of that bus instance.
+        Returns tid, uba, size, bus_guid, and the list of bound devices.
+      operationId: bind_npu_device
+      tags:
+        - UB
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BindNpuDeviceRequest'
+      responses:
+        '200':
+          description: UB devices enabled successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BindNpuDeviceResult'
+        '400':
+          description: Invalid request parameters (e.g., malformed upi or empty device list)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '545':
+          description: NPU device selection failed (device does not exist, is already bound, has insufficient free devices, or has no available affinity NIC)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+  /npu/unbind:
+    post:
+      summary: Disable UB devices
+      description: >
+        Query all UB devices bound to the bus instance GUID; if no device is bound, return a failure;
+        otherwise pass these devices together with the bus instance GUID to the UBSE free_devices interface for release.
+      operationId: unbind_npu_device
+      tags:
+        - UB
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UnbindNpuDeviceRequest'
+      responses:
+        '200':
+          description: UB devices disabled successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '400':
+          description: Invalid request parameters (bus_guid is empty)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '534':
+          description: Failed to release UB devices (UBSE free_devices call failed)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '548':
+          description: The bus instance does not exist or has no bound devices
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+  /vm/create:
+    post:
+      summary: Create an A5 NPU passthrough VM
+      description: >
+        Based on the user-provided libvirt domain XML and UB device requirements, select and allocate UB/NPU devices on the local host,
+        assemble the A5 NPU passthrough VM XML, and define and start the VM when the libvirt creation switch is enabled.
+        The XML parameter can be XML content or the path to an XML file readable by the server.
+      operationId: create_vm
+      tags:
+        - VM
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateVmRequest'
+      responses:
+        '200':
+          description: VM created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '400':
+          description: Invalid request parameters or input XML
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '545':
+          description: NPU device selection failed (device does not exist, is already bound, has insufficient free devices, or has no available affinity NIC)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '543':
+          description: Failed to assemble the VM XML
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '544':
+          description: Failed to define or start the VM via libvirt
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+  /vm/{name}:
+    delete:
+      summary: Delete a VM by name
+      description: Delete the VM via libvirt by VM name; if it has UB devices, unbind them
+      operationId: delete_vm
+      tags:
+        - VM
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+          description: VM name
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '400':
+          description: Invalid request parameters (e.g., empty VM name)
+        '404':
+          description: Specified VM not found
+
+components:
+  schemas:
+
+    CreateVmRequest:
+      type: object
+      description: Request to create an A5 NPU passthrough VM.
+      required:
+        - upi
+      properties:
+        xml_text:
+          type: string
+          nullable: true
+          description: libvirt domain XML content. Exactly one of xml_text and xml_path must be provided.
+          example: <domain><name>vm</name></domain>
+        xml_path:
+          type: string
+          nullable: true
+          description: Path to a libvirt domain XML file readable by the server. Exactly one of xml_text and xml_path must be provided.
+          example: /path/to/domain.xml
+        upi:
+          type: string
+          pattern: '^0[xX]([1-9a-fA-F][0-9a-fA-F]{0,2}|0[1-9a-fA-F][0-9a-fA-F]{0,2}|00[1-9a-fA-F][0-9a-fA-F]?|000[1-9a-fA-F])$'
+          description: User isolation identifier in hexadecimal (one to four digits; prefix and digits are case-insensitive), from 0x0001 to 0x0fff.
+          example: "0x000f"
+        need_nic:
+          type: boolean
+          default: false
+          description: Whether to automatically select NIC devices based on NPU affinity.
+          example: false
+        npu_ids:
+          type: array
+          nullable: true
+          description: Explicit NPU device IDs. Duplicates are not allowed and this field is mutually exclusive with npu_count.
+          items:
+            type: string
+          example: ["1-1", "1-2"]
+        npu_count:
+          type: integer
+          nullable: true
+          enum:
+            - 1
+            - 2
+            - 4
+            - 8
+          description: >-
+            Number of free NPUs to select automatically; mutually exclusive with
+            npu_ids. Only 1, 2, 4, or 8 are allowed. Omit both npu_ids and
+            npu_count to create a regular VM without NPUs.
+          example: 2
+
+    BindNpuDeviceRequest:
+      type: object
+      description: Request to bind UB devices. Exactly one of ids and count must be provided.
+      required:
+        - upi
+      properties:
+        upi:
+          type: string
+          pattern: '^0[xX]([1-9a-fA-F][0-9a-fA-F]{0,2}|0[1-9a-fA-F][0-9a-fA-F]{0,2}|00[1-9a-fA-F][0-9a-fA-F]?|000[1-9a-fA-F])$'
+          description: User isolation identifier in hexadecimal (one to four digits; prefix and digits are case-insensitive), from 0x0001 to 0x0fff.
+          example: "0x000f"
+        ids:
+          type: array
+          nullable: true
+          description: Explicit NPU device IDs. Duplicates are not allowed; only 1, 2, 4, or 8 IDs are allowed and this field is mutually exclusive with count.
+          items:
+            type: string
+          example: ["1-1", "1-2"]
+        count:
+          type: integer
+          nullable: true
+          enum:
+            - 1
+            - 2
+            - 4
+            - 8
+          description: Number of free NPUs to select automatically. Only 1, 2, 4, or 8 are allowed and this field is mutually exclusive with ids.
+          example: 2
+        need_nic:
+          type: boolean
+          default: false
+          description: Whether to automatically select NIC devices based on NPU affinity.
+          example: false
+
+    UnbindNpuDeviceRequest:
+      type: object
+      description: Request to unbind UB devices.
+      required:
+        - bus_guid
+      properties:
+        bus_guid:
+          type: string
+          maxLength: 128
+          description: Bus instance GUID returned when UB devices were bound.
+          example: "0xcc08-a002-0-0-000000-00000038c8c1008c"
+    BindNpuDeviceResult:
+      type: object
+      description: UB device binding result.
+      required:
+        - tid
+        - uba
+        - size
+        - bus_guid
+        - devices
+      properties:
+        tid:
+          type: integer
+          description: Bus instance TID.
+          example: 11
+        uba:
+          type: integer
+          description: Bus instance UBA.
+          example: 22
+        size:
+          type: integer
+          description: Bus instance memory size.
+          example: 1024
+        bus_guid:
+          type: string
+          maxLength: 128
+          description: Bus instance GUID returned after device allocation.
+          example: "0xcc08-a002-0-0-000000-00000038c8c1008c"
+        devices:
+          type: array
+          description: Bound UB devices.
+          items:
+            $ref: '#/components/schemas/BoundUbDevice'
+
+    NsConnectInfo:
+      type: object
+      description: Storage connection information.
+      properties:
+        src_eid:
+          type: string
+          default: ""
+          description: Source EID.
+        tgt_eid:
+          type: string
+          default: ""
+          description: Target EID.
+        tgt_nqn:
+          type: string
+          default: ""
+          description: Target NQN address.
+        host_nqn:
+          type: string
+          default: ""
+          description: Host NQN.
+        ns_uuid:
+          type: string
+          default: ""
+          description: Namespace UUID.
+        ns_id:
+          type: integer
+          default: 0
+          description: Namespace ID.
+
+
+    SsuNsStatus:
+      type: object
+      description: Namespace usage statistics.
+      properties:
+        ns_uuid:
+          type: string
+          default: ""
+          description: Namespace UUID.
+        ns_id:
+          type: integer
+          default: 0
+          description: Namespace ID.
+        total_size:
+          type: integer
+          default: 0
+          description: Total namespace size.
+        used_size:
+          type: integer
+          default: 0
+          description: Used namespace size.
+
+    BindSsuVfeReq:
+      type: object
+      description: Request to bind a VFE.
+      required:
+        - upi
+        - vfe_guid
+        - bus_guid
+      properties:
+        upi:
+          type: integer
+          description: Tenant isolation identifier.
+        vfe_guid:
+          type: string
+          description: SSU VFE GUID.
+          example: "0000-0-0000-00000000"
+        bus_guid:
+          type: string
+          maxLength: 32
+          description: >-
+            Bus instance GUID. Can be empty (empty string means ubse creates a
+            new VM bus instance internally); when non-empty, its length must be 32.
+          example: ""
+
+
+    UnbindSsuVfeReq:
+      type: object
+      description: Request to unbind a VFE.
+      required:
+        - upi
+        - vfe_guid
+      properties:
+        upi:
+          type: integer
+          description: Tenant isolation identifier.
+        vfe_guid:
+          type: string
+          description: SSU VFE GUID.
+          example: "0000-0-0000-00000000"
+
+
+    VfeForSsu:
+      type: object
+      description: SSU VFE hardware resource information.
+      properties:
+        slot_id:
+          type: integer
+          format: uint8
+          default: 0
+          minimum: 0
+          maximum: 255
+          description: Slot ID.
+        chip_id:
+          type: integer
+          format: uint8
+          default: 0
+          minimum: 0
+          maximum: 255
+          description: Chip ID.
+        die_id:
+          type: integer
+          format: uint8
+          default: 0
+          minimum: 0
+          maximum: 255
+          description: Die ID
+        pfe_id:
+          type: integer
+          format: uint16
+          default: 0
+          minimum: 0
+          maximum: 65535
+          description: Physical function element ID.
+        vfe_id:
+          type: integer
+          format: uint16
+          default: 0
+          minimum: 0
+          maximum: 65535
+          description: Virtual function element ID.
+        vfe_guid:
+          type: string
+          description: vfe_guid
+        bind_bus_guid:
+          type: string
+          default: ""
+          description: Bound bus instance GUID.
+
+
+    SsuVfeAllocReq:
+      type: object
+      description: Request to bind a VFE to a VM.
+      required:
+        - upi
+        - vfe_guid
+      properties:
+        upi:
+          type: integer
+          description: Tenant isolation identifier.
+        vfe_guid:
+          type: string
+          format: bytearray-hex
+          description: VFE GUID.
+        bus_guid:
+          type: string
+          format: bytearray-hex
+          description: VM bus instance GUID, supplied as a hexadecimal string.
+
+
+    SsuPermReq:
+      type: object
+      required:
+        - name
+        - nqn
+      properties:
+        name:
+          type: string
+          description: SSU name.
+          example: "ssu-volume-001"
+        nqn:
+          type: string
+          description: NVMe host NQN identifier.
+          example: "nqn.2014-08.org.nvmexpress:uuid:fedcba98-7654-3210-fedc-ba9876543210"
+
+
+    SsuLbaFormat:
+      type: integer
+      description: >
+        LBA format definition.
+        FORMAT_512 = 512  # 512B
+        FORMAT_4K = 4096  # 4K
+      enum:
+        - 512
+        - 4096
+
+    SsuAllocStrategy:
+      type: integer
+      description: >
+        Allocation strategy:
+        0: STRIPED (distributed strategy).
+        1: LINEAR (sequential strategy).
+        2: NORMAL.
+      enum:
+        - 0
+        - 1
+        - 2
+
+    SsuAllocSpaceReq:
+      type: object
+      description: Storage allocation request.
+      required:
+        - name
+        - ns_size_gb
+        - ns_num
+        - lba_format
+        - strategy
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 48
+          description: Request identifier, with a maximum length of 48 characters.
+        ns_size_gb:
+          type: integer
+          format: int64
+          minimum: 1
+          description: >-
+            Requested total capacity in GB. Must be greater than or equal to 1.
+        ns_num:
+          type: integer
+          format: int32
+          minimum: 1
+          description: >-
+            Number of namespaces. When ns_num is 1, strategy cannot be STRIPED (0).
+        lba_format:
+          $ref: '#/components/schemas/SsuLbaFormat'
+        strategy:
+          $ref: '#/components/schemas/SsuAllocStrategy'
+        tenant:
+          type: string
+          default: ""
+          pattern: '^[a-zA-Z0-9_.:-]*$'
+          description: >-
+            Requester tenant isolation identifier. Can be empty; when non-empty,
+            only [a-zA-Z0-9_-.:] is allowed.
+
+
+
+    SsuSpaceReq:
+      type: object
+      description: Attach/detach request for a storage space.
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 48
+          description: SSU storage space identifier.
+          example: "ssu-volume-001"
+        nqn:
+          type: string
+          maxLength: 69
+          default: ""
+          description: Host NVMe Qualified Name (NQN). Can be empty.
+          example: "nqn.2014-08.org.nvmexpress:uuid:fedcba98-7654-3210-fedc-ba9876543210"
+        src_eid:
+          type: string
+          default: ""
+          maxLength: 17
+          description: Source EID (Endpoint Identifier). Can be empty.
+          example: "0x0000"
+
+
+
+
+
+    SsuAttachResult:
+      type: object
+      description: Result of attaching a storage space.
+      required:
+        - dev_paths
+      properties:
+        dev_paths:
+          type: array
+          description: Device paths returned after the storage space is attached.
+          items:
+            type: string
+            maxLength: 128
+          example: ["/dev/nvme0n1"]
+
+    SsuInfo:
+      type: object
+      description: SSU allocation result.
+      required:
+        - name
+        - strategy
+        - namespace_cnt
+        - namespaces
+      properties:
+        name:
+          type: string
+          maxLength: 256 # Update when the actual UBS_SSU_MAX_NAME_LENGTH is available.
+          description: SSU name (fixed-length string).
+          example: "ssu-volume-001"
+        strategy:
+          type: integer
+          format: int32
+          description: Allocation strategy.
+          example: 1
+        namespace_cnt:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Number of namespaces.
+          example: 2
+        namespaces:
+          type: array
+          description: Namespace information entries.
+          items:
+            $ref: '#/components/schemas/SsuNamespaceInfo'
+
+    SsuNamespaceInfo:
+      type: object
+      description: SSU namespace details.
+      required:
+        - tgt_eid
+        - tgt_nqn
+        - ns_uuid
+        - ns_id
+        - ns_dev_path
+        - ns_size
+        - lba_format
+      properties:
+        tgt_eid:
+          type: string
+          maxLength: 64 # Update when the actual UBS_SSU_MAX_EID_LENGTH is available.
+          description: Target EID (Endpoint Identifier).
+          example: "nqn.2014-08.org.nvmexpress:uuid:fedcba98-7654-3210-fedc-ba9876543210"
+        tgt_nqn:
+          type: string
+          maxLength: 256 # Update when the actual UBS_SSU_MAX_NQN_LENGTH is available.
+          description: Target NQN (NVMe Qualified Name).
+          example: "nqn.2014-08.com.example:nvme:subsystem-1"
+        ns_uuid:
+          type: string
+          maxLength: 64 # Update when the actual UBS_SSU_MAX_UUID_LENGTH is available.
+          description: Namespace UUID.
+          example: "123e4567-e89b-12d3-a456-426614174000"
+        ns_id:
+          type: integer
+          minimum: 0
+          description: Namespace ID.
+          example: 1
+        ns_dev_path:
+          type: string
+          maxLength: 128 # Update when the actual UBS_SSU_MAX_DEV_PATH_LENGTH is available.
+          description: Namespace device path in the VM.
+          example: "/dev/nvme0n1"
+        ns_size:
+          type: integer
+          minimum: 0
+          description: Namespace size in bytes.
+          example: 1099511627776
+        lba_format:
+          type: integer
+          description: LBA format (Logical Block Address Format).
+          example: 0
+
+
+    Message:
+      type: object
+      description: Response message.
+      required:
+        - msg
+      properties:
+        msg:
+          type: string
+          maxLength: 256
+          description: Returned message.
+          example: "success."
+
+    BoundUbDevice:
+      type: object
+      description: Bound device information. When need_nic is true, the list includes selected affinity NIC devices distinguished by type.
+      required:
+        - id
+        - guid
+        - type
+      properties:
+        id:
+          type: string
+          maxLength: 64
+          description: UB device ID.
+          example: "1-1"
+        guid:
+          type: string
+          maxLength: 128
+          description: UB device GUID.
+          example: "0xcc08-a000-0-2-000000-00000000000201ff"
+        type:
+          type: string
+          maxLength: 64
+          description: UB device type, such as NPU or NIC_VFE.
+          example: "NPU"
+
+    NpuDeviceInfo:
+      type: object
+      description: NPU device information.
+      required:
+        - id
+        - guid
+      properties:
+        id:
+          type: string
+          maxLength: 64
+          description: NPU device ID (fixed-length string).
+          example: "0-1"
+        guid:
+          type: string
+          maxLength: 128
+          description: NPU device GUID (fixed-length string).
+          example: "0xcc08-a000-0-2-000000-00000000000201ff"
+        bus_guid:
+          type: string
+          maxLength: 128
+          nullable: true
+          description: Bus instance GUID bound to the NPU device (fixed-length string).
+          example: "0xcc08-a002-0-0-000000-00000038c8c1008c"
+
