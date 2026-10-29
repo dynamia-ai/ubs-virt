@@ -219,9 +219,6 @@ static int file_adapter_load(storage_adapter_t *adapter, allocation_t *allocs, i
         cJSON *sched_policy = cJSON_GetObjectItem(item, "sched_policy");
         cJSON *swap_priority = cJSON_GetObjectItem(item, "swap_priority");
         cJSON *vnpu_priority = cJSON_GetObjectItem(item, "vnpu_priority");
-        if (vnpu_priority == NULL) {
-            vnpu_priority = cJSON_GetObjectItem(item, "priority"); /* 兼容旧版持久化数据 */
-        }
         cJSON *create_time_ns = cJSON_GetObjectItem(item, "create_time_ns");
         cJSON *update_time_ns = cJSON_GetObjectItem(item, "update_time_ns");
         cJSON *swap_offset = cJSON_GetObjectItem(item, "swap_offset");
