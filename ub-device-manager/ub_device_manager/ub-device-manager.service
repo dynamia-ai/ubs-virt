@@ -1,0 +1,34 @@
+##########################################################################################################
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+#
+# ub-device-manager is licensed under the Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#      http://license.coscl.org.cn/MulanPSL2
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+##########################################################################################################
+# @PYTHON3@ / @SITE_PACKAGES@ 占位符由 RPM 构建时(spec %install 的 sed)渲染为实际路径
+
+[Unit]
+Description=Ub Device Manager
+After=network.target
+
+[Service]
+Type=simple
+MemoryMax=1G
+# 对 UBSE/libvirt 的访问依赖对应的服务授权
+User=ub-device-manager
+Group=ub-device-manager
+RuntimeDirectory=ub_device_manager
+RuntimeDirectoryMode=0755
+WorkingDirectory=@SITE_PACKAGES@/ub_device_manager
+ExecStart=@PYTHON3@ @SITE_PACKAGES@/ub_device_manager/run.py
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
