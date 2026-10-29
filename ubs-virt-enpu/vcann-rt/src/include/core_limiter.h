@@ -40,8 +40,8 @@ extern "C" {
 #define MAX_STREAK 2
 
 #define VNPU_SCHEULE_PERIOD (100ULL * NS_PER_MS)                 // 100 ms
-#define VNPU_NORMAL_FAIRNESS_PERIOD (1ULL * NS_PER_S)             // Reserve normal-priority submit time once per second.
-#define VNPU_NORMAL_FAIRNESS_WINDOW (10ULL * NS_PER_MS)           // Normal-priority submit window: 1% admission time.
+#define VNPU_NORMAL_FAIRNESS_PERIOD (1ULL * NS_PER_S)            // Reserve normal-priority submit time once per second.
+#define VNPU_NORMAL_FAIRNESS_WINDOW (10ULL * NS_PER_MS)          // Normal-priority submit window: 1% admission time.
 #define VNPU_FLUSH_PERIOD (1ULL * NS_PER_MS)                     // 1ms
 #define VNPU_TIMEOUT_PERIOD (3ULL * NS_PER_MS)                   // 3ms
 #define VNPU_NO_TASK_TIMEOUT_PERIOD (5ULL * NS_PER_MS)           // 5ms

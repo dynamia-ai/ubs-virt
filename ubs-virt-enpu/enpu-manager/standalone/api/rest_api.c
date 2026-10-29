@@ -446,8 +446,7 @@ static int route_request(rest_api_server_t *server, const char *method, const ch
                          "\"minor_name\":\"%s\",\"result\":%d,\"error_msg\":\"%s\"}",
                          resp.phy_id, resp.vnpu_id, resp.pod_uid, resp.container_name, resp.die_id, resp.shm_id,
                          resp.aicore_quota, resp.hbm_quota, resp.hbm_limit, resp.sched_policy, resp.vnpu_priority,
-                         resp.minor_name,
-                         resp.result, resp.error_msg);
+                         resp.minor_name, resp.result, resp.error_msg);
         CHECK_COND_LOG_(ret < 0, "snprintf_s response failed.");
         return result == ENPU_SUCCESS ? HTTP_STATUS_OK : HTTP_STATUS_BAD_REQUEST;
     }
