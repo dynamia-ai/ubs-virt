@@ -8,10 +8,11 @@
 | --- | --- |
 | ubs-virt | `1.0.0`，提交 `46b6d55a892429008b1e02f96b0a0f81d1176db8` |
 | CANN | `9.1.0` |
-| 官方构建镜像 | `swr.cn-north-4.myhuaweicloud.com/ubscore/ubs-virt:oe2403-v1@sha256:f42bfc52ba01eaf1652421477b88425631a37ecd990191bf26c94084ce1a2c10` |
+| 构建镜像 | `ghcr.io/dynamia-ai/ubs-virt:oe2403-v1@sha256:f42bfc52ba01eaf1652421477b88425631a37ecd990191bf26c94084ce1a2c10` |
+| 原始来源 | `swr.cn-north-4.myhuaweicloud.com/ubscore/ubs-virt:oe2403-v1@sha256:f42bfc52ba01eaf1652421477b88425631a37ecd990191bf26c94084ce1a2c10` |
 | 构建平台 | `linux/arm64` |
 
-打包脚本默认从固定提交导出源码；持续构建流程显式传入本次提交。构建过程使用镜像内的 CANN 和驱动 SDK，不需要 NPU、宿主机驱动或设备挂载；编译阶段禁用网络。
+打包脚本默认从固定提交导出源码；持续构建流程显式传入本次提交。GHCR 构建镜像是原始来源的逐层副本，使用相同的 digest；切换镜像仓库不改变 CANN 或驱动 SDK 的版本。构建过程使用镜像内的 CANN 和驱动 SDK，不需要 NPU、宿主机驱动或设备挂载；编译阶段禁用网络。
 
 ## 构建
 
