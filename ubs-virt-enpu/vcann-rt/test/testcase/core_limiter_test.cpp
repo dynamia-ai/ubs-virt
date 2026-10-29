@@ -41,6 +41,7 @@ extern pthread_mutex_t g_sched_mutex;
 // Internal helpers used by the stream/event capture state machine.
 bool is_vnpu_alive(int vnpu_id);
 bool check_timeout(atomic_uint_fast64_t *timestamp, uint64_t timeout_period);
+bool priority_admission_allowed(const vnpu_time_slice_sched_t *sched, uint8_t priority, uint64_t now);
 // restore_streams is external-linkage in core_limiter.c but not declared in any public header.
 void restore_streams(rtStream_t stream);
 }
@@ -284,13 +285,110 @@ TEST_F(CoreLimiterTest, is_vnpu_alive_self)
     EXPECT_TRUE(alive);
 }
 
-// core_limiter is a no-op when !is_core_limit (best-effort policy).
+// Best-effort bypasses quota scheduling when there is no competing demand.
 TEST_F(CoreLimiterTest, core_limiter_best_effort_no_op)
 {
     MOCKER(is_core_limit).stubs().will(returnValue(false));
     // Should return immediately without blocking.
     core_limiter(nullptr, nullptr, nullptr);
     SUCCEED();
+}
+
+TEST_F(CoreLimiterTest, high_priority_best_effort_records_submission_demand)
+{
+    MOCKER(is_core_limit).stubs().will(returnValue(false));
+    MOCKER(get_vnpu_priority).stubs().will(returnValue((uint8_t)VNPU_PRIORITY_HIGH));
+    uint64_t before = ns_now();
+
+    core_limiter(nullptr, nullptr, nullptr);
+
+    EXPECT_GE(atomic_load(&g_vnpu_sched_context->last_kernel_time_ns[g_vnpu_id]), before);
+}
+
+class PriorityAdmissionTest : public testing::Test {
+protected:
+    void SetUp() override
+    {
+        for (int i = 0; i < MAX_VNPU; ++i) {
+            atomic_store(&sched_.vnpu_priority[i], VNPU_PRIORITY_NORMAL);
+            atomic_store(&sched_.last_alive_time_ns[i], 0);
+            atomic_store(&sched_.last_kernel_time_ns[i], 0);
+        }
+    }
+
+    void publish(uint8_t priority, uint64_t alive, uint64_t task)
+    {
+        atomic_store(&sched_.vnpu_priority[1], priority);
+        atomic_store(&sched_.last_alive_time_ns[1], alive);
+        atomic_store(&sched_.last_kernel_time_ns[1], task);
+    }
+
+    vnpu_time_slice_sched_t sched_{};
+    const uint64_t normal_window_ = 10 * VNPU_NORMAL_FAIRNESS_PERIOD + VNPU_NORMAL_FAIRNESS_WINDOW - 1;
+    const uint64_t high_window_ = 10 * VNPU_NORMAL_FAIRNESS_PERIOD + VNPU_NORMAL_FAIRNESS_WINDOW;
+};
+
+TEST_F(PriorityAdmissionTest, alive_high_priority_without_tasks_does_not_throttle_normal)
+{
+    publish(VNPU_PRIORITY_HIGH, high_window_, 0);
+    EXPECT_TRUE(priority_admission_allowed(&sched_, VNPU_PRIORITY_NORMAL, high_window_));
+}
+
+TEST_F(PriorityAdmissionTest, idle_high_priority_releases_normal_even_with_fresh_heartbeat)
+{
+    publish(VNPU_PRIORITY_HIGH, high_window_, high_window_ - VNPU_NO_TASK_TIMEOUT_PERIOD - 1);
+    EXPECT_TRUE(priority_admission_allowed(&sched_, VNPU_PRIORITY_NORMAL, high_window_));
+}
+
+TEST_F(PriorityAdmissionTest, active_high_priority_preserves_normal_window)
+{
+    publish(VNPU_PRIORITY_HIGH, normal_window_, normal_window_);
+    EXPECT_TRUE(priority_admission_allowed(&sched_, VNPU_PRIORITY_NORMAL, normal_window_));
+    publish(VNPU_PRIORITY_HIGH, high_window_, high_window_);
+    EXPECT_FALSE(priority_admission_allowed(&sched_, VNPU_PRIORITY_NORMAL, high_window_));
+}
+
+TEST_F(PriorityAdmissionTest, high_priority_yields_only_to_active_normal_demand)
+{
+    publish(VNPU_PRIORITY_NORMAL, normal_window_, 0);
+    EXPECT_TRUE(priority_admission_allowed(&sched_, VNPU_PRIORITY_HIGH, normal_window_));
+    publish(VNPU_PRIORITY_NORMAL, normal_window_, normal_window_);
+    EXPECT_FALSE(priority_admission_allowed(&sched_, VNPU_PRIORITY_HIGH, normal_window_));
+    publish(VNPU_PRIORITY_NORMAL, high_window_, high_window_);
+    EXPECT_TRUE(priority_admission_allowed(&sched_, VNPU_PRIORITY_HIGH, high_window_));
+}
+
+TEST_F(PriorityAdmissionTest, waiting_normal_is_released_when_high_priority_exits)
+{
+    publish(VNPU_PRIORITY_HIGH, high_window_, high_window_);
+    EXPECT_FALSE(priority_admission_allowed(&sched_, VNPU_PRIORITY_NORMAL, high_window_));
+    uint64_t after_exit = high_window_ + VNPU_TIMEOUT_PERIOD + 1;
+    EXPECT_TRUE(priority_admission_allowed(&sched_, VNPU_PRIORITY_NORMAL, after_exit));
+}
+
+TEST_F(PriorityAdmissionTest, waiting_normal_is_released_when_high_priority_stops_submitting)
+{
+    publish(VNPU_PRIORITY_HIGH, high_window_, high_window_);
+    EXPECT_FALSE(priority_admission_allowed(&sched_, VNPU_PRIORITY_NORMAL, high_window_));
+    uint64_t after_idle = high_window_ + VNPU_NO_TASK_TIMEOUT_PERIOD + 1;
+    publish(VNPU_PRIORITY_HIGH, after_idle, high_window_);
+    EXPECT_TRUE(priority_admission_allowed(&sched_, VNPU_PRIORITY_NORMAL, after_idle));
+}
+
+TEST_F(PriorityAdmissionTest, activity_expiry_boundary_and_concurrent_timestamp)
+{
+    publish(VNPU_PRIORITY_HIGH, high_window_, high_window_ - VNPU_NO_TASK_TIMEOUT_PERIOD);
+    EXPECT_FALSE(priority_admission_allowed(&sched_, VNPU_PRIORITY_NORMAL, high_window_));
+    publish(VNPU_PRIORITY_HIGH, high_window_, high_window_ - VNPU_NO_TASK_TIMEOUT_PERIOD - 1);
+    EXPECT_TRUE(priority_admission_allowed(&sched_, VNPU_PRIORITY_NORMAL, high_window_));
+    publish(VNPU_PRIORITY_HIGH, high_window_ + 1, high_window_ + 1);
+    EXPECT_FALSE(priority_admission_allowed(&sched_, VNPU_PRIORITY_NORMAL, high_window_));
+}
+
+TEST_F(PriorityAdmissionTest, null_context_allows_submission)
+{
+    EXPECT_TRUE(priority_admission_allowed(nullptr, VNPU_PRIORITY_NORMAL, high_window_));
+    EXPECT_TRUE(priority_admission_allowed(nullptr, VNPU_PRIORITY_HIGH, normal_window_));
 }
 
 // check_timeout returns true when timestamp is recent (within threshold).
