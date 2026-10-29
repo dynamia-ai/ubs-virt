@@ -125,11 +125,42 @@ void restore_streams(rtStream_t stream)
     return;
 }
 
+static bool priority_timestamp_is_recent(uint64_t timestamp, uint64_t now, uint64_t timeout)
+{
+    if (timestamp == 0) {
+        return false;
+    }
+    /* A concurrent publisher can write a timestamp just after our clock sample. */
+    uint64_t elapsed = timestamp <= now ? now - timestamp : timestamp - now;
+    return elapsed <= timeout;
+}
+
+bool priority_admission_allowed(const vnpu_time_slice_sched_t *sched, uint8_t priority, uint64_t now)
+{
+    if (sched == NULL) {
+        return true;
+    }
+
+    uint8_t competing_priority = priority == VNPU_PRIORITY_HIGH ? VNPU_PRIORITY_NORMAL : VNPU_PRIORITY_HIGH;
+    for (int i = 0; i < MAX_VNPU; ++i) {
+        if (atomic_load(&sched->vnpu_priority[i]) != competing_priority ||
+            !priority_timestamp_is_recent(atomic_load(&sched->last_alive_time_ns[i]), now, VNPU_TIMEOUT_PERIOD) ||
+            !priority_timestamp_is_recent(atomic_load(&sched->last_kernel_time_ns[i]), now,
+                                          VNPU_NO_TASK_TIMEOUT_PERIOD)) {
+            continue;
+        }
+        bool in_normal_window = now % VNPU_NORMAL_FAIRNESS_PERIOD < VNPU_NORMAL_FAIRNESS_WINDOW;
+        return priority == VNPU_PRIORITY_HIGH ? !in_normal_window : in_normal_window;
+    }
+    return true;
+}
+
 /*
- * Give normal-priority vNPUs a small periodic submission window while any
- * high-priority vNPU is alive. High-priority launches are held during the
- * same window. This is an admission-control guarantee: work already queued on
- * the device cannot be preempted by the host runtime.
+ * Share the periodic submission window only while the opposite priority has
+ * recent submission demand. An idle process's alive heartbeat is insufficient.
+ * Refresh demand while waiting, including high-priority best-effort callers.
+ * This controls host admission; it does not track completion or preempt work
+ * already queued on the device.
  */
 static void wait_for_priority_fairness_window(void)
 {
@@ -137,27 +168,11 @@ static void wait_for_priority_fairness_window(void)
         return;
     }
 
-    bool high_priority_alive = false;
-    bool normal_priority_alive = false;
-    for (int i = 0; i < MAX_VNPU; ++i) {
-        if (!is_vnpu_alive(i)) {
-            continue;
-        }
-        if (is_normal_priority_vnpu(i)) {
-            normal_priority_alive = true;
-        } else {
-            high_priority_alive = true;
-        }
-    }
-    if (!high_priority_alive || !normal_priority_alive) {
-        return;
-    }
-
-    bool is_high_priority = get_vnpu_priority() == VNPU_PRIORITY_HIGH;
+    uint8_t priority = get_vnpu_priority();
     while (!g_terminate) {
-        uint64_t phase = ns_now() % VNPU_NORMAL_FAIRNESS_PERIOD;
-        bool in_normal_window = phase < VNPU_NORMAL_FAIRNESS_WINDOW;
-        if ((is_high_priority && !in_normal_window) || (!is_high_priority && in_normal_window)) {
+        uint64_t now = ns_now();
+        atomic_store(&g_vnpu_sched_context->last_kernel_time_ns[g_vnpu_id], now);
+        if (priority_admission_allowed(g_vnpu_sched_context, priority, now)) {
             return;
         }
         ns_sleep(WAITING_SLEEP_PERIOD);
@@ -180,17 +195,21 @@ void core_limiter(rtStream_t stream, core_function func, void *param)
     /* Priority admission must also cover high-priority best-effort vNPUs,
      * which intentionally have no core quota and therefore bypass the normal
      * policy limiter below. */
-    wait_for_priority_fairness_window();
-
-    // when schedule policy is 3
     if (!is_core_limit()) {
+        wait_for_priority_fairness_window();
         return;
     }
     while (!g_terminate) {
+        /* A request waiting for its normal-policy turn is still submission demand. */
+        update_last_kernel_time_now();
         // g_sched_locking is a atomic_int for scheduler thread obtain lock with high priority
         if (atomic_load(&g_sched_locking)) {
             ns_sleep(WAITING_SLEEP_PERIOD);
             continue;
+        }
+        wait_for_priority_fairness_window();
+        if (g_terminate) {
+            return;
         }
         // waiting for mutex == waiting for launch task
         int rc = pthread_mutex_lock(&g_sched_mutex);
