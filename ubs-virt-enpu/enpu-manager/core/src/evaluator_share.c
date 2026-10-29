@@ -29,7 +29,7 @@ typedef struct share_candidate {
     uint64_t avail_hbm;
     int32_t vnpu_count;
     int32_t minor_id;
-    int32_t priority;
+    int32_t vnpu_priority;
     bool policy_ok;
     bool die_oversub_enabled; /* 该 die 是否启用显存超分（oversub_ratio > 0） */
 } share_candidate_t;
@@ -93,7 +93,7 @@ static int compare_share_candidates(const void *a, const void *b)
     const share_candidate_t *ca = (const share_candidate_t *)a;
     const share_candidate_t *cb = (const share_candidate_t *)b;
 
-    if (ca->priority == VNPU_PRIORITY_HIGH) {
+    if (ca->vnpu_priority == VNPU_PRIORITY_HIGH) {
         return compare_load_balance(a, b);
     }
 
@@ -120,15 +120,15 @@ static int evaluator_share_evaluate(evaluator_t *eval, npu_tree_t *tree, eval_re
     // evaluator_share_init_with_strategy 在初始化阶段写入（值来自 conf 的 share-strategy）,
     // compare_share_candidates 直接读它, 无需在此从 private_data 中转拷贝.
 
-    if ((req->priority == VNPU_PRIORITY_NORMAL && req->aicore_quota <= 0) || req->hbm_quota == 0) {
+    if ((req->vnpu_priority == VNPU_PRIORITY_NORMAL && req->aicore_quota <= 0) || req->hbm_quota == 0) {
         return ENPU_INVALID_PARAM;
     }
 
-    if (req->priority != VNPU_PRIORITY_NORMAL && req->priority != VNPU_PRIORITY_HIGH) {
+    if (req->vnpu_priority != VNPU_PRIORITY_NORMAL && req->vnpu_priority != VNPU_PRIORITY_HIGH) {
         return ENPU_INVALID_PARAM;
     }
 
-    if (req->priority == VNPU_PRIORITY_NORMAL &&
+    if (req->vnpu_priority == VNPU_PRIORITY_NORMAL &&
         (req->sched_policy < SCHED_POLICY_FIXED_SHARE || req->sched_policy > SCHED_POLICY_BEST_EFFORT)) {
         return ENPU_INVALID_PARAM;
     }
@@ -238,8 +238,8 @@ static int evaluator_share_evaluate(evaluator_t *eval, npu_tree_t *tree, eval_re
         candidates[candidate_count].avail_hbm = avail_hbm;
         candidates[candidate_count].vnpu_count = npu_node_get_vnpu_count(node);
         candidates[candidate_count].minor_id = npu_node_get_minor_id(node);
-        candidates[candidate_count].priority = req->priority;
-        candidates[candidate_count].policy_ok = (req->priority == VNPU_PRIORITY_HIGH) ||
+        candidates[candidate_count].vnpu_priority = req->vnpu_priority;
+        candidates[candidate_count].policy_ok = (req->vnpu_priority == VNPU_PRIORITY_HIGH) ||
                                                 (npu_node_validate_policy(node, req->sched_policy) == ENPU_SUCCESS);
         candidates[candidate_count].die_oversub_enabled = die_oversub_enabled;
         LOG_INFO("candidate[%d]: phy_id=%d vnpu_count=%d avail_aicore=%d avail_hbm=%lu -> vnpu_id=%d policy_ok=%d",

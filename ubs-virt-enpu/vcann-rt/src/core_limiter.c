@@ -727,9 +727,9 @@ int vnpu_scheduler_init(vnpu_time_slice_sched_t *vnpu_sched_shm)
     g_vnpu_id = get_vnpu_id();
 
     uint8_t aicore_limit_percent = get_core_limit_quota();
-    uint8_t priority = get_vnpu_priority();
-    atomic_store(&g_vnpu_sched_context->vnpu_priority[g_vnpu_id], priority);
-    if (priority == VNPU_PRIORITY_HIGH) {
+    uint8_t vnpu_priority = get_vnpu_priority();
+    atomic_store(&g_vnpu_sched_context->vnpu_priority[g_vnpu_id], vnpu_priority);
+    if (vnpu_priority == VNPU_PRIORITY_HIGH) {
         // High priority vNPU is excluded from owner rotation and runs tasks directly.
         return ENPU_SUCCESS;
     }
