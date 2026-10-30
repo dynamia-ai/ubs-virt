@@ -12,7 +12,7 @@
 
 <span id="version"></span>
 
-支持的 CANN 版本因硬件产品而异：Atlas A2、Atlas A3 推理系列产品支持 CANN 8.5.0 和 9.1.0；下表中的其他硬件产品支持 CANN 9.1.0。请按实际硬件选择对应表格中的版本，并保持编译环境与业务容器中的 CANN 版本一致。
+支持的 CANN 版本因硬件产品而异，请以对应硬件的软件版本表为准，并保持编译环境与业务容器中的 CANN 版本一致。
 
 #### Atlas A2 推理系列产品
 
@@ -166,15 +166,15 @@ vCANN-RT支持两种方式编译：
 
 在编译vCANN-RT源码前，用户根据物理机/业务容器的CANN环境设置CANN的环境变量。如果驱动安装在非默认路径，还需要设置驱动路径环境变量。
 
-例如，在支持 CANN 8.5.0 的硬件上编译时，先加载该版本的环境。以下路径请替换为实际安装路径：
+编译前先加载所选 CANN 版本的环境。以下路径请替换为实际安装路径：
 
 ```shell
-source /path/to/cann-8.5.0/set_env.sh
+source /path/to/cann/set_env.sh
 ```
 
 若驱动安装在非默认路径，还需执行`export ENPU_ASCEND_DRIVER_PATH=/path/to/Ascend`，其中路径应为实际包含`driver`目录的 Ascend 安装目录。
 
-`vCANN-RT`提供统一的编译构建脚本`make_build.sh`。当前脚本通过`ASCEND_HOME_PATH`读取 CANN 安装路径，不通过位置参数选择版本；CANN 8.5.0 和 9.1.0 均使用以下命令，无需追加`8.5.0`等版本参数：
+`vCANN-RT`提供统一的编译构建脚本`make_build.sh`，通过`ASCEND_HOME_PATH`读取 CANN 安装路径。加载 CANN 环境后，执行以下命令：
 
 ```shell
 bash make_build.sh
@@ -205,14 +205,14 @@ cd ubs-virt-enpu/vcann-rt
 
 在编译vCANN-RT源码前，用户需要根据实际业务场景选择CANN版本并设置环境变量，预编译镜像中的CANN安装路径为`/usr/local/Ascend/cann-xxx`。软切分支持的CANN版本可见[软件版本](#version)。
 
-下例使用 CANN 9.1.0；若使用 CANN 8.5.0，请将路径替换为`/usr/local/Ascend/cann-8.5.0/set_env.sh`，并确认该环境已安装且硬件支持该版本。
+下例使用 CANN 9.1.0；若使用其他受支持的 CANN 版本，请替换为对应的安装路径，并加载该版本的环境变量。
 
 ```shell
 # 以CANN 9.1.0为例，具体环境变量设置命令请参考CANN官方文档
 source /usr/local/Ascend/cann-9.1.0/set_env.sh
 ```
 
-加载所选 CANN 版本的环境后，执行统一构建命令。CANN 8.5.0 和 9.1.0 均无需向`make_build.sh`追加版本参数：
+加载所选 CANN 版本的环境后，执行统一构建命令：
 
 ```shell
 bash make_build.sh
@@ -678,11 +678,11 @@ export ENPU_LOG_LEVEL=4
 
 ## FAQ
 
-1. hook拦截runtime API提示`can't find function`:
+1. 启动时加载 runtime API 提示`Can not find function`:
 
-    请先确认硬件及 CANN 版本符合[软件版本](#version)中的支持范围。编译时应加载对应版本的 CANN 环境，业务容器中的 CANN 版本也应保持一致。
+    为兼容不同 CANN 版本，vCANN-RT 启动时会尝试加载多个版本的 runtime API。部分接口仅在高版本 CANN 中新增，低版本中不存在，因此可能出现`Can not find function ... because the runtime version ...`的 WARN 日志。
 
-    不同 CANN 版本提供的 runtime API 存在差异。若仍提示找不到函数，请根据日志中的具体 API 名称检查所选 CANN 是否提供该符号，以及预加载的软切分动态库是否使用同一版本 CANN 编译。
+    在符合[软件版本](#version)支持范围的环境中，缺少未使用的高版本新增接口属于正常的版本差异提示；业务运行正常时无需处理。若同时出现业务调用失败，请确认编译环境与业务容器中的 CANN 版本一致。
 
 2. 容器启动或者业务运行时报错`GLIBC_xxx not found`:
     
