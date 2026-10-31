@@ -14,7 +14,7 @@
 
 import pytest
 from ub_device_manager.exceptions import VmXmlBuildFailed
-from subprocess import CalledProcessError, CompletedProcess
+from subprocess import CalledProcessError, CompletedProcess, TimeoutExpired
 from unittest.mock import patch
 
 from ub_device_manager.domain.vm.vm_smbios import VmSmbios, SmbiosType131
@@ -49,6 +49,9 @@ def test_ignores_truncated_table():
 def test_reads_dmidecode():
     with patch('ub_device_manager.domain.vm.vm_smbios.subprocess.run', return_value=CompletedProcess([], 0, make_output(), '')) as run:
         assert VmSmbios().get_type131().pod_id == 65535
+        run.assert_called_once()
+        assert run.call_args.kwargs['timeout'] == 60
+        assert run.call_args.kwargs['check'] is True
         assert run.call_args.args[0] == ['/usr/bin/sudo', '-n', '/usr/sbin/dmidecode', '-t', '131', '-u']
 
 
@@ -63,3 +66,30 @@ def test_invalid_type131_fails_creation():
                return_value=CompletedProcess([], 0, 'No SMBIOS type 131 structures found.', '')):
         with pytest.raises(VmXmlBuildFailed, match='missing or invalid'):
             VmSmbios().get_type131()
+
+
+def test_timeout_fails_without_retry():
+    error = TimeoutExpired('dmidecode', 60)
+    with patch('ub_device_manager.domain.vm.vm_smbios.subprocess.run', side_effect=error) as run:
+        with pytest.raises(VmXmlBuildFailed, match='timed out after 60s') as caught:
+            VmSmbios().get_type131()
+    run.assert_called_once()
+    assert run.call_args.kwargs['timeout'] == 60
+    assert caught.value.__cause__ is error
+
+
+@pytest.mark.parametrize('error', [CalledProcessError(1, 'dmidecode'),
+                                 PermissionError('denied'), FileNotFoundError('dmidecode')])
+def test_non_timeout_errors_are_not_retried(error):
+    with patch('ub_device_manager.domain.vm.vm_smbios.subprocess.run', side_effect=error) as run:
+        with pytest.raises(VmXmlBuildFailed):
+            VmSmbios().get_type131()
+    run.assert_called_once()
+
+
+def test_invalid_data_is_not_retried():
+    with patch('ub_device_manager.domain.vm.vm_smbios.subprocess.run',
+               return_value=CompletedProcess([], 0, make_output(flag=1), '')) as run:
+        with pytest.raises(VmXmlBuildFailed, match='missing or invalid'):
+            VmSmbios().get_type131()
+    run.assert_called_once()

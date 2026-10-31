@@ -206,6 +206,7 @@ create_vm(
     npu_count=None,
     client=None,
     *,
+    affinity_policy=None,
 )
 ```
 
@@ -220,7 +221,7 @@ create_vm(
 | `npu_ids` | 否 | NPU 设备 ID 字符串列表。 |
 | `npu_count` | 否 | 自动选择的 NPU 数量，支持 1、2、4、8。 |
 | `client` | 否 | 客户端对象。 |
-| `affinity_policy` | 否 | 可选设备亲和性策略，支持 `"required"`、`"socket"`、`"preferred"`。 |
+| `affinity_policy` | 否 | 内存与 NPU 的亲和策略：`"required"`、`"socket"`、`"preferred"`；默认 `None`，保持原有设备选择行为。 |
 
 参数要求：
 
@@ -228,8 +229,70 @@ create_vm(
 - 请求 NPU 时，`npu_ids` 与 `npu_count` 二选一。
 - 指定设备 ID 时，不允许重复，数量只能为 1、2、4 或 8 个。
 - 创建普通虚拟机时，省略 `npu_ids` 和 `npu_count`。
-- `affinity_policy` 与 `npu_count` 配合使用，其前提和含义见 CLI 使用指南。
+- `affinity_policy` 仅支持与 `npu_count` 配合使用；与 `npu_ids` 同时传入（包括空列表），或未指定 `npu_count` 时，服务端返回 400。
 - 输入基础 XML 不应包含已有的 UB controller、UB hostdev 或 `ubmem_vmmu` 参数。
+
+#### 可选内存亲和策略
+
+下面先说明策略里用到的几个名称：
+
+- **NPU 亲和 NUMA**：与该 NPU 具有亲和关系的宿主 NUMA 节点。
+- **NPU 亲和 Socket**：该 NPU 亲和 NUMA 所属的宿主 Socket。
+- **虚拟机内存绑定 NUMA 集合 `N`**：虚拟机内存允许使用的所有宿主 NUMA 编号，由 XML 的内存绑定配置确定。重复编号只保留一次。
+- **虚拟机内存绑定 NUMA 集合对应的 Socket 集合 `S`**：`N` 里的每个 NUMA 都有所属的 Socket。把这些 Socket 编号放在一起，重复编号只保留一次，就得到 `S`。
+
+例如，XML 配置允许虚拟机内存使用宿主 NUMA 1、2，那么 `N={1,2}`；如果 NUMA 1 属于 Socket 0、NUMA 2 属于 Socket 1，那么 `S={0,1}`。
+
+策略判断的是每张待选 NPU 的亲和 NUMA 或亲和 Socket 是否属于上述集合：
+
+| 策略 | 选择规则 |
+| --- | --- |
+| `required` | 仅选择**亲和 NUMA 属于虚拟机内存绑定 NUMA 集合 `N`** 的空闲 NPU；满足条件的 NPU 数量不足 `npu_count` 时失败。 |
+| `socket` | 仅选择**亲和 Socket 属于虚拟机内存绑定 NUMA 集合对应的 Socket 集合 `S`** 的空闲 NPU；满足条件的 NPU 数量不足 `npu_count` 时失败。 |
+| `preferred` | 优先选择**亲和 Socket 属于集合 `S`** 的空闲 NPU；数量不足时，再从**亲和 Socket 不属于集合 `S`** 的其他空闲 NPU 中补足；全部空闲 NPU 仍不足 `npu_count` 时失败。 |
+
+集合用于判断每张 NPU 是否符合条件，不要求从集合中的每个 NUMA 或 Socket 都分配 NPU。
+
+`preferred` 在亲和 Socket 属于集合 `S` 的候选中，不再按 NPU 的亲和 NUMA 是否属于集合 `N` 增加优先级。自动选卡时，各优先级内按 UBSE 设备 ID 字符串升序选择。指定 `npu_ids` 时应省略 `affinity_policy`，按原有流程使用指定设备。
+
+省略 `affinity_policy` 或传入 `None` 时，不执行新增的内存亲和 XML 检查和拓扑读取，自动选卡仍按库存顺序进行。
+
+使用前提：
+
+- 虚拟机的全部内存都必须使用大页，通过 `memoryBacking/hugepages` 配置。
+- 通过 `numatune` 指定虚拟机内存允许使用的宿主 NUMA，采用 `placement='static'` 和 `mode='strict'` 配置。允许使用一个或多个宿主 NUMA，也支持跨 Socket。
+- 启用亲和策略时，XML 中不能包含 `<devices>` 下的 `<memory>` 附加内存设备（如 DIMM、virtio-mem）。
+
+例如，在自己的基础 XML 中添加或修改以下两个与 `<cpu>` 同级的配置段，并保存为 `/home/vm-affinity.xml`。这是配置片段，需要保留基础 XML 的其他内容，并根据宿主资源调整大页大小和 NUMA 编号：
+
+```xml
+<memoryBacking>
+  <hugepages>
+    <page size='2' unit='MiB'/>
+  </hugepages>
+</memoryBacking>
+<numatune>
+  <memory mode='strict' placement='static' nodeset='1,2'/>
+</numatune>
+```
+
+上例允许虚拟机内存使用宿主 NUMA 1、2，因此 `N={1,2}`。即使虚拟机内部没有配置 NUMA 划分，也可以这样绑定宿主 NUMA。
+
+虚拟机内部也可以划分为多个 NUMA 节点，每个节点关联一部分虚拟机内存。虚拟机内部的 NUMA 编号和宿主 NUMA 编号要分开看。
+
+为这些节点分别配置内存绑定时，按以下规则确定 `N`：
+
+1. 对虚拟机内部的每个 NUMA 节点，如果有对应的 `numatune/memnode` 配置，就使用这项配置中的宿主 NUMA 编号。
+2. 没有单独的 `memnode` 配置时，使用 `numatune/memory` 中的宿主 NUMA 编号。
+3. 把各部分内存允许使用的宿主 NUMA 编号合在一起，重复编号只保留一次，就得到 `N`。
+
+例如，一部分内存允许使用宿主 NUMA `0,1`，另一部分允许使用 `1,2`，那么 `N={0,1,2}`。
+
+`hugepages/page` 的 `nodeset` 填写虚拟机内部的 NUMA 编号，`numatune` 的 `nodeset` 填写宿主 NUMA 编号。组件根据集合 `N` 选择 NPU，不保证各 NUMA 的内存分配比例或 NPU 数量均衡。
+
+同时传入 `need_nic=True` 时，自动选卡会先排除没有空闲配套 NIC_VFE 的 NPU，再执行亲和筛选。
+
+亲和策略与 `npu_ids` 同传、缺少 `npu_count`，或 XML 的大页、内存绑定格式和模式不符合要求时返回 400；参数类型或策略枚举值不合法返回 422；亲和拓扑读取失败返回 503；符合策略的空闲 NPU 不足，或 XML 内存绑定引用了宿主不存在的 NUMA 时，当前返回 545。后一种情况需要核对并修改 XML 中的宿主 NUMA 编号。
 
 #### 示例
 
@@ -281,6 +344,18 @@ result = create_vm(
 result = create_vm(
     upi="0x000f",
     xml_path="/home/vm-base.xml",
+    client=client,
+)
+```
+
+使用本节准备的 `/home/vm-affinity.xml`，按 `preferred` 策略自动选择 4 张 NPU；`client` 沿用前文设置了较长超时的客户端：
+
+```python
+result = create_vm(
+    upi="0x000f",
+    xml_path="/home/vm-affinity.xml",
+    npu_count=4,
+    affinity_policy="preferred",
     client=client,
 )
 ```

@@ -1,4 +1,15 @@
-﻿from __future__ import annotations
+﻿##########################################################################################################
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+#
+# ub-device-manager is licensed under the Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#      http://license.coscl.org.cn/MulanPSL2
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+##########################################################################################################
+from __future__ import annotations
 
 from enum import StrEnum
 from typing import Optional, cast
@@ -6,6 +17,8 @@ from typing import Optional, cast
 from pydantic import BaseModel, constr
 
 from ub_device_manager.domain.npu.npu_client import UbDeviceInfo
+from ub_device_manager.domain.npu.affinity_policy import NpuAffinityPolicy, NpuAffinitySelector
+from ub_device_manager.domain.npu.host_topology import HostTopology
 
 
 class UbDevice(BaseModel):
@@ -32,14 +45,27 @@ class UbDeviceSelector:
         ids: Optional[list[str]] = None,
         count: Optional[int] = None,
         need_nic: bool = False,
+        *,
+        affinity_policy: NpuAffinityPolicy | str | None = None,
+        memory_nodes: set[int] | None = None,
+        topology: HostTopology | None = None,
     ) -> list[UbDevice]:
         """Select free NPUs by ID or count and optionally append one affinity NIC per NPU."""
-        # Build an index for the full UB device inventory.
         inventory_index: InventoryIndex = {(device.type, device.id): device for device in inventory}
+        if affinity_policy is not None and (memory_nodes is None or topology is None):
+            raise ValueError("memory affinity and host topology are required")
         if ids:
             selected = self._resolve_explicit_npus(ids, inventory_index)
+        elif affinity_policy is not None:
+            candidates = self._get_free_npu_candidates(inventory_index, need_nic)
+            selected_candidates = NpuAffinitySelector().select(
+                candidates, cast(int, count), affinity_policy, memory_nodes, topology
+            )
+            selected = [
+                UbDevice(type=device.type, id=device.id, guid=device.guid)
+                for device in selected_candidates
+            ]
         else:
-            # Request validation guarantees that count is valid here; cast only narrows the type.
             selected = self._select_free_npus(cast(int, count), inventory_index, need_nic)
         if need_nic:
             selected = self._append_affinity_nics(selected, inventory_index)
@@ -52,7 +78,6 @@ class UbDeviceSelector:
             device = inventory_index.get((UbDeviceType.NPU, device_id))
             if not device:
                 raise ValueError(f"UB device not found, type: {UbDeviceType.NPU}, id: {device_id}")
-            # A device with a bus instance GUID is already bound and cannot be bound again.
             if device.bus_guid:
                 raise ValueError(f"UB device is already bound, type: {device.type}, id: {device.id}")
             selected.append(UbDevice(type=device.type, id=device.id, guid=device.guid))
@@ -60,13 +85,7 @@ class UbDeviceSelector:
 
     def _select_free_npus(self, count: int, inventory_index: InventoryIndex, need_nic: bool) -> list[UbDevice]:
         """Select the first count free NPUs when sufficient devices are available."""
-        candidates: list[UbDeviceInfo] = []
-        for device in inventory_index.values():
-            if device.type != UbDeviceType.NPU or device.bus_guid:
-                continue
-            if need_nic and not self._find_affinity_device(device, inventory_index, DEFAULT_NIC_TYPE):
-                continue
-            candidates.append(device)
+        candidates = self._get_free_npu_candidates(inventory_index, need_nic)
 
         if len(candidates) < count:
             if need_nic:
@@ -78,6 +97,17 @@ class UbDeviceSelector:
             UbDevice(type=device.type, id=device.id, guid=device.guid)
             for device in candidates[:count]
         ]
+
+    def _get_free_npu_candidates(self, inventory_index: InventoryIndex, need_nic: bool) -> list[UbDeviceInfo]:
+        candidates: list[UbDeviceInfo] = []
+        for device in inventory_index.values():
+            if device.type != UbDeviceType.NPU or device.bus_guid:
+                continue
+            if need_nic and not self._find_affinity_device(device, inventory_index, DEFAULT_NIC_TYPE):
+                continue
+            candidates.append(device)
+
+        return candidates
 
     def _append_affinity_nics(self, devices: list[UbDevice], inventory_index: InventoryIndex) -> list[UbDevice]:
         """Append one affinity NIC-VFE for each selected NPU."""
@@ -99,7 +129,6 @@ class UbDeviceSelector:
             if affinity_dev.device_type != nic_type:
                 continue
             nic = inventory_index.get((affinity_dev.device_type, affinity_dev.device_id))
-            # The NIC-VFE must exist and be unbound.
             if nic and not nic.bus_guid:
                 return nic
         return None

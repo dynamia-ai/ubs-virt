@@ -498,6 +498,15 @@ components:
       required:
         - upi
       properties:
+        affinity_policy:
+          type: string
+          nullable: true
+          enum: [required, socket, preferred]
+          description: >-
+            Only supported with npu_count; cannot be used with npu_ids.
+            required: require NUMA affinity with VM memory.
+            socket: require Socket affinity with VM memory.
+            preferred: prefer Socket affinity, allowing other free NPUs when needed.
         xml_text:
           type: string
           nullable: true

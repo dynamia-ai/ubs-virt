@@ -18,6 +18,13 @@ from ub_device_manager.ub_dm_sdk.vm import create_vm, delete_vm
 
 class TestCreateVm:
     @patch.object(UbDeviceManagerClient, "post")
+    async def test_affinity_parameter_preserves_positional_client(self, mock_post):
+        client = UbDeviceManagerClient()
+        create_vm('0x1', '<domain/>', None, False, None, 2, client,
+                  affinity_policy='socket')
+        assert mock_post.call_args.kwargs['json']['affinity_policy'] == 'socket'
+
+    @patch.object(UbDeviceManagerClient, "post")
     async def test_posts_expected_payload(self, mock_post):
         mock_post.return_value = {"msg": "ok"}
 

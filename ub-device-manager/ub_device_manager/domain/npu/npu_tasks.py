@@ -11,6 +11,7 @@
 ##########################################################################################################
 from __future__ import annotations
 
+import asyncio
 import re
 
 from loguru import logger
@@ -28,6 +29,8 @@ from ub_device_manager.constants import (
     BOUND_DEVICES_CONTEXT_KEY,
     NPU_LIST_CONTEXT_KEY,
     UNBIND_REQUEST_CONTEXT_KEY,
+    CREATE_VM_REQUEST_CONTEXT_KEY,
+    VM_MEMORY_AFFINITY_CONTEXT_KEY,
 )
 from ub_device_manager.exceptions import (
     ResolveNpuDevicesFailed,
@@ -37,6 +40,7 @@ from ub_device_manager.exceptions import (
 )
 from ub_device_manager.domain.npu.npu_client import AllocDevicesParams, NpuClient
 from ub_device_manager.domain.npu.device_selector import UbDeviceSelector, UbDeviceType
+from ub_device_manager.domain.npu.host_topology import HostTopologyProvider
 
 # The UPI prefix and hexadecimal digits are case-insensitive; short forms are accepted.
 UPI_PATTERN = re.compile(r"^0[xX][0-9a-fA-F]{1,4}$")
@@ -98,9 +102,26 @@ class BindNpuDeviceTask(AsyncTask):
         self._validate_request(request)
         inventory = await self.npu_client.get_host_ub_devices()
         try:
-            devices = self.device_selector.resolve_npu_devices(inventory, ids=request.ids, count=request.count,
-                                                               need_nic=request.need_nic
-                                                               )
+            create_request = self.context.get(CREATE_VM_REQUEST_CONTEXT_KEY)
+            policy = create_request.affinity_policy if create_request else None
+            affinity_args = {}
+            if policy is not None:
+                memory_affinity = self.context.get(VM_MEMORY_AFFINITY_CONTEXT_KEY)
+                if not memory_affinity:
+                    raise RuntimeError("VM memory affinity is missing; PrepareVmXmlTask must run first")
+                topology = await asyncio.to_thread(HostTopologyProvider().get_topology, inventory)
+                affinity_args = dict(affinity_policy=policy.value, memory_nodes=memory_affinity.host_nodes,
+                                     topology=topology)
+            devices = self.device_selector.resolve_npu_devices(
+                inventory, ids=request.ids, count=request.count,
+                need_nic=request.need_nic, **affinity_args,
+            )
+            if policy is not None:
+                numa_local_npu_ids = [device.id for device in devices if device.type == UbDeviceType.NPU
+                                      and topology.npu_to_numa.get(device.id) in memory_affinity.host_nodes]
+                logger.info("NPU memory affinity: policy={}, memory_nodes={}, numa_local_npu_ids={}, selected={}",
+                            policy, sorted(memory_affinity.host_nodes), numa_local_npu_ids,
+                            [device.id for device in devices if device.type == UbDeviceType.NPU])
         except ValueError as exc:
             raise ResolveNpuDevicesFailed(str(exc)) from exc
         device_list = [

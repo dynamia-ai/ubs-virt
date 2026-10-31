@@ -23,6 +23,7 @@ from ub_device_manager.constants import (
     DELETE_VM_CONTEXT_KEY,
     UNBIND_REQUEST_CONTEXT_KEY,
     VM_XML_CONTEXT_KEY,
+    VM_SMBIOS_CONTEXT_KEY,
 )
 from ub_device_manager.domain.npu.npu_client import NpuClient
 from ub_device_manager.domain.vm import vm_tasks
@@ -33,8 +34,10 @@ from ub_device_manager.domain.vm.vm_tasks import (
     GetAllVmTask,
     GetVmsListResp,
     PrepareVmXmlTask,
+    PrepareVmSmbiosTask,
 )
 from ub_device_manager.domain.vm.vm_xml_builder import VmXmlBuilder
+from ub_device_manager.domain.vm.vm_smbios import SmbiosType131, VmSmbios
 from ub_device_manager.exceptions import InvalidCreateVmRequest, VmXmlBuildFailed, VmXmlTooLarge
 
 VALID_XML = "<domain><devices/></domain>"
@@ -184,33 +187,43 @@ class TestBuildAndStartVmTask:
     @patch.object(VMClient, "define_and_start", new_callable=AsyncMock)
     async def test_starts_vm_without_bound_devices(self, mock_define):
         context = await run_task(BuildAndStartVmTask(), {VM_XML_CONTEXT_KEY: VALID_XML})
-
         mock_define.assert_awaited_once_with(VALID_XML)
         assert not context.get(BIND_RESULT_CONTEXT_KEY)
 
-    @patch("ub_device_manager.domain.vm.vm_smbios.VmSmbios.get_type131", return_value=None)
-    @patch.object(VmXmlBuilder, "build", return_value="final-xml")
-    @patch.object(VMClient, "define_and_start", new_callable=AsyncMock)
-    async def test_builds_final_xml_when_devices_are_bound(self, mock_define, mock_build, mock_read):
-        await run_task(BuildAndStartVmTask(), {VM_XML_CONTEXT_KEY: VALID_XML, BIND_RESULT_CONTEXT_KEY: make_bind_result()})
+    @patch.object(VmSmbios, 'get_type131')
+    @patch.object(VmXmlBuilder, 'build', return_value='final-xml')
+    @patch.object(VMClient, 'define_and_start', new_callable=AsyncMock)
+    async def test_builds_with_prepared_smbios_without_reading_again(self, mock_define, mock_build, mock_read):
+        info = SmbiosType131(0, 1, 2, 1, 3, 4)
+        bound = make_bind_result()
+        await run_task(BuildAndStartVmTask(), {
+            VM_XML_CONTEXT_KEY: VALID_XML, BIND_RESULT_CONTEXT_KEY: bound,
+            VM_SMBIOS_CONTEXT_KEY: info,
+        })
+        mock_build.assert_called_once_with(VALID_XML, bound, smbios_type131=info)
+        mock_read.assert_not_called()
+        mock_define.assert_awaited_once_with('final-xml')
 
-        mock_define.assert_awaited_once_with("final-xml")
+    @patch.object(VmXmlBuilder, 'build', return_value='final-xml')
+    @patch.object(NpuClient, 'free_devices', new_callable=AsyncMock)
+    @patch.object(VMClient, 'define_and_start', new_callable=AsyncMock, side_effect=RuntimeError('start failed'))
+    async def test_rolls_back_devices_when_start_fails(self, mock_define, mock_free, mock_build):
+        with pytest.raises(RuntimeError, match='start failed'):
+            await run_task(BuildAndStartVmTask(), {
+                VM_XML_CONTEXT_KEY: VALID_XML, BIND_RESULT_CONTEXT_KEY: make_bind_result(),
+                VM_SMBIOS_CONTEXT_KEY: SmbiosType131(0, 1, 2, 1, 3, 4),
+            })
+        mock_free.assert_awaited_once_with('bus-1', [{'device_id': '1-1', 'device_type': 'NPU'}])
 
-    @patch("ub_device_manager.domain.vm.vm_smbios.VmSmbios.get_type131", return_value=None)
-    @patch.object(NpuClient, "free_devices", new_callable=AsyncMock)
-    @patch.object(VMClient, "define_and_start", new_callable=AsyncMock, side_effect=RuntimeError("start failed"))
-    async def test_rolls_back_devices_when_start_fails(self, mock_define, mock_free, mock_read):
-        with pytest.raises(RuntimeError, match="start failed"):
-            await run_task(BuildAndStartVmTask(), {VM_XML_CONTEXT_KEY: VALID_XML, BIND_RESULT_CONTEXT_KEY: make_bind_result()})
-
-        mock_free.assert_awaited_once_with("bus-1", [{"device_id": "1-1", "device_type": "NPU"}])
-
-    @patch("ub_device_manager.domain.vm.vm_smbios.VmSmbios.get_type131", return_value=None)
-    @patch.object(NpuClient, "free_devices", new_callable=AsyncMock, side_effect=RuntimeError("rollback failed"))
-    @patch.object(VMClient, "define_and_start", new_callable=AsyncMock, side_effect=RuntimeError("start failed"))
-    async def test_rollback_failure_does_not_mask_original_error(self, mock_define, mock_free, mock_read):
-        with pytest.raises(RuntimeError, match="start failed"):
-            await run_task(BuildAndStartVmTask(), {VM_XML_CONTEXT_KEY: VALID_XML, BIND_RESULT_CONTEXT_KEY: make_bind_result()})
+    @patch.object(VmXmlBuilder, 'build', return_value='final-xml')
+    @patch.object(NpuClient, 'free_devices', new_callable=AsyncMock, side_effect=RuntimeError('rollback failed'))
+    @patch.object(VMClient, 'define_and_start', new_callable=AsyncMock, side_effect=RuntimeError('start failed'))
+    async def test_rollback_failure_does_not_mask_original_error(self, mock_define, mock_free, mock_build):
+        with pytest.raises(RuntimeError, match='start failed'):
+            await run_task(BuildAndStartVmTask(), {
+                VM_XML_CONTEXT_KEY: VALID_XML, BIND_RESULT_CONTEXT_KEY: make_bind_result(),
+                VM_SMBIOS_CONTEXT_KEY: SmbiosType131(0, 1, 2, 1, 3, 4),
+            })
 
 
 class TestDeleteVmTask:
@@ -245,32 +258,41 @@ async def test_get_vms_list_response_wraps_vms():
 
     assert response.vms[0].name == "a"
 
-class TestVmSmbiosIntegration:
-    @patch('ub_device_manager.domain.vm.vm_smbios.VmSmbios.get_type131')
-    @patch.object(VMClient, 'define_and_start', new_callable=AsyncMock)
-    async def test_only_npu_vm_queries_smbios(self, mock_define, mock_read):
-        from ub_device_manager.domain.vm.vm_smbios import SmbiosType131
-        mock_read.return_value = SmbiosType131(0, 1, 2, 1, 3, 4)
-        xml = '<domain><os><type>hvm</type></os><devices/></domain>'
-        await run_task(BuildAndStartVmTask(), {VM_XML_CONTEXT_KEY: xml})
-        mock_read.assert_not_called()
-        await run_task(BuildAndStartVmTask(), {
-            VM_XML_CONTEXT_KEY: xml, BIND_RESULT_CONTEXT_KEY: make_bind_result(),
+class TestPrepareVmSmbiosTask:
+    @patch.object(VmSmbios, 'get_type131')
+    async def test_regular_vm_skips_reading(self, read):
+        context = await run_task(PrepareVmSmbiosTask())
+        read.assert_not_called()
+        assert not context.get(VM_SMBIOS_CONTEXT_KEY)
+
+    @patch.object(VmSmbios, 'get_type131', return_value=SmbiosType131(0, 1, 2, 1, 3, 4))
+    async def test_reads_and_stores_smbios_before_devices_are_bound(self, read):
+        context = await run_task(PrepareVmSmbiosTask(), {
+            BIND_REQUEST_CONTEXT_KEY: make_request(npu_count=1),
         })
-        mock_read.assert_called_once()
-        assert 'type131' in mock_define.await_args.args[0]
+        read.assert_called_once()
+        assert context.get(VM_SMBIOS_CONTEXT_KEY) is read.return_value
+        assert not context.get(BIND_RESULT_CONTEXT_KEY)
+
+    @patch.object(VmSmbios, 'get_type131', side_effect=VmXmlBuildFailed('read failed'))
+    async def test_read_failure_stops_preparation(self, read):
+        with pytest.raises(VmXmlBuildFailed, match='read failed'):
+            await run_task(PrepareVmSmbiosTask(), {BIND_REQUEST_CONTEXT_KEY: make_request(npu_count=1)})
+
+    @patch.object(VmSmbios, 'get_type131', return_value=None)
+    async def test_invalid_reader_result_fails_closed(self, read):
+        with pytest.raises(VmXmlBuildFailed, match='missing or invalid'):
+            await run_task(PrepareVmSmbiosTask(), {BIND_REQUEST_CONTEXT_KEY: make_request(npu_count=1)})
 
 
-class TestType131FailClosed:
-    @patch('ub_device_manager.domain.vm.vm_smbios.VmSmbios.get_type131',
-           side_effect=VmXmlBuildFailed('cannot read host SMBIOS Type 131'))
-    @patch.object(NpuClient, 'free_devices', new_callable=AsyncMock)
-    @patch.object(VMClient, 'define_and_start', new_callable=AsyncMock)
-    async def test_missing_type131_prevents_vm_start_and_rolls_back(self, mock_define, mock_free, mock_read):
-        with pytest.raises(VmXmlBuildFailed, match='cannot read host SMBIOS Type 131'):
-            await run_task(BuildAndStartVmTask(), {
-                VM_XML_CONTEXT_KEY: VALID_XML,
-                BIND_RESULT_CONTEXT_KEY: make_bind_result(),
-            })
-        mock_define.assert_not_awaited()
-        mock_free.assert_awaited_once_with('bus-1', [{'device_id': '1-1', 'device_type': 'NPU'}])
+@patch.object(VmSmbios, 'get_type131')
+@patch.object(NpuClient, 'free_devices', new_callable=AsyncMock)
+@patch.object(VMClient, 'define_and_start', new_callable=AsyncMock)
+async def test_missing_prepared_smbios_does_not_read_after_binding(mock_start, mock_free, mock_read):
+    with pytest.raises(VmXmlBuildFailed, match='not found in task context'):
+        await run_task(BuildAndStartVmTask(), {
+            VM_XML_CONTEXT_KEY: VALID_XML, BIND_RESULT_CONTEXT_KEY: make_bind_result(),
+        })
+    mock_read.assert_not_called()
+    mock_start.assert_not_awaited()
+    mock_free.assert_awaited_once_with('bus-1', [{'device_id': '1-1', 'device_type': 'NPU'}])

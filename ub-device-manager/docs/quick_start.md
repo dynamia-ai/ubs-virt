@@ -129,6 +129,7 @@ vi /etc/libvirt/libvirtd.conf
 设置以下配置项。已有同名配置时，修改原配置，避免重复添加：
 
 ```ini
+auth_unix_rw = "none"
 log_level = 2
 log_outputs = "2:file:/var/log/libvirt/libvirtd.log"
 ```
@@ -199,7 +200,7 @@ ub-device-manager 默认配置文件为：
 /etc/ub_device_manager/ub_device_manager.toml
 ```
 
-配置项说明见[配置文件说明](./configuration.md)。libvirt 访问权限的配置和检查方法见[安装部署指导](./install.md)。
+配置项说明见[配置文件说明](./configuration.md)。libvirt 的 `auth_unix_rw = "none"` 应已按第 3.2 节配置并重启生效；已有环境也需要检查，配置说明见[安装部署指导](./install.md#222-安装虚拟化组件)。
 
 将 `ub-device-manager` 服务账户加入 `ubse` 组：
 

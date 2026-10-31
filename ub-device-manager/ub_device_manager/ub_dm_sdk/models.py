@@ -10,7 +10,7 @@
 # See the Mulan PSL v2 for more details.
 ##########################################################################################################
 from enum import IntEnum
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -24,6 +24,7 @@ class CreateVmRequest(BaseModel):
     need_nic: bool = False
     npu_ids: Optional[list[str]] = None
     npu_count: Optional[int] = Field(None, ge=0)
+    affinity_policy: Optional[Literal['required', 'socket', 'preferred']] = None
 
 
 class BindNpuDeviceRequest(BaseModel):
