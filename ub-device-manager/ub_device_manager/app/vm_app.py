@@ -29,6 +29,7 @@ from ub_device_manager.domain.vm.vm_tasks import (
     BuildAndStartVmTask,
     DeleteVmTask,
     PrepareVmXmlTask,
+    PrepareVmSmbiosTask,
 )
 
 app = FastAPI()
@@ -46,6 +47,7 @@ async def create_vm(body: CreateVmRequest) -> Message:
         AsyncTaskChain()
         .with_context({CREATE_VM_REQUEST_CONTEXT_KEY: body})
         .apply_async_task(PrepareVmXmlTask)
+        .apply_async_task(PrepareVmSmbiosTask)
         .apply_acquire_lock(VM_BIND_LOCK_NAME)
         .apply_async_task(BindNpuDeviceTask)
         .apply_release_lock(VM_BIND_LOCK_NAME)

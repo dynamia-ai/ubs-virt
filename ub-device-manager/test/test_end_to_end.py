@@ -355,8 +355,11 @@ class TestSsuFlow:
 # Error paths mapped across the whole stack
 # ---------------------------------------------------------------------------
 class TestErrorFlows:
+    @patch("ub_device_manager.domain.vm.vm_smbios.VmSmbios.get_type131")
     @patch("ubse.ubs_engine_npu.get_host_ub_devices")
-    async def test_npu_not_found_returns_545(self, mock_get, client):
+    async def test_npu_not_found_returns_545(self, mock_get, mock_smbios, client):
+        from ub_device_manager.domain.vm.vm_smbios import SmbiosType131
+        mock_smbios.return_value = SmbiosType131(0, 65535, 255, 1, 16383, 3)
         mock_get.return_value = [FakeUbseDevice("NPU", "0-1", "g")]
 
         response = client.post(
@@ -400,3 +403,63 @@ class TestErrorFlows:
         response = client.get("/ssu/missing")
 
         assert response.status_code == 404
+
+
+@pytest.mark.parametrize('success', [True, False])
+async def test_type131_single_read_finishes_before_any_device_allocation(client, success):
+    from subprocess import CompletedProcess, TimeoutExpired
+    from unittest.mock import AsyncMock
+    from test.domain.vm.test_vm_smbios import make_output
+    from ub_device_manager.domain.vm.vm_client import VMClient
+
+    events = []
+
+    def read(*args, **kwargs):
+        events.append('read')
+        if not success:
+            raise TimeoutExpired('dmidecode', 60)
+        return CompletedProcess([], 0, make_output(), '')
+
+    def inventory():
+        events.append('inventory')
+        return [FakeUbseDevice('NPU', '1-1', 'guid-1')]
+
+    def allocate(**kwargs):
+        events.append('allocate')
+        return 'bus-1', None
+
+    async def start(xml):
+        events.append('start')
+        assert 'type131' in xml
+
+    with patch('ub_device_manager.domain.vm.vm_smbios.subprocess.run', side_effect=read) as run, \
+         patch('ubse.ubs_engine_npu.get_host_ub_devices', side_effect=inventory) as get, \
+         patch('ubse.ubs_engine_npu.alloc_devices', side_effect=allocate) as alloc, \
+         patch('ubse.ubs_engine_npu.query_uba_tid_size', return_value=(1, 2, 3)), \
+         patch('ubse.ubs_engine_npu.free_devices') as free, \
+         patch.object(VMClient, 'define_and_start', new_callable=AsyncMock, side_effect=start) as vm_start:
+        response = client.post('/vm/create', json={
+            'upi': '0x1', 'xml_text': VM_XML, 'npu_count': 1,
+        })
+        run.assert_called_once()
+        assert run.call_args.kwargs['timeout'] == 60
+        if success:
+            assert response.status_code == 200, response.text
+            assert events == ['read', 'inventory', 'allocate', 'start']
+            alloc.assert_called_once()
+        else:
+            assert response.status_code == 543
+            assert events == ['read']
+            get.assert_not_called()
+            alloc.assert_not_called()
+            vm_start.assert_not_awaited()
+        free.assert_not_called()
+
+
+async def test_invalid_xml_fails_before_type131_read_or_device_allocation(client):
+    with patch('ub_device_manager.domain.vm.vm_smbios.VmSmbios.get_type131') as read, \
+         patch('ubse.ubs_engine_npu.alloc_devices') as alloc:
+        response = client.post('/vm/create', json={'upi': '0x1', 'xml_text': '<broken', 'npu_count': 1})
+        assert response.status_code == 400
+        read.assert_not_called()
+        alloc.assert_not_called()

@@ -24,7 +24,7 @@ class AffinityDeviceInfo(BaseModel):
     device_type: str = Field(
         ...,
         description='Affinity device type.',
-        examples=['NIC_VFE'],
+        examples=['NIC_VFE', 'P_IDEV'],
     )
 
 

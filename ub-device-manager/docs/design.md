@@ -18,8 +18,6 @@
 
 ## 2. 整体架构与框架
 
-![ub-device-manager 整体架构](./images/architecture.png)
-
 ### 2.1 框架与用途
 
 | 框架或机制 | 当前用途 |
@@ -43,8 +41,8 @@
 | `run.py` | 初始化日志和 UDS，启动 Uvicorn，设置 Socket 权限。 |
 | `common/factory.py` | 合并 VM、NPU、SSU 路由，注册请求标识、耗时和异常处理中间件。 |
 | `app/` | 声明接口模型及路由，组装对应任务链。 |
-| `domain/npu/` | 设备库存转换、设备选择、UBSE 分配与释放。 |
-| `domain/vm/` | 读取基础 XML、转换 UB 配置、解析 Type 131、调用 libvirt。 |
+| `domain/npu/` | 设备库存转换、FE 与宿主拓扑读取、亲和筛选、UBSE 分配与释放。 |
+| `domain/vm/` | 读取基础 XML、解析内存 NUMA 绑定、转换 UB 配置、解析 Type 131、调用 libvirt。 |
 | `common/async_task_framework.py` | 任务生命周期、请求上下文、命名锁及退出清理。 |
 | `ub_dm_sdk/` | 提供 Python 调用函数、客户端模型及 UDS HTTP 客户端。 |
 | `ub_device_manager_cli.py`、`openapi.yaml` | 动态生成命令并转换命令参数与 HTTP 请求。 |
@@ -71,31 +69,16 @@ FastAPI 使用服务端 `app/models.py` 校验请求。任务层进一步校验 
 
 ### 3.2 Python SDK
 
-SDK 是独立的客户端封装，不直接调用 UBSE 或 libvirt。调用过程为：
+SDK 通过 HTTPX 和 UDS 调用服务，不直接访问 UBSE 或 libvirt。封装函数用 `model_dump(exclude_none=True)` 整理请求模型，`UbDeviceManagerClient` 发送 HTTP 请求、调用 `raise_for_status()` 并解析响应，再由封装函数整理返回值。每次请求创建并关闭客户端，且设置 `trust_env=False`。UDS 路径依次取显式参数、`UBDM_UDS_PATH` 和默认路径；默认超时为 10 秒，耗时操作可自行调大。
 
-```text
-SDK 函数参数
-  → SDK Pydantic 请求模型
-  → model_dump(exclude_none=True)
-  → HTTPX / UDS
-  → 服务端路由与业务任务
-  → JSON 响应
-  → Python 对象或返回值
-```
-
-`UbDeviceManagerClient` 使用 `httpx.HTTPTransport(uds=...)`，每次请求创建并关闭同步 HTTPX 客户端，设置 `trust_env=False`。UDS 路径优先使用显式参数，其次为 `UBDM_UDS_PATH`，最后为默认路径。请求默认超时为 10 秒，调用方可为创建等耗时操作设置更大的值。
-
-客户端先调用 `raise_for_status()`，成功后解析 JSON；非成功状态通过 HTTPX 异常反馈给调用方。各封装函数继续整理返回值：
-
-| SDK 函数 | HTTP 映射 | 返回值处理 |
+| SDK 函数 | HTTP 接口 | 返回值 |
 | --- | --- | --- |
-| `get_host_npu_device()` | `GET /npu` | 将每项转换为 `NpuDeviceInfo`。 |
-| `bind_npu_device()` | `POST /npu/bind` | 将设备转换为 `BoundUbDevice`，返回 `(tid, uba, size, bus_guid, devices)`。 |
-| `unbind_npu_device()` | `POST /npu/unbind` | 成功后不返回业务数据。 |
-| `create_vm()` | `POST /vm/create` | 返回服务端创建结果字典。 |
-| `delete_vm()` | `DELETE /vm/{name}` | 当前实现返回服务端删除结果字典。 |
+| `get_host_npu_device()` | `GET /npu` | `NpuDeviceInfo` 列表。 |
+| `bind_npu_device()` | `POST /npu/bind` | `(tid, uba, size, bus_guid, devices)`。 |
+| `unbind_npu_device()` | `POST /npu/unbind` | 无业务数据。 |
+| `create_vm()`、`delete_vm()` | `POST /vm/create`、`DELETE /vm/{name}` | 服务端结果字典。 |
 
-SDK 模型与服务端模型分别定义，因此 SDK 侧检查不能替代服务端校验。
+SDK 与服务端分别定义请求模型，服务端仍需独立校验。
 
 ### 3.3 CLI
 
@@ -142,34 +125,51 @@ CLI 使用随包提供的静态 OpenAPI 文件，不会在启动时自动向服�
 | `device_type` | `type` | 区分 NPU、NIC_PFE 和 NIC_VFE。 |
 | `guid` | `guid` | 后续 hostdev XML 中的设备 GUID。 |
 | `bus_instance` | `bus_guid` | 判断是否已绑定，或按 bus instance 定位待释放设备。 |
-| `affinity_devs` | `affinity_devs` | 查找 NPU 配套的 NIC_VFE。 |
+| `affinity_devs` | `affinity_devs` | 查找配套 NIC_VFE，以及用于确定 NUMA 亲和关系的 P_IDEV。 |
 
 适配层保留 NPU、NIC_PFE 和 NIC_VFE 库存，`GET /npu` 只返回其中的 NPU。选择器以 `(type, id)` 建立索引，避免仅凭 ID 混淆不同类型的设备。
 
-指定 ID 时，检查目标 NPU 存在且 `bus_guid` 为空。指定数量时，按库存遍历顺序选择前若干个空闲 NPU。`need_nic=True` 时，仅选择具有可用配套 NIC_VFE 的 NPU，并将 NIC_VFE 追加到设备列表；不会把 NIC_PFE 当作网卡直通对象。
+指定 ID 时，检查目标 NPU 存在且 `bus_guid` 为空。指定数量且未传亲和策略时，按库存遍历顺序选择前若干个空闲 NPU。`need_nic=True` 时，仅选择具有可用配套 NIC_VFE 的 NPU，并将 NIC_VFE 追加到设备列表；不会把 NIC_PFE 当作网卡直通对象。
 
-这里的配套网卡关联来自 UBSE 的 `affinity_devs`，不是按宿主 NUMA 或 Socket 选择 NPU 的策略。当前请求没有 `affinity_policy` 参数。
+配套网卡关联与内存亲和选择是两个规则：前者从 `affinity_devs` 查找 NIC_VFE，后者使用其中的 P_IDEV 定位 NPU 对应的宿主 NUMA。
+
+#### 内存与 NPU 亲和选择
+
+`POST /vm/create` 的 `affinity_policy` 只用于 `npu_count` 自动选卡。与 `npu_ids` 同传或未提供 `npu_count` 时，在读取 XML 和查询设备前返回 400；省略或传 `null` 时保持原有选卡行为。`POST /npu/bind` 不接收该参数。
+
+启用策略时，`VmMemoryAffinityParser` 要求基础内存全部使用大页，并明确绑定宿主 NUMA；`placement`、`mode` 分别按 `static`、`strict` 校验，省略属性时也按这两个值解析。`<devices><memory>` 附加内存设备不在当前解析范围内，启用策略时返回 400。
+
+对每个虚拟机 NUMA 节点，优先采用其 `numatune/memnode`，否则采用通用的 `numatune/memory`；将实际采用的宿主 NUMA 编号去重，得到集合 **`N`**。每个内存单元可以绑定多个宿主 NUMA，允许跨 Socket；
+
+`HostTopologyProvider` 从本次 UBSE 库存的每张 NPU 的 `affinity_devs` 中取得 `P_IDEV.device_id`（UB FE ID），读取 `/sys/bus/ub/devices/{FE ID}/numa`，将 `0x03` 等十六进制值转成宿主 NUMA 编号。再根据 `/sys/devices/system/cpu/cpu*/node*` 和 `topology/physical_package_id` 确定 NUMA 所属 Socket。
+
+FE ID 保留原字符串，不从 NPU ID 或 GUID 推算。直通 VFE 继承 FE 亲和关系，生成 XML 时仍使用待直通设备的 GUID。服务账户须能读取上述 sysfs 文件并遍历其目录。
+
+当前实现检查库存中的全部 NPU，包括已绑定设备：每张必须恰有一个 `P_IDEV`，其 NUMA 必须可读取并对应有效宿主节点；否则在分配前返回 503。Socket 无法确定时记为未知，`socket` 策略遇到内存节点 Socket 未知会选择失败。拓扑来自实时 UBSE 查询和 sysfs，无需 `npu-smi`、固定拓扑文件或数据库。
+
+将 `N` 中各宿主 NUMA 所属的已知 Socket 编号去重，得到集合 **`S`**。每张候选 NPU 的亲和 NUMA 来自其 FE，亲和 Socket 来自该 NUMA。选择前排除已绑定 NPU；`need_nic=True` 时还需排除没有空闲配套 NIC_VFE 的 NPU。
+
+| 策略 | 选择规则 |
+| --- | --- |
+| `required` | 仅选亲和 NUMA 属于 `N` 的 NPU。 |
+| `socket` | 仅选亲和 Socket 属于 `S` 的 NPU。 |
+| `preferred` | 先选亲和 Socket 属于 `S` 的 NPU，不足时从其他空闲 NPU 补足；不额外优先亲和 NUMA 属于 `N` 的 NPU。 |
+
+各优先级内按设备 ID **字符串升序**选取；符合条件的设备不足返回 545，不保证各 NUMA 或 Socket 的 NPU 数量均衡。XML 内存绑定引用的宿主 NUMA 是否存在，也在选卡阶段校验；不存在时当前返回 545，应修正 XML 中的宿主 NUMA 编号。指定 `npu_ids` 时不接受亲和策略，仍按原流程检查设备与配套网卡。
+
+XML 配置示例见 [CLI 使用指导](./cli_userguide.md#可选内存亲和策略)。
 
 ### 4.3 从分配请求到绑定结果
 
-假设用户指定 `upi='0x000f'` 和 NPU `1-1`，流程如下：
+选择设备后，UBDM 用其 `device_id` 和 `device_type` 构造 `device_list`；调用 UBSE 时去掉 UPI 的 `0x` 前缀，并以空 `bus_guid` 创建新的 bus instance。绑定结果的字段分别来自以下接口：
 
-1. 查询库存，选择对应设备，并保留其 GUID 和类型。
-2. 构造 `device_list`，每项仅包含 `device_id` 和 `device_type`。
-3. 去掉 UPI 的 `0x` 前缀，以 `upi='000f'` 调用 UBSE。
-4. 新分配流程默认传入 `bus_guid=''`，由 UBSE 返回本次 bus instance GUID。
-5. 使用该 GUID 调用 `query_uba_tid_size()`，取得映射参数。
-6. 将分配结果与所选库存设备组合为 `BindNpuDeviceResult`。
+| 来源 | 结果字段 |
+| --- | --- |
+| `get_host_ub_devices()` | 已选设备的类型、ID 和 GUID。 |
+| `alloc_devices()` | `bus_guid`。 |
+| `query_uba_tid_size()` | `tid`、`uba`、`size`。 |
 
-```text
-get_host_ub_devices() ──→ 所选设备的 id / type / guid
-alloc_devices()      ──→ bus_guid
-query_uba_tid_size()  ──→ tid / uba / size
-                         ↓
-                BindNpuDeviceResult
-```
-
-因此，绑定结果的 `devices[].guid` 来自库存查询，`bus_guid` 来自分配接口，`tid/uba/size` 来自后续映射查询。它们不是单次 `alloc_devices()` 直接返回的完整对象，也不是 UBDM 自行生成的值。
+这些字段组合成 `BindNpuDeviceResult`，供 XML 构建和异常补偿使用。
 
 ## 5. 绑定结果如何转换为 XML
 
@@ -194,147 +194,60 @@ query_uba_tid_size()  ──→ tid / uba / size
 
 IOMMUFD 标识 `1` 与 UBSE 返回的 `tid` 属于不同配置，不能互相替代。设备 ID 用于查询和分配，设备 GUID 用于 XML；原始 bus GUID 用于绑定关系和释放，controller 的派生地址 GUID 不能用来解绑。
 
-### 5.2 转换示例
+完整 XML 示例见 [NPU 直通虚拟机 XML 配置指南](./npu_passthrough_xml.md)。
 
-以下是便于说明的单设备示例，所有值仅用于展示映射关系：
+### 5.2 Type 131 的来源
 
-```json
-{
-  "bus_guid": "cc08-ffff-0-0-000000-011101ff7e2c0080",
-  "tid": 1,
-  "uba": 3298534883328,
-  "size": 49152,
-  "devices": [
-    {"id": "1-1", "guid": "cc08-a002-0-2-000000-0000008405480188", "type": "NPU"}
-  ]
-}
-```
+`PrepareVmSmbiosTask` 在 UBSE 分配前调用 `VmSmbios`，以 `/usr/bin/sudo -n /usr/sbin/dmidecode -t 131 -u` 读取一次宿主 SMBIOS Type 131，超时 60 秒，不重试。Type 131 用于向虚拟机传递服务器组网信息；解析结果放在本次请求的任务上下文中。
 
-对应的关键 XML 片段如下；hostdev 和 controller 位于 `<devices>` 内，命令行位于 `<domain>` 下：
+解析器检查记录类型、长度和 `Flag=0`。下表偏移从 `Header and Data` 的首字节起算，多字节字段按小端序读取；XML 值写为十进制字符串。
 
-```xml
-<controller type='ub' index='0'>
-  <model name='ubc'/>
-  <ports num='1'/>
-  <alias name='ubc.0'/>
-  <source>
-    <businstance guid='cc08-ffff-0-0-000000-011101ff7e2c0080'/>
-  </source>
-  <address type='ub' eid='0x1' guid='cc08-ffff-0-2-000000-011101ff7e2c0080'/>
-</controller>
-<hostdev mode='subsystem' type='ub' managed='yes' iommufd='1'>
-  <driver name='vfio'/>
-  <source>
-    <address guid='cc08-a002-0-2-000000-0000008405480188'/>
-  </source>
-  <address type='ub' eid='0x2' guid='cc08-a002-0-2-000000-0000008405480188'/>
-  <alias name='ub-0'/>
-  <ports num='1'>
-    <port index='0' teid='0x1' tport='0'/>
-  </ports>
-</hostdev>
-```
+| 偏移 | 宿主字段 | XML 属性 |
+| --- | --- | --- |
+| `04h` | Flag | `flag` |
+| `05h`～`06h` | PodId | `pod_id` |
+| `07h` | SlotId | `slot_id` |
+| `08h` | Mesh_Type | `mesh_type` |
+| `09h`～`0Ch` | SuperPodId | `super_pod_id` |
+| `0Dh`～`0Eh` | ServedIndex | `served_index` |
 
-```xml
-<qemu:commandline>
-  <qemu:arg value='-device'/>
-  <qemu:arg value='ubmem_vmmu,tid=1,uba=3298534883328,size=49152'/>
-</qemu:commandline>
-```
-
-### 5.3 Type 131 的来源
-
-Type 131 信息来自宿主机 SMBIOS，用于让虚拟机内的 NPU 驱动识别服务器类型。`VmSmbios` 通过以下命令读取，超时为 10 秒：
-
-```bash
-/usr/bin/sudo -n /usr/sbin/dmidecode -t 131 -u
-```
-
-字段对应关系如下。偏移从 `Header and Data` 的第一个字节开始，以 0 为起点；多字节数值按小端序读取，写入 XML 时使用十进制字符串。
-
-| 偏移 | 原始字段 | XML 属性 | 读取与转换方式 | 说明 |
-| --- | --- | --- | --- | --- |
-| `00h` | Type | 不填写。 | 单字节，`83` 表示十进制 `131`。 | 用于识别 Type 131 记录。 |
-| `01h` | Length | 不填写。 | 单字节，`4D` 表示十进制 `77`。 | 格式化数据区长度，用于检查记录完整性。 |
-| `02h`～`03h` | Handle | 不填写。 | 不转换为 XML 属性。 | 宿主机记录标识符。 |
-| `04h` | Flag | `flag` | 读取单字节，`00` 转为 `0`。 | 当前组件只接受 Flag 为 `00` 的记录。 |
-| `05h`～`06h` | PodId | `pod_id` | 读取 2 字节，按小端序转换；如 `01 00` 转为 `1`。 | 组网 ID。 |
-| `07h` | SlotId | `slot_id` | 读取单字节；如 `02` 转为 `2`。 | 服务器在组网内的 ID。 |
-| `08h` | Mesh_Type | `mesh_type` | 读取单字节；如 `00` 转为 `0`。 | 组网类型，具体取值含义以产品定义为准。 |
-| `09h`～`0Ch` | SuperPodId | `super_pod_id` | 读取 4 字节，按小端序转换。 | 按宿主机实际值填写。 |
-| `0Dh`～`0Eh` | ServedIndex | `served_index` | 读取 2 字节，按小端序转换；如 `03 00` 转为 `3`。 | 超节点全局编号。 |
-| `0Fh` | TypeName | `type_name` | 当前组件固定填写 `UB INFO`，不解析字符串索引。 | 不将索引数字写入 XML。 |
-| `10h`～`4Ch` | Reserved | 不填写。 | 当前组件不转换这些字节。 | 77 字节示例记录中的预留区。 |
-
-解析完成后，`VmXmlBuilder` 将表中的 XML 属性写入 `sysinfo/type131/entry`，并在已有的 `<os>` 中设置 `<smbios mode='sysinfo'/>`。如果已有 SMBIOS 配置，则替换其中的 Type 131，保留其他字段。
-
-以下示例展示转换后的 XML 结构。其中 `pod_id='1'`、`slot_id='2'`、`mesh_type='0'`、`super_pod_id='0'`、`served_index='3'` 为示例值，实际应使用当前宿主机的解析结果：
-
-```xml
-<domain type='kvm'>
-  <!-- 保留虚拟机原有的其他配置 -->
-  <sysinfo type='smbios'>
-    <type131>
-      <entry flag='0' pod_id='1' slot_id='2' mesh_type='0'
-             super_pod_id='0' served_index='3' type_name='UB INFO'/>
-    </type131>
-  </sysinfo>
-  <os>
-    <!-- 保留原有的机器类型、固件和启动顺序等配置 -->
-    <smbios mode='sysinfo'/>
-  </os>
-</domain>
-```
-
-`<sysinfo>` 与 `<os>` 同级，`<smbios mode='sysinfo'/>` 位于 `<os>` 内。上例只展示 Type 131 相关配置，合并时应保留虚拟机原有的其他配置。
-
-虚拟机启动后，在虚拟机内使用 root 用户执行：
-
-```bash
-dmidecode -t 131 -u
-```
-
-确认回显中存在 Type 131 记录，并按表中的转换规则核对 Flag、PodId、SlotId、Mesh_Type、SuperPodId、ServedIndex 和 `UB INFO`。各字段应与 XML 中填写的值一致。
-
-如果虚拟机内没有相应记录，应检查 XML 是否生效，以及配套 libvirt 和 QEMU 是否支持 Type 131 扩展。仅在宿主机查看 XML，不能代替虚拟机内的读取验证。
+`type_name` 固定为 `UB INFO`。`VmXmlBuilder` 将这些属性写入 `sysinfo/type131/entry`，并将 `os/smbios/@mode` 设为 `sysinfo`；已有 SMBIOS `sysinfo` 时保留其他条目，只更新 Type 131。客体内仍需读取 Type 131 核对结果。
 
 ## 6. 创建流程与异常补偿
 
 ### 6.1 正常创建
 
-![NPU 直通虚拟机创建流程](./images/vm_create_sequence.png)
+```mermaid
+flowchart TD
+    A[PrepareVmXmlTask] --> B[PrepareVmSmbiosTask]
+    B --> C[获取设备绑定锁]
+    C --> D[BindNpuDeviceTask]
+    D --> E[释放设备绑定锁]
+    E --> F[BuildAndStartVmTask]
+```
 
-创建路由顺序执行 `PrepareVmXmlTask → 加锁 → BindNpuDeviceTask → 解锁 → BuildAndStartVmTask`：
+`PrepareVmXmlTask` 校验请求和基础 XML 的大小、`domain` 根节点，并拒绝预先包含 UB controller、UB hostdev 或 `ubmem_vmmu` 的输入；启用亲和策略时还解析大页和内存绑定。请求 NPU 时，先读取 Type 131，再在绑定锁内查询库存、选择设备并调用 UBSE。锁释放后生成直通 XML，`VMClient` 通过本地 `qemu:///system` 定义并启动虚拟机。生成 XML 时保留用户原有的 CPU 和内存绑定。
 
-1. 先处理 `xml_text` 或服务端 `xml_path`，按配置限制字节数，使用 defusedxml 解析。根节点必须为 `domain`，不能已有 UB controller、UB hostdev 或 `ubmem_vmmu` 参数。先检查输入，减少无效请求占用设备的机会。
-2. 请求 NPU 时，准备绑定请求，选择设备并取得完整绑定结果。
-3. 读取 Type 131 并调用 `VmXmlBuilder.build()`，将最终 XML 交给 `VMClient.define_and_start()`。
-4. `VMClient` 通过 libvirt Python 绑定连接本地 `qemu:///system`，调用 `defineXML()` 和 `domain.create()`，最后关闭连接。
-
-不请求 NPU 时，绑定任务跳过，直接使用基础 XML 定义并启动普通虚拟机，不补充 UB 和宿主机 Type 131。该分支不表示服务可以不安装其整体运行依赖。
+不请求 NPU 时跳过 Type 131 和设备绑定，按基础 XML 创建普通虚拟机。
 
 ### 6.2 任务上下文与锁
 
-每条任务链有独立 `Context`，通过 ContextVar 传递；任务按上下文键读取请求、基础 XML、绑定结果和待解绑 GUID。任务的 `should_run()` 决定是否执行，`execute()` 执行业务，`when_raise_exception()` 提供异常处理入口。
+任务链用独立 `Context` 传递基础 XML、内存绑定、Type 131 和绑定结果；任务结束时释放尚未主动释放的锁并恢复上下文。
 
-创建路由在库存查询、选择和绑定阶段持有 `vm_bind_npu_device` 命名锁，绑定完成后释放，避免把后续虚拟机启动耗时包含在锁内。任务链结束时，`finally` 会释放尚未主动释放的锁并恢复上下文。
-
-该锁是当前进程内的 `asyncio.Lock`，不是跨进程或分布式锁；独立 `/npu/bind` 路由没有使用这把创建锁。因此不能把它描述为所有资源操作的全局互斥保证。
+创建路由只在查询库存、选卡和绑定期间持有 `vm_bind_npu_device` 锁。该锁仅在当前进程内生效，独立的 `/npu/bind` 路由也不使用它，因此不能作为全部资源操作的全局互斥保证。
 
 ### 6.3 失败处理
 
 | 失败阶段 | 当前处理 |
 | --- | --- |
-| 输入校验或设备选择失败 | 直接返回错误，尚未完成设备分配。 |
+| 输入参数、XML 结构或内存绑定格式校验失败 | 返回 400；参数类型或枚举校验失败返回 422，尚未分配设备。 |
+| Type 131 读取或解析失败 | `PrepareVmSmbiosTask` 返回 543，尚未分配设备，无需解绑。 |
+| 亲和拓扑读取或设备选择失败 | 拓扑读取失败返回 503；符合策略的空闲 NPU 不足、XML 内存绑定引用的宿主 NUMA 不存在等选卡错误返回 545，尚未分配设备。 |
 | `alloc_devices()` 抛出异常 | 异常向上反馈；UBDM 没有在此分支额外执行库存核对或释放。 |
 | 分配成功，但 `query_uba_tid_size()` 失败 | `NpuClient.bind_devices()` 使用分配所得 GUID 和设备列表调用 `free_devices()`，随后抛出异常。 |
-| Type 131 读取或 XML 构建失败 | `BuildAndStartVmTask` 尝试释放本次绑定设备，再向上抛出错误。 |
+| 绑定后的 XML 构建失败 | `BuildAndStartVmTask` 尝试释放本次绑定设备，再向上抛出错误。 |
 | libvirt 已定义虚拟机，但启动失败 | `VMClient` 尝试用 `VIR_DOMAIN_UNDEFINE_NVRAM` 取消定义；外层创建任务再尝试释放设备。 |
 | 创建阶段释放设备也失败 | 记录释放失败日志；`BuildAndStartVmTask` 保留其捕获的原始创建异常。资源状态需进一步核查。 |
-
-这是对外部副作用的补偿流程，不是数据库事务，也不保证补偿在所有故障下必然成功。映射查询失败后的 `free_devices()`，以及 libvirt 启动失败后的取消定义调用，如果再次抛错，当前实现可能暴露后续清理异常。
-
-调用超时、服务进程中断或外部接口出现部分成功时，不应仅凭客户端失败就认定资源未分配。当前没有持久化恢复队列和请求幂等键，处理前应结合 UBSE 库存、libvirt 定义和日志确认实际状态。
 
 ## 7. 删除与解绑设计
 
@@ -355,6 +268,8 @@ dmidecode -t 131 -u
 
 RPM 将服务配置为 `ub-device-manager` 用户运行。systemd 创建运行目录，程序启动后将 UDS 权限设置为 `0660`。调用用户需具备该 Socket 的访问权限；服务账户访问 UBSE、libvirt 和通过 sudo 读取 Type 131 的权限分别由对应组件配置。
 
+服务账户通过 `qemu:///system` 连接本地 libvirt。部署时在 `/etc/libvirt/libvirtd.conf` 设置 `auth_unix_rw = "none"`，关闭 libvirt Unix 读写 Socket 的连接认证；服务账户仍需具备该 Socket 的文件访问权限。修改后重启 libvirtd，操作步骤见[安装部署指导](./install.md#222-安装虚拟化组件)。
+
 TOML 配置在进程启动时读取，主要控制日志级别、轮转和 XML 输入大小；修改后需要重启。路径加载顺序为存在的 `UBDM_CONFIG_PATH` 文件、`/etc/ub_device_manager/ub_device_manager.toml`、程序包内默认副本，不合并多个文件。具体操作见[配置文件说明](./configuration.md)和[安装部署指导](./install.md)。
 
 日志默认写入 `/var/log/ub_device_manager/ub_device_manager.log`，支持轮转、压缩及可选标准输出。请求 ID 通过 ContextVar 关联同次请求中的日志，日志消息和 CLI 展示内容还会过滤控制字符。
@@ -365,6 +280,7 @@ TOML 配置在进程启动时读取，主要控制日志级别、轮转和 XML �
 | [app/models.py](../ub_device_manager/app/models.py)、[vm_app.py](../ub_device_manager/app/vm_app.py)、[npu_app.py](../ub_device_manager/app/npu_app.py) | 服务端模型与业务任务链入口。 |
 | [async_task_framework.py](../ub_device_manager/common/async_task_framework.py) | 任务链、上下文和进程内锁。 |
 | [npu_client.py](../ub_device_manager/domain/npu/npu_client.py)、[device_selector.py](../ub_device_manager/domain/npu/device_selector.py)、[npu_tasks.py](../ub_device_manager/domain/npu/npu_tasks.py) | UBSE 适配、设备选择、绑定与解绑。 |
+| [affinity_policy.py](../ub_device_manager/domain/npu/affinity_policy.py)、[host_topology.py](../ub_device_manager/domain/npu/host_topology.py)、[vm_memory_affinity.py](../ub_device_manager/domain/vm/vm_memory_affinity.py) | 亲和策略、FE 与宿主拓扑、内存绑定解析。 |
 | [vm_tasks.py](../ub_device_manager/domain/vm/vm_tasks.py)、[vm_client.py](../ub_device_manager/domain/vm/vm_client.py) | 创建、删除、libvirt 调用和补偿。 |
 | [vm_xml_builder.py](../ub_device_manager/domain/vm/vm_xml_builder.py)、[vm_smbios.py](../ub_device_manager/domain/vm/vm_smbios.py) | XML 转换和 Type 131 读取、解析。 |
 | [ub_dm_sdk](../ub_device_manager/ub_dm_sdk)、[ub_device_manager_cli.py](../ub_device_manager/ub_device_manager_cli.py)、[openapi.yaml](../ub_device_manager/openapi.yaml) | SDK 封装、CLI 生成与接口契约。 |

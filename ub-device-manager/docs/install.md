@@ -117,9 +117,24 @@ dnf makecache
 ```bash
 dnf install -y  qemu* libvirt* python3-libvirt edk2-aarch64
 ```
-执行以下命令，启动libvirtd服务
+
+编辑 libvirt 配置文件：
+
 ```bash
-systemctl start libvirtd
+vi /etc/libvirt/libvirtd.conf
+```
+
+将 `auth_unix_rw` 设置为 `"none"`。若已有该配置项，修改原配置并取消注释，避免重复添加：
+
+```ini
+auth_unix_rw = "none"
+```
+
+该配置关闭本地 Unix 读写 Socket 的连接认证；
+保存后重启 libvirtd 使配置生效；
+
+```bash
+systemctl restart libvirtd
 ```
 验证基本功能，执行以下virsh命令：
 ```bash

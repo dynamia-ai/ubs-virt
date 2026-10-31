@@ -26,6 +26,11 @@ class InvalidCreateVmRequest(UbDmHTTPException):
     code = 400
 
 
+class AffinityTopologyUnavailable(UbDmHTTPException):
+    msg = 'host affinity topology is unavailable'
+    code = 503
+
+
 class VmXmlTooLarge(InvalidCreateVmRequest):
     msg = 'vm xml exceeds the maximum allowed size'
 

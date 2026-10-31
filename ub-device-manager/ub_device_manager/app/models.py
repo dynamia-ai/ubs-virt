@@ -9,13 +9,18 @@
 # IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 # See the Mulan PSL v2 for more details.
 ##########################################################################################################
-
 from __future__ import annotations
 
-from enum import IntEnum
+from enum import Enum, IntEnum
 from typing import List, Optional
 
 from pydantic import BaseModel, Field, conint, constr
+
+
+class AffinityPolicy(Enum):
+    required = 'required'
+    socket = 'socket'
+    preferred = 'preferred'
 
 
 class NpuCount(IntEnum):
@@ -26,6 +31,10 @@ class NpuCount(IntEnum):
 
 
 class CreateVmRequest(BaseModel):
+    affinity_policy: Optional[AffinityPolicy] = Field(
+        None,
+        description='Only supported with npu_count; cannot be used with npu_ids. required: require NUMA affinity with VM memory. socket: require Socket affinity with VM memory. preferred: prefer Socket affinity, allowing other free NPUs when needed.',
+    )
     xml_text: Optional[str] = Field(
         None,
         description='libvirt domain XML content. Exactly one of xml_text and xml_path must be provided.',

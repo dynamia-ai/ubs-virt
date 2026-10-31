@@ -30,10 +30,13 @@ from ub_device_manager.constants import (
     DELETE_VM_CONTEXT_KEY,
     UNBIND_REQUEST_CONTEXT_KEY,
     VM_XML_CONTEXT_KEY,
+    VM_SMBIOS_CONTEXT_KEY,
+    VM_MEMORY_AFFINITY_CONTEXT_KEY,
 )
 from ub_device_manager.domain.vm.vm_client import VMClient, VmInfo
 from ub_device_manager.domain.vm.vm_xml_builder import VmXmlBuilder
-from ub_device_manager.domain.vm.vm_smbios import VmSmbios
+from ub_device_manager.domain.vm.vm_smbios import SmbiosType131, VmSmbios
+from ub_device_manager.domain.vm.vm_memory_affinity import VmMemoryAffinityParser
 
 
 class GetVmsListResp(BaseModel):
@@ -71,6 +74,12 @@ class PrepareVmXmlTask(AsyncTask):
     async def execute(self) -> None:
         request: CreateVmRequest = self.context.get(CREATE_VM_REQUEST_CONTEXT_KEY)
         xml = self._load_and_validate_xml(request, self.xml_builder)
+        if request.affinity_policy is not None:
+            try:
+                memory_affinity = VmMemoryAffinityParser().parse(xml)
+            except ValueError as exc:
+                raise InvalidCreateVmRequest(str(exc)) from exc
+            self.context.set(VM_MEMORY_AFFINITY_CONTEXT_KEY, memory_affinity)
         self.context.set(VM_XML_CONTEXT_KEY, xml)
         if request.npu_ids or (request.npu_count or 0) > 0:
             self.context.set(BIND_REQUEST_CONTEXT_KEY, BindNpuDeviceRequest(
@@ -82,6 +91,11 @@ class PrepareVmXmlTask(AsyncTask):
 
     @staticmethod
     def _validate_create_request(request: CreateVmRequest) -> None:
+        if request.affinity_policy is not None:
+            if request.npu_ids is not None:
+                raise InvalidCreateVmRequest("affinity_policy cannot be used with npu_ids")
+            if request.npu_count is None:
+                raise InvalidCreateVmRequest("affinity_policy requires npu_count")
         if request.npu_ids and (request.npu_count or 0) > 0:
             raise InvalidCreateVmRequest("npu_ids and npu_count are mutually exclusive")
         if request.npu_ids and len(set(request.npu_ids)) != len(request.npu_ids):
@@ -144,6 +158,20 @@ class PrepareVmXmlTask(AsyncTask):
         return xml_input
 
 
+class PrepareVmSmbiosTask(AsyncTask):
+    def __init__(self):
+        self.vm_smbios = VmSmbios()
+
+    async def should_run(self) -> bool:
+        return bool(self.context.get(BIND_REQUEST_CONTEXT_KEY))
+
+    async def execute(self) -> None:
+        smbios_type131 = await asyncio.to_thread(self.vm_smbios.get_type131)
+        if not isinstance(smbios_type131, SmbiosType131):
+            raise VmXmlBuildFailed("Host SMBIOS Type 131 is missing or invalid")
+        self.context.set(VM_SMBIOS_CONTEXT_KEY, smbios_type131)
+
+
 class BuildAndStartVmTask(AsyncTask):
     """Build and start the VM; release allocated UB devices if this step fails."""
 
@@ -151,7 +179,6 @@ class BuildAndStartVmTask(AsyncTask):
         self.npu_client = NpuClient()
         self.vm_client = VMClient()
         self.xml_builder = VmXmlBuilder()
-        self.vm_smbios = VmSmbios()
 
     async def execute(self) -> None:
         xml = self.context.get(VM_XML_CONTEXT_KEY)
@@ -168,7 +195,9 @@ class BuildAndStartVmTask(AsyncTask):
             for device in bind_result.devices
         ]
         try:
-            smbios_type131 = await asyncio.to_thread(self.vm_smbios.get_type131)
+            smbios_type131 = self.context.get(VM_SMBIOS_CONTEXT_KEY)
+            if not isinstance(smbios_type131, SmbiosType131):
+                raise VmXmlBuildFailed("prepared host SMBIOS Type 131 not found in task context")
             final_xml = self.xml_builder.build(xml, bind_result, smbios_type131=smbios_type131)
             await self.vm_client.define_and_start(final_xml)
         except Exception:
