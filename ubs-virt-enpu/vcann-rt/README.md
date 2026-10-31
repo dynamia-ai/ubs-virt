@@ -12,6 +12,8 @@
 
 <span id="version"></span>
 
+支持的 CANN 版本因硬件产品而异，请以对应硬件的软件版本表为准，并保持编译环境与业务容器中的 CANN 版本一致。
+
 #### Atlas A2 推理系列产品
 
 **表 1 软件版本**
@@ -164,7 +166,15 @@ vCANN-RT支持两种方式编译：
 
 在编译vCANN-RT源码前，用户根据物理机/业务容器的CANN环境设置CANN的环境变量。如果驱动安装在非默认路径，还需要设置驱动路径环境变量。
 
-`vCANN-RT`在代码仓中提供了统一的编译构建脚本（即`make_build.sh`文件），可以直接执行该脚本文件进行编译构建。
+编译前先加载所选 CANN 版本的环境。以下路径请替换为实际安装路径：
+
+```shell
+source /path/to/cann/set_env.sh
+```
+
+若驱动安装在非默认路径，还需执行`export ENPU_ASCEND_DRIVER_PATH=/path/to/Ascend`，其中路径应为实际包含`driver`目录的 Ascend 安装目录。
+
+`vCANN-RT`提供统一的编译构建脚本`make_build.sh`，通过`ASCEND_HOME_PATH`读取 CANN 安装路径。加载 CANN 环境后，执行以下命令：
 
 ```shell
 bash make_build.sh
@@ -195,12 +205,14 @@ cd ubs-virt-enpu/vcann-rt
 
 在编译vCANN-RT源码前，用户需要根据实际业务场景选择CANN版本并设置环境变量，预编译镜像中的CANN安装路径为`/usr/local/Ascend/cann-xxx`。软切分支持的CANN版本可见[软件版本](#version)。
 
+下例使用 CANN 9.1.0；若使用其他受支持的 CANN 版本，请替换为对应的安装路径，并加载该版本的环境变量。
+
 ```shell
 # 以CANN 9.1.0为例，具体环境变量设置命令请参考CANN官方文档
 source /usr/local/Ascend/cann-9.1.0/set_env.sh
 ```
 
-`vCANN-RT`在代码仓中提供了统一的编译构建脚本（即`make_build.sh`文件），可以直接执行该脚本文件进行编译构建。
+加载所选 CANN 版本的环境后，执行统一构建命令：
 
 ```shell
 bash make_build.sh
@@ -443,7 +455,7 @@ vCANN-RT支持两种方式启动业务容器：
             - 弹性模式（elastic）
             - 争抢模式（best-effort）
             
-          - 每种模式的详细介绍参见[表9](#table9)，其中在争抢模式下，为充分利用算力资源，此时aicore的使用将不受配额的限制，但 HBM 的使用仍受配额的限制。
+          - 每种模式的详细介绍参见[表10](#table10)，其中在争抢模式下，为充分利用算力资源，此时aicore的使用将不受配额的限制，但 HBM 的使用仍受配额的限制。
 
   - host-arch: 系统架构 huawei-arm / huawei-x86
   - containers:
@@ -660,15 +672,17 @@ export ENPU_LOG_LEVEL=4
   - 若多容器配置的aicore总量超出100%， 各容器无法按照原先设定的资源使用。
   - 若多容器配置的HBM总量超出当前单Device可用内存大小，某一容器内的业务运行时，可能因为实际内存不足，导致报错OOM内存不足。
   - 若单卡上各容器配置的调度策略不相同，各容器无法按照原先设定的资源使用，建议各容器配置的调度策略相同。
-- 当前vCANN-RT方案适配CANN软件版本为商发版本9.1.0，由于版本限制，暂时不支持persistent task的使用。
+- CANN 商发版本的支持范围以[软件版本](#version)中对应硬件的表格为准。暂时不支持 persistent task 的使用。
 - 显存超分仅在 docker 部署场景下可用。
 - `scheduling-policy = 1`（fixed-share）的容器不支持显存超分，必须满足 `memory-request == memory-limit`；需要显存超分请使用 `scheduling-policy = 2`（elastic）或 `3`（best-effort）。
 
 ## FAQ
 
-1. hook拦截runtime API提示`can't find function`:
+1. 启动时加载 runtime API 提示`Can not find function`:
 
-    当前vCANN-RT方案适配CANN软件版本为商发版本9.1.0，部分runtime API在CANN其他版本未支持。
+    为兼容不同 CANN 版本，vCANN-RT 启动时会尝试加载多个版本的 runtime API。部分接口仅在高版本 CANN 中新增，低版本中不存在，因此可能出现`Can not find function ... because the runtime version ...`的 WARN 日志。
+
+    在符合[软件版本](#version)支持范围的环境中，缺少未使用的高版本新增接口属于正常的版本差异提示；业务运行正常时无需处理。若同时出现业务调用失败，请确认编译环境与业务容器中的 CANN 版本一致。
 
 2. 容器启动或者业务运行时报错`GLIBC_xxx not found`:
     
