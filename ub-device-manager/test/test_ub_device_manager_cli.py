@@ -225,6 +225,16 @@ class TestServerClient:
 
 
 class TestApplication:
+    @patch.object(cli, "get_server_client")
+    async def test_vm_affinity_option_is_generated_and_forwarded(self, mock_client):
+        response = httpx.Response(200, json={'msg': 'ok'})
+        mock_client.return_value.__enter__.return_value.request.return_value = response
+        result = CliRunner().invoke(cli.app, ['vm', 'create', '--upi', '0x1',
+            '--xml_text', '<domain/>', '--npu_count', '2', '--affinity_policy', 'preferred'])
+        assert result.exit_code == 0, result.output
+        request = mock_client.return_value.__enter__.return_value.request
+        assert request.call_args.kwargs['json']['affinity_policy'] == 'preferred'
+
     async def test_help_lists_available_groups(self):
         result = CliRunner().invoke(cli.app, ["--help"])
 

@@ -242,10 +242,11 @@ enpu-manager 通过 HTTP REST API 接收请求，默认端口 8080，返回 JSON
 
 | 字段               | 类型    | 必填 | 说明                                                                                       |
 |:-------------------|:--------|:-----|:-------------------------------------------------------------------------------------------|
-| `aicore_quota`     | int     | 是   | AICore 配额，范围 1~100。                                                                  |
+| `aicore_quota`     | int     | 普通优先级必填 | AICore 配额，普通优先级范围 1~100；高优先级可省略，实际使用 0，表示不预留软件算力配额。 |
 | `hbm_quota`        | int | 是   | HBM Request（保底预留），单位 MB，等价别名 `hbm_request`。                                            |
 | `hbm_limit`        | int | 否   | HBM Limit（硬上限），单位 MB。未填时默认等于 `hbm_quota`。                                              |
-| `sched_policy`     | int     | 是   | 调度策略：`1`=fixed-share，`2`=elastic，`3`=best-effort。     |
+| `sched_policy`     | int     | 普通优先级必填 | 调度策略：`1`=fixed-share，`2`=elastic，`3`=best-effort；高优先级可省略，实际使用 `3`。 |
+| `vnpu_priority`    | int     | 否   | vNPU 优先级：`0`=普通优先级（默认），`1`=高优先级。 |
 | `swap_priority`    | int     | 否   | 换出优先级：`0`=HIGH（最后换出），`1`=MEDIUM（默认），`2`=LOW（最先换出）。                  |
 | `phy_id`           | int     | 否   | 指定物理卡：`-1`=由 enpu-manager 自动选择（默认）；`>=0`=直接分配到该卡（跳过自动决策）。     |
 | `pod_uid`          | string  | 否   | Pod 标识符。未填时默认 `pod-<phy_id>`。                                                     |
@@ -253,7 +254,20 @@ enpu-manager 通过 HTTP REST API 接收请求，默认端口 8080，返回 JSON
 
 > `pod_uid` 和 `container_name` 共同构成 vNPU 的复合主键，后续释放/查询时需要提供。未指定时使用默认值，响应体中会回显实际使用的值。
 >
-> 未填 `hbm_limit` 时默认等于 `hbm_quota`，相当于 `hbm_request == hbm_limit`。**采用 `sched_policy=1`（fixed-share）时建议显式传 `hbm_limit` 与 `hbm_quota` 相等**，避免误解。
+> 未填 `hbm_limit` 时默认等于 `hbm_quota`，相当于 `hbm_request == hbm_limit`。**普通优先级采用 `sched_policy=1`（fixed-share）时建议显式传 `hbm_limit` 与 `hbm_quota` 相等**，避免误解。
+
+当`vnpu_priority=1`时，若用户显式传入非`0`的`aicore_quota`或非`3`的`sched_policy`，分配成功的响应会通过`warnings`数组对相应字段返回英文提示，并回显最终生效值。未传入的字段、已使用正确值的字段不产生提示；没有提示时省略`warnings`字段。分配失败仍通过`error_msg`说明原因。
+
+例如，同时传入`vnpu_priority=1`、`aicore_quota=20`和`sched_policy=2`时，成功响应中包含：
+
+```json
+{
+  "warnings": [
+    "aicore_quota is ignored when vnpu_priority=1; the effective value is 0.",
+    "sched_policy is ignored when vnpu_priority=1; the effective value is 3 (best-effort)."
+  ]
+}
+```
 
 **示例 1：自动选择物理卡，分配 elastic 模式 vNPU**
 

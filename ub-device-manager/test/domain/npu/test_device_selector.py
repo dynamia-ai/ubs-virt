@@ -142,3 +142,14 @@ async def test_ub_device_type_values():
     assert UbDeviceType.NPU == "NPU"
     assert UbDeviceType.NIC_PFE == "NIC_PFE"
     assert UbDeviceType.NIC_VFE == "NIC_VFE"
+
+
+@pytest.mark.parametrize('need_nic', [False, True])
+def test_p_idev_relation_is_never_added_to_passthrough_devices(need_nic):
+    devices = [
+        make_device('1-1', affinity=[('00020', 'P_IDEV'), ('nic', 'NIC_VFE')]),
+        make_device('nic', device_type='NIC_VFE'),
+    ]
+    selected = UbDeviceSelector().resolve_npu_devices(devices, ids=['1-1'], need_nic=need_nic)
+    assert [device.id for device in selected] == (['1-1', 'nic'] if need_nic else ['1-1'])
+    assert selected[0].guid == 'guid-1-1'

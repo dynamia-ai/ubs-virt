@@ -92,6 +92,32 @@ static const char *json_number_value(const char *json, const char *key)
     return colon + 1;
 }
 
+static int format_allocate_priority_warnings(const char *body, const alloc_request_t *req, char *warnings,
+                                             size_t warnings_size)
+{
+    warnings[0] = '\0';
+    if (req->vnpu_priority != VNPU_PRIORITY_HIGH) {
+        return 0;
+    }
+
+    bool ignored_quota = json_number_value(body, "\"aicore_quota\"") != NULL && req->aicore_quota != 0;
+    bool ignored_policy = json_number_value(body, "\"sched_policy\"") != NULL &&
+                          req->sched_policy != SCHED_POLICY_BEST_EFFORT;
+    if (!ignored_quota && !ignored_policy) {
+        return 0;
+    }
+
+    const char *quota_warning = ignored_quota ? "\"aicore_quota is ignored when vnpu_priority=1; "
+                                                "the effective value is 0.\"" :
+                                                "";
+    const char *policy_warning = ignored_policy ? "\"sched_policy is ignored when vnpu_priority=1; "
+                                                  "the effective value is 3 (best-effort).\"" :
+                                                  "";
+    int ret = snprintf_s(warnings, warnings_size, warnings_size - 1, ",\"warnings\":[%s%s%s]", quota_warning,
+                         ignored_quota && ignored_policy ? "," : "", policy_warning);
+    return ret < 0 ? -1 : 0;
+}
+
 static int is_safe_key(const char *s)
 {
     for (const char *p = s; *p != '\0'; p++) {
@@ -434,6 +460,14 @@ static int route_request(rest_api_server_t *server, const char *method, const ch
             CHECK_COND_LOG_(ret < 0, "snprintf_s response failed.");
             return HTTP_STATUS_BAD_REQUEST;
         }
+        /* The allocator normalizes req in place, so capture explicit overrides first. */
+        char warnings[512] = {0};
+        if (format_allocate_priority_warnings(body, &req, warnings, sizeof(warnings)) != 0) {
+            ret = snprintf_s(response, REST_RESPONSE_SIZE, REST_RESPONSE_SIZE - 1,
+                             "{\"error\":\"Failed to format allocation warnings\",\"result\":%d}", ENPU_FAIL);
+            CHECK_COND_LOG_(ret < 0, "snprintf_s response failed.");
+            return HTTP_STATUS_INTERNAL_ERROR;
+        }
         int result = enpu_manager_allocate(mgr, &req, &resp);
         if (result != ENPU_SUCCESS) {
             resp.result = result; /* 用返回值覆盖 resp.result，避免 rollback 后 resp.result 仍为 SUCCESS */
@@ -443,10 +477,10 @@ static int route_request(rest_api_server_t *server, const char *method, const ch
                          "\"die_id\":\"%s\",\"shm_id\":\"%s\","
                          "\"aicore_quota\":%d,\"hbm_quota\":%lu,\"hbm_limit\":%lu,\"sched_policy\":%d,"
                          "\"vnpu_priority\":%d,"
-                         "\"minor_name\":\"%s\",\"result\":%d,\"error_msg\":\"%s\"}",
+                         "\"minor_name\":\"%s\",\"result\":%d,\"error_msg\":\"%s\"%s}",
                          resp.phy_id, resp.vnpu_id, resp.pod_uid, resp.container_name, resp.die_id, resp.shm_id,
                          resp.aicore_quota, resp.hbm_quota, resp.hbm_limit, resp.sched_policy, resp.vnpu_priority,
-                         resp.minor_name, resp.result, resp.error_msg);
+                         resp.minor_name, resp.result, resp.error_msg, result == ENPU_SUCCESS ? warnings : "");
         CHECK_COND_LOG_(ret < 0, "snprintf_s response failed.");
         return result == ENPU_SUCCESS ? HTTP_STATUS_OK : HTTP_STATUS_BAD_REQUEST;
     }

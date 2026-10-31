@@ -120,3 +120,17 @@ async def test_affinity_device_info_defaults():
 
 async def test_ub_device_info_requires_guid():
     assert UbDeviceInfo(id="0-1", type="NPU", guid="g").bus_guid is None
+
+
+@patch('ubse.ubs_engine_npu.get_host_ub_devices')
+async def test_npu_inventory_preserves_p_idev_relation(mock_get):
+    mock_get.return_value = [FakeHostDevice('NPU', '1-1', 'vfe-guid', affinity_devs=[
+        {'device_type': 'UBCTRL', 'device_id': '255-10-1'},
+        {'device_type': 'NIC_PFE', 'device_id': '1-11-3'},
+        {'device_type': 'NIC_VFE', 'device_id': '1-11-3-49'},
+        {'device_type': 'P_IDEV', 'device_id': '00020'},
+    ]), FakeHostDevice('P_IDEV', '00020', 'fe-guid')]
+    devices = await NpuClient.get_host_ub_devices()
+    assert len(devices) == 1
+    assert devices[0].guid == 'vfe-guid'
+    assert devices[0].affinity_devs[-1] == AffinityDeviceInfo(device_type='P_IDEV', device_id='00020')

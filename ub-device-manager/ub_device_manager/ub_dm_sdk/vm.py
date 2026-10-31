@@ -23,6 +23,8 @@ def create_vm(
     npu_ids: Optional[list[str]] = None,
     npu_count: Optional[int] = None,
     client: Optional[UbDeviceManagerClient] = None,
+    *,
+    affinity_policy: Optional[str] = None,
 ) -> Any:
     """
     Create VM.
@@ -34,6 +36,7 @@ def create_vm(
         need_nic: Whether to select NIC devices by NPU affinity.
         npu_ids: Explicit NPU device id list, mutually exclusive with positive npu_count.
         npu_count: Number of NPU devices to select automatically. 0 means no NPU device is requested.
+        affinity_policy: Memory-to-NPU policy for npu_count only; requires hugepages and strict memory binding.
     """
     request = CreateVmRequest(
         xml_text=xml_text,
@@ -42,6 +45,7 @@ def create_vm(
         need_nic=need_nic,
         npu_ids=npu_ids,
         npu_count=npu_count,
+        affinity_policy=affinity_policy,
     )
     sdk_client = client or UbDeviceManagerClient()
     return sdk_client.post("/vm/create", json=request.model_dump(exclude_none=True))

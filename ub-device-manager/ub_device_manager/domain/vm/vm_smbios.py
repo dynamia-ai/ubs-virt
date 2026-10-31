@@ -45,7 +45,7 @@ SMBIOS_SUPER_POD_ID_OFFSET = 0x09
 SMBIOS_SERVED_INDEX_OFFSET = 0x0D
 SMBIOS_TYPE_131_MIN_LENGTH = 0x0F
 SMBIOS_FLAG_VALID = 0
-SMBIOS_READ_TIMEOUT_SECONDS = 10
+SMBIOS_READ_TIMEOUT_SECONDS = 60
 
 
 @dataclass(frozen=True)
@@ -101,6 +101,7 @@ class VmSmbios:
 
     def get_type131(self) -> SmbiosType131:
         """Require valid host Type 131 data for an NPU passthrough VM."""
+        logger.info("Reading host SMBIOS Type 131, timeout={}s", SMBIOS_READ_TIMEOUT_SECONDS)
         try:
             result = subprocess.run(
                 ["/usr/bin/sudo", "-n", "/usr/sbin/dmidecode", "-t", "131", "-u"],
@@ -109,11 +110,17 @@ class VmSmbios:
                 check=True,
                 timeout=SMBIOS_READ_TIMEOUT_SECONDS,
             )
-        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        except subprocess.TimeoutExpired as exc:
+            logger.error("Host SMBIOS Type 131 read timed out after {}s", SMBIOS_READ_TIMEOUT_SECONDS)
+            raise VmXmlBuildFailed(
+                f"Cannot read host SMBIOS Type 131: timed out after {SMBIOS_READ_TIMEOUT_SECONDS}s"
+            ) from exc
+        except (OSError, subprocess.CalledProcessError) as exc:
             logger.error("Cannot read host SMBIOS Type 131: {}", exc)
             raise VmXmlBuildFailed("Cannot read host SMBIOS Type 131") from exc
         parsed = self.parse_type131(result.stdout)
         if parsed is None:
             logger.error("Host SMBIOS Type 131 is missing or not valid")
             raise VmXmlBuildFailed("Host SMBIOS Type 131 is missing or invalid")
+        logger.info("Host SMBIOS Type 131 read succeeded")
         return parsed
