@@ -27,6 +27,8 @@ from ub_device_manager.constants import (
     BIND_REQUEST_CONTEXT_KEY,
     BIND_RESULT_CONTEXT_KEY,
     BOUND_DEVICES_CONTEXT_KEY,
+    H2N_NIC_PAIRS_CONTEXT_KEY,
+    H2N_REQUIRED_CONTEXT_KEY,
     NPU_LIST_CONTEXT_KEY,
     UNBIND_REQUEST_CONTEXT_KEY,
     CREATE_VM_REQUEST_CONTEXT_KEY,
@@ -34,11 +36,14 @@ from ub_device_manager.constants import (
 )
 from ub_device_manager.exceptions import (
     ResolveNpuDevicesFailed,
+    H2NRequirementFailed,
     InvalidBindDeviceRequest,
     UnbindDeviceFailed,
     UnbindDeviceNotFound,
+    ensure_terminal_period,
 )
 from ub_device_manager.domain.npu.npu_client import AllocDevicesParams, NpuClient
+from ub_device_manager.domain.npu.h2n import is_h2n_required
 from ub_device_manager.domain.npu.device_selector import UbDeviceSelector, UbDeviceType
 from ub_device_manager.domain.npu.host_topology import HostTopologyProvider
 
@@ -122,8 +127,15 @@ class BindNpuDeviceTask(AsyncTask):
                 logger.info("NPU memory affinity: policy={}, memory_nodes={}, numa_local_npu_ids={}, selected={}",
                             policy, sorted(memory_affinity.host_nodes), numa_local_npu_ids,
                             [device.id for device in devices if device.type == UbDeviceType.NPU])
+            nic_pairs = self.device_selector.resolve_nic_pairs(inventory, devices)
         except ValueError as exc:
             raise ResolveNpuDevicesFailed(str(exc)) from exc
+        h2n_required = False
+        if nic_pairs:
+            try:
+                h2n_required = await is_h2n_required(self.npu_client)
+            except Exception as exc:
+                raise H2NRequirementFailed(ensure_terminal_period(str(exc))) from exc
         device_list = [
             {"device_id": device.id, "device_type": device.type}
             for device in devices
@@ -134,6 +146,8 @@ class BindNpuDeviceTask(AsyncTask):
             AllocDevicesParams(upi=request.upi, device_list=device_list)
         )
         self.context.set(BOUND_DEVICES_CONTEXT_KEY, [device.model_dump() for device in devices])
+        self.context.set(H2N_NIC_PAIRS_CONTEXT_KEY, nic_pairs)
+        self.context.set(H2N_REQUIRED_CONTEXT_KEY, h2n_required)
         self.context.set(BIND_RESULT_CONTEXT_KEY, BindNpuDeviceResult(tid=tid, uba=uba, size=size, bus_guid=bus_guid,
                                                                       devices=[
                                                                           BoundUbDevice(id=device.id, guid=device.guid,

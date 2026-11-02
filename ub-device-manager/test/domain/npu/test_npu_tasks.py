@@ -20,10 +20,12 @@ from ub_device_manager.constants import (
     BIND_REQUEST_CONTEXT_KEY,
     BIND_RESULT_CONTEXT_KEY,
     BOUND_DEVICES_CONTEXT_KEY,
+    H2N_NIC_PAIRS_CONTEXT_KEY,
+    H2N_REQUIRED_CONTEXT_KEY,
     NPU_LIST_CONTEXT_KEY,
     UNBIND_REQUEST_CONTEXT_KEY,
 )
-from ub_device_manager.domain.npu.npu_client import NpuClient, UbDeviceInfo
+from ub_device_manager.domain.npu.npu_client import AffinityDeviceInfo, NpuClient, ProductType, UbDeviceInfo
 from ub_device_manager.domain.npu.npu_tasks import (
     ALLOWED_DEVICE_COUNTS,
     BindNpuDeviceTask,
@@ -31,6 +33,7 @@ from ub_device_manager.domain.npu.npu_tasks import (
     UnbindNpuDeviceTask,
 )
 from ub_device_manager.exceptions import (
+    H2NRequirementFailed,
     InvalidBindDeviceRequest,
     ResolveNpuDevicesFailed,
     UnbindDeviceFailed,
@@ -84,6 +87,50 @@ class TestBindNpuDeviceRequestValidation:
 
 
 class TestBindNpuDeviceTaskExecute:
+    @patch.object(NpuClient, "get_product_type", new_callable=AsyncMock,
+                  side_effect=RuntimeError("unknown product type"))
+    @patch.object(NpuClient, "get_host_ub_devices", new_callable=AsyncMock)
+    @patch.object(NpuClient, "bind_devices", new_callable=AsyncMock)
+    async def test_product_type_failure_prevents_allocation(self, mock_bind, mock_get, mock_type):
+        npu = device("0-1")
+        npu.affinity_devs = [
+            AffinityDeviceInfo(device_id="2-1", device_type="NIC_PFE"),
+            AffinityDeviceInfo(device_id="1-7", device_type="NIC_VFE"),
+        ]
+        mock_get.return_value = [npu, device("2-1", "NIC_PFE"), device("1-7", "NIC_VFE")]
+
+        with pytest.raises(H2NRequirementFailed, match="unknown product type") as caught:
+            await run_task(
+                BindNpuDeviceTask(),
+                {BIND_REQUEST_CONTEXT_KEY: BindNpuDeviceRequest(upi="0x1", ids=["0-1"], need_nic=True)},
+            )
+        assert caught.value.detail.endswith(".")
+        mock_bind.assert_not_awaited()
+
+    @pytest.mark.parametrize("product_type, required", [
+        (ProductType.SERVER, True), (ProductType.POD_16_1825, False), (ProductType.POD_32_1825, False),
+    ])
+    @patch.object(NpuClient, "get_product_type", new_callable=AsyncMock)
+    @patch.object(NpuClient, "get_host_ub_devices", new_callable=AsyncMock)
+    @patch.object(NpuClient, "bind_devices", new_callable=AsyncMock, return_value=("bus-1", 1, 2, 3))
+    async def test_server_type_controls_h2n(self, mock_bind, mock_get, mock_type, product_type, required):
+        mock_type.return_value = product_type
+        npu = device("0-1")
+        npu.affinity_devs = [
+            AffinityDeviceInfo(device_id="2-1", device_type="NIC_PFE"),
+            AffinityDeviceInfo(device_id="1-7", device_type="NIC_VFE"),
+        ]
+        mock_get.return_value = [npu, device("2-1", "NIC_PFE"), device("1-7", "NIC_VFE")]
+
+        context = await run_task(
+            BindNpuDeviceTask(),
+            {BIND_REQUEST_CONTEXT_KEY: BindNpuDeviceRequest(upi="0x1", ids=["0-1"], need_nic=True)},
+        )
+
+        assert context.get(H2N_NIC_PAIRS_CONTEXT_KEY) == [("guid-2-1", "7")]
+        assert context.get(H2N_REQUIRED_CONTEXT_KEY) is required
+        mock_type.assert_awaited_once()
+
     @patch.object(NpuClient, "get_host_ub_devices", new_callable=AsyncMock)
     @patch.object(NpuClient, "bind_devices", new_callable=AsyncMock)
     async def test_binds_explicit_device_and_sets_context(self, mock_bind, mock_get):

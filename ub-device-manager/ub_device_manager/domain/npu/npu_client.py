@@ -10,8 +10,14 @@
 # See the Mulan PSL v2 for more details.
 ##########################################################################################################
 import asyncio
+import re
+import secrets
+import subprocess
+from enum import IntEnum
+from pathlib import Path
 from typing import Any, List, Optional
 
+from loguru import logger
 from pydantic import BaseModel, Field, constr
 
 
@@ -74,6 +80,20 @@ class AllocDevicesParams(BaseModel):
 UBSE_PASSTHROUGH_DEVICE_TYPES = {"NPU", "NIC_PFE", "NIC_VFE"}
 
 
+class ProductType(IntEnum):
+    SERVER = 0
+    POD_16_1825 = 1
+    POD_32_1825 = 2
+
+
+NET_SYSFS_ROOT = Path("/sys/class/net")
+HINICADM_PATH = "/usr/sbin/hinicadm5"
+NIC_COMMAND_TIMEOUT = 30
+SAFE_INTERFACE_NAME = re.compile(r"^[A-Za-z0-9_.:-]{1,15}$")
+SAFE_FUNCTION_ID = re.compile(r"^[0-9]+$")
+SAFE_LOCAL_MAC = re.compile(r"^02(?::[0-9a-fA-F]{2}){5}$")
+
+
 _ubse_log_registered = False
 
 
@@ -105,6 +125,115 @@ class NpuClient:
             bus_guid=dev.bus_instance,
             affinity_devs=dev.affinity_devs)
             for dev in host_devices if dev.device_type in UBSE_PASSTHROUGH_DEVICE_TYPES]
+
+    @staticmethod
+    async def get_product_type() -> ProductType:
+        """Read the local UBSE product type; unknown values fail closed."""
+        from ubse import ubs_engine_npu
+
+        get_type = getattr(ubs_engine_npu, "get_product_type", None)
+        if get_type is None:
+            raise RuntimeError("UBSE get_product_type is unavailable.")
+        raw_type = await asyncio.to_thread(get_type)
+        try:
+            if type(raw_type) is not int:
+                raise ValueError("UBSE product type must be an integer.")
+            return ProductType(raw_type)
+        except ValueError as exc:
+            raise RuntimeError(f"Unknown UBSE product type: {raw_type!r}.") from exc
+
+    @staticmethod
+    def _find_interface(pfe_guid: str, net_root: Path = NET_SYSFS_ROOT) -> str:
+        matches = []
+        for entry in net_root.iterdir():
+            if not SAFE_INTERFACE_NAME.fullmatch(entry.name):
+                continue
+            try:
+                guid = (entry / "device" / "guid").read_text(encoding="utf-8").strip()
+            except (OSError, UnicodeError):
+                continue
+            if guid.lower() == pfe_guid.strip().lower():
+                matches.append(entry.name)
+        if len(matches) != 1:
+            raise RuntimeError(f"Expected one NIC interface for PFE {pfe_guid}, found {len(matches)}.")
+        return matches[0]
+
+    @staticmethod
+    def _run_nic_command(interface: str, function_id: str, option: str, value: str | None = None) -> None:
+        if not SAFE_INTERFACE_NAME.fullmatch(interface) or not SAFE_FUNCTION_ID.fullmatch(function_id):
+            raise ValueError("Invalid NIC interface or VFE function ID.")
+        if not ((option == "-m" and value is not None and SAFE_LOCAL_MAC.fullmatch(value)) or
+                (option == "-c" and value is None)):
+            raise ValueError("Invalid NIC vfconfig operation or value.")
+        command = ["/usr/bin/sudo", "-n", HINICADM_PATH,
+                   "vfconfig", "-i", interface, "-f", function_id, option]
+        if value is not None:
+            command.append(value)
+        result = subprocess.run(
+            command,
+            check=True, capture_output=True, text=True, timeout=NIC_COMMAND_TIMEOUT,
+        )
+        if option == "-m":
+            logger.info(
+                "VF MAC configuration command succeeded: interface={}, function_id={}, mac={}, "
+                "exit_code={}, stdout={!r}, stderr={!r}.",
+                interface, function_id, value, result.returncode, result.stdout, result.stderr,
+            )
+        else:
+            logger.info(
+                "VF MAC/SVLAN clear command succeeded: interface={}, function_id={}, "
+                "exit_code={}, stdout={!r}, stderr={!r}.",
+                interface, function_id, result.returncode, result.stdout, result.stderr,
+            )
+
+    @classmethod
+    async def configure_nics(cls, pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        """Set a random locally administered MAC for each selected VF."""
+        configured = []
+        used_macs = set()
+        pfe_guid = None
+        function_id = None
+        interface = None
+        step = "resolve interface"
+        try:
+            for pfe_guid, function_id in pairs:
+                interface = None
+                step = "resolve interface"
+                interface = await asyncio.to_thread(cls._find_interface, pfe_guid)
+                step = "generate MAC"
+                while True:
+                    mac = "02:" + ":".join(f"{byte:02x}" for byte in secrets.token_bytes(5))
+                    if mac not in used_macs:
+                        used_macs.add(mac)
+                        break
+                step = "set MAC"
+                await asyncio.to_thread(cls._run_nic_command, interface, function_id, "-m", mac)
+                configured.append((interface, function_id))
+            return configured
+        except BaseException as exc:
+            logger.error(
+                "NIC configuration failed before rollback: step={}, pfe_guid={}, interface={}, "
+                "function_id={}, error={}, exit_code={}, stdout={!r}, stderr={!r}.",
+                step, pfe_guid, interface, function_id, exc,
+                getattr(exc, "returncode", None),
+                getattr(exc, "stdout", None), getattr(exc, "stderr", None),
+            )
+            await cls.clear_nic_configs(configured)
+            raise
+
+    @classmethod
+    async def clear_nic_configs(cls, configured: list[tuple[str, str]]) -> None:
+        """Clear VF MAC/SVLAN configuration written during a failed VM creation."""
+        for interface, function_id in reversed(configured):
+            try:
+                await asyncio.to_thread(cls._run_nic_command, interface, function_id, "-c")
+            except Exception as exc:
+                logger.error(
+                    "Failed to clear VF MAC/SVLAN configuration: interface={}, function_id={}, "
+                    "error={}, exit_code={}, stdout={!r}, stderr={!r}.",
+                    interface, function_id, exc, getattr(exc, "returncode", None),
+                    getattr(exc, "stdout", None), getattr(exc, "stderr", None),
+                )
 
     @try_catch_log
     async def bind_devices(self, params: AllocDevicesParams) -> tuple[str, int, int, int]:

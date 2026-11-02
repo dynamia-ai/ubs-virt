@@ -422,6 +422,7 @@ paths:
       description: >
         Based on the user-provided libvirt domain XML and UB device requirements, select and allocate UB/NPU devices on the local host,
         assemble the A5 NPU passthrough VM XML, and define and start the VM when the libvirt creation switch is enabled.
+        With a NIC VFE, H2N is checked before NIC MAC/VFE configuration when required by h2n.mode.
         The XML parameter can be XML content or the path to an XML file readable by the server.
       operationId: create_vm
       tags:
@@ -459,6 +460,30 @@ paths:
                 $ref: '#/components/schemas/Message'
         '544':
           description: Failed to define or start the VM via libvirt
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '550':
+          description: Host NPU affinity topology is unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '546':
+          description: Failed to determine whether H2N check is required from UBSE product type
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '547':
+          description: H2N links did not become stable and healthy before the deadline
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '549':
+          description: NIC MAC/VFE configuration failed
           content:
             application/json:
               schema:

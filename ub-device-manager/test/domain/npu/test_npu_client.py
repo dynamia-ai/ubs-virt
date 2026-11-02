@@ -10,6 +10,7 @@
 # See the Mulan PSL v2 for more details.
 ##########################################################################################################
 """Unit tests for :mod:`ub_device_manager.domain.npu.npu_client`."""
+import subprocess
 from unittest.mock import patch
 
 import pytest
@@ -20,6 +21,7 @@ from ub_device_manager.domain.npu.npu_client import (
     AllocDevicesParams,
     DeviceRef,
     NpuClient,
+    ProductType,
     UbDeviceInfo,
 )
 
@@ -57,6 +59,160 @@ class TestGetHostUbDevices:
         assert [device.id for device in devices] == ["0-1", "1-1"]
         assert devices[0].bus_guid == "bus"
         assert devices[0].type == "NPU"
+
+
+class TestProductType:
+    @pytest.mark.parametrize("raw, expected", [
+        (0, ProductType.SERVER), (1, ProductType.POD_16_1825), (2, ProductType.POD_32_1825),
+    ])
+    @patch("ubse.ubs_engine_npu.get_product_type")
+    async def test_maps_ubse_type(self, mock_get, raw, expected):
+        mock_get.return_value = raw
+        assert await NpuClient.get_product_type() is expected
+
+    @patch("ubse.ubs_engine_npu.get_product_type", return_value=99)
+    async def test_unknown_type_fails(self, mock_get):
+        with pytest.raises(RuntimeError, match="Unknown UBSE product type"):
+            await NpuClient.get_product_type()
+
+    @patch("ubse.ubs_engine_npu.get_product_type", return_value=True)
+    async def test_boolean_type_fails(self, mock_get):
+        with pytest.raises(RuntimeError, match="Unknown UBSE product type"):
+            await NpuClient.get_product_type()
+
+
+class TestConfigureNics:
+    @pytest.mark.parametrize("option, value", [
+        ("-m", "02:fb:c0:da:88:b3"), ("-c", None),
+    ])
+    @patch.object(npu_client_module.subprocess, "run")
+    def test_nic_command_uses_noninteractive_sudo(self, mock_run, option, value):
+        NpuClient._run_nic_command("eth0", "32", option, value)
+
+        command = ["/usr/bin/sudo", "-n", "/usr/sbin/hinicadm5", "vfconfig",
+                   "-i", "eth0", "-f", "32", option]
+        if value is not None:
+            command.append(value)
+        mock_run.assert_called_once_with(
+            command,
+            check=True, capture_output=True, text=True, timeout=npu_client_module.NIC_COMMAND_TIMEOUT,
+        )
+
+    @pytest.mark.parametrize("option, value, expected_message", [
+        ("-m", "02:fb:c0:da:88:b3", "VF MAC configuration command succeeded"),
+        ("-c", None, "VF MAC/SVLAN clear command succeeded"),
+    ])
+    @patch.object(npu_client_module.logger, "info")
+    @patch.object(npu_client_module.subprocess, "run")
+    def test_nic_command_logs_success_result(self, mock_run, mock_log, option, value, expected_message):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=["hinicadm5", "vfconfig"], returncode=0,
+            stdout="will take effect after reloading the driver", stderr="",
+        )
+
+        NpuClient._run_nic_command("eth0", "32", option, value)
+
+        log_args = mock_log.call_args.args
+        assert expected_message in log_args[0]
+        assert log_args[1:3] == ("eth0", "32")
+        if option == "-m":
+            assert log_args[3] == value
+        assert log_args[-3:] == (0, "will take effect after reloading the driver", "")
+
+    @patch.object(npu_client_module.logger, "info")
+    @patch.object(npu_client_module.subprocess, "run")
+    def test_failed_nic_command_does_not_log_success(self, mock_run, mock_log):
+        mock_run.side_effect = subprocess.CalledProcessError(250, ["hinicadm5", "vfconfig"])
+
+        with pytest.raises(subprocess.CalledProcessError):
+            NpuClient._run_nic_command("eth0", "32", "-m", "02:fb:c0:da:88:b3")
+
+        mock_log.assert_not_called()
+
+    @pytest.mark.parametrize("interface, function_id, option, value", [
+        ("eth0;id", "32", "-m", "02:fb:c0:da:88:b3"),
+        ("eth0", "32;id", "-m", "02:fb:c0:da:88:b3"),
+        ("eth0", "32", "-m", "ff:fb:c0:da:88:b3"),
+        ("eth0", "32", "-s", "0"),
+        ("eth0", "32", "-s", "1"),
+        ("eth0", "32", "-c", "0"),
+        ("eth0", "32", "-x", "1"),
+    ])
+    @patch.object(npu_client_module.subprocess, "run")
+    def test_nic_command_rejects_unapproved_arguments(self, mock_run, interface, function_id, option, value):
+        with pytest.raises(ValueError):
+            NpuClient._run_nic_command(interface, function_id, option, value)
+
+        mock_run.assert_not_called()
+
+    @patch.object(NpuClient, "_run_nic_command")
+    @patch.object(NpuClient, "_find_interface", return_value="eth0")
+    async def test_sets_mac_without_svlan(self, mock_find, mock_run):
+        configured = await NpuClient.configure_nics([("pfe-guid", "7")])
+
+        assert configured == [("eth0", "7")]
+        mock_run.assert_called_once()
+        assert mock_run.call_args.args[:3] == ("eth0", "7", "-m")
+
+    @patch.object(NpuClient, "_run_nic_command")
+    @patch.object(NpuClient, "_find_interface", return_value="eth0")
+    async def test_clears_first_vf_after_second_mac_failure(self, mock_find, mock_run):
+        mock_find.side_effect = ["eth0", "eth1"]
+
+        def run(interface, function_id, option, value=None):
+            if interface == "eth1" and option == "-m":
+                raise RuntimeError("set MAC failed")
+
+        mock_run.side_effect = run
+        with pytest.raises(RuntimeError, match="set MAC failed"):
+            await NpuClient.configure_nics([("pfe-1", "7"), ("pfe-2", "8")])
+
+        assert mock_run.call_args_list[-1].args == ("eth0", "7", "-c")
+
+    @patch.object(NpuClient, "_run_nic_command")
+    async def test_clear_nic_configs_uses_c_in_reverse_order(self, mock_run):
+        await NpuClient.clear_nic_configs([("eth0", "7"), ("eth1", "8")])
+
+        assert [call.args for call in mock_run.call_args_list] == [
+            ("eth1", "8", "-c"), ("eth0", "7", "-c"),
+        ]
+
+    async def test_logs_mac_failure_and_command_output_before_rollback(self):
+        events = []
+        failure = subprocess.CalledProcessError(
+            2, ["hinicadm5", "vfconfig"], output="command output", stderr="invalid MAC"
+        )
+
+        async def clear(configured):
+            events.append("rollback")
+
+        with patch.object(NpuClient, "_find_interface", return_value="eth0"), \
+                patch.object(NpuClient, "_run_nic_command", side_effect=failure), \
+                patch.object(NpuClient, "clear_nic_configs", side_effect=clear), \
+                patch.object(npu_client_module.logger, "error") as mock_log:
+            mock_log.side_effect = lambda *args: events.append("log")
+            with pytest.raises(subprocess.CalledProcessError):
+                await NpuClient.configure_nics([("pfe-guid", "7")])
+
+        assert events == ["log", "rollback"]
+        log_args = mock_log.call_args.args
+        assert "step={}" in log_args[0]
+        assert log_args[1:5] == ("set MAC", "pfe-guid", "eth0", "7")
+        assert "exit_code={}" in log_args[0]
+        assert log_args[-3] == 2
+        assert log_args[-2:] == ("command output", "invalid MAC")
+
+    @patch.object(NpuClient, "_run_nic_command")
+    async def test_clear_failure_logs_exit_code_and_command_output(self, mock_run):
+        mock_run.side_effect = subprocess.CalledProcessError(
+            250, ["hinicadm5", "vfconfig"], output="tool output", stderr="invalid option"
+        )
+        with patch.object(npu_client_module.logger, "error") as mock_log:
+            await NpuClient.clear_nic_configs([("eth0", "32")])
+
+        log_args = mock_log.call_args.args
+        assert log_args[1:3] == ("eth0", "32")
+        assert log_args[-3:] == (250, "tool output", "invalid option")
 
 
 class TestBindDevices:

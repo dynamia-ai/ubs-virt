@@ -39,6 +39,38 @@ InventoryIndex = dict[DeviceKey, UbDeviceInfo]
 
 
 class UbDeviceSelector:
+    @staticmethod
+    def resolve_nic_pairs(inventory: list[UbDeviceInfo], selected: list[UbDevice]) -> list[tuple[str, str]]:
+        """Resolve each selected NPU's PFE GUID and selected VFE function ID."""
+        selected_vfes = {device.id for device in selected if device.type == UbDeviceType.NIC_VFE}
+        if not selected_vfes:
+            return []
+        index: InventoryIndex = {(device.type, device.id): device for device in inventory}
+        pairs = []
+        for selected_npu in (device for device in selected if device.type == UbDeviceType.NPU):
+            npu = index[(UbDeviceType.NPU, selected_npu.id)]
+            vfe_ids = [
+                affinity.device_id for affinity in npu.affinity_devs
+                if affinity.device_type == UbDeviceType.NIC_VFE and affinity.device_id in selected_vfes
+            ]
+            pfe_ids = [
+                affinity.device_id for affinity in npu.affinity_devs
+                if affinity.device_type == UbDeviceType.NIC_PFE
+            ]
+            if len(vfe_ids) != 1 or len(pfe_ids) != 1:
+                raise ValueError(f"Incomplete or ambiguous H2N affinity for NPU {npu.id}.")
+            pfe = index.get((UbDeviceType.NIC_PFE, pfe_ids[0]))
+            if pfe is None or not pfe.guid:
+                raise ValueError(f"Missing PFE GUID for NPU {npu.id}.")
+            vfe_id = vfe_ids[0]
+            function_id = vfe_id.rsplit("-", 1)[-1]
+            if "-" not in vfe_id or not function_id.isascii() or not function_id.isdigit():
+                raise ValueError(f"Invalid VFE function ID: {vfe_id}.")
+            pairs.append((pfe.guid, function_id))
+        if len(pairs) != len(selected_vfes):
+            raise ValueError("Selected NPU/VFE affinity is not one-to-one.")
+        return pairs
+
     def resolve_npu_devices(
         self,
         inventory: list[UbDeviceInfo],

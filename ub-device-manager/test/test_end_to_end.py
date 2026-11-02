@@ -23,13 +23,14 @@ layers are wired together correctly (task context keys, request/response
 models, rollback behaviour, error-code mapping).
 """
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
 
 from ub_device_manager.common.factory import create_app
 from ub_device_manager.domain.npu.npu_client import AffinityDeviceInfo
+from ub_device_manager.domain.npu.npu_client import NpuClient
 
 VM_XML = "<domain><os><type>hvm</type></os><devices/></domain>"
 
@@ -203,18 +204,28 @@ class TestVmCreateFlow:
         from ub_device_manager.domain.vm.vm_smbios import SmbiosType131
         mock_smbios.return_value = SmbiosType131(0, 65535, 255, 1, 16383, 3)
         mock_get.return_value = [
-            FakeUbseDevice("NPU", "0-1", "guid-0-1", affinity_devs=[AffinityDeviceInfo(device_id="1-1", device_type="NIC_VFE")]),
+            FakeUbseDevice("NPU", "0-1", "guid-0-1", affinity_devs=[
+                AffinityDeviceInfo(device_id="2-1", device_type="NIC_PFE"),
+                AffinityDeviceInfo(device_id="1-1", device_type="NIC_VFE"),
+            ]),
+            FakeUbseDevice("NIC_PFE", "2-1", "guid-2-1"),
             FakeUbseDevice("NIC_VFE", "1-1", "guid-1-1"),
         ]
         conn = FakeConnection(define_domain=FakeDomain())
         mock_open.return_value = conn
 
-        response = client.post(
-            "/vm/create",
-            json={"upi": "0x1", "xml_text": VM_XML, "npu_count": 1, "need_nic": True},
-        )
+        with patch("ubse.ubs_engine_npu.get_product_type", return_value=0), \
+             patch("ub_device_manager.domain.vm.vm_tasks.wait_h2n_healthy", new_callable=AsyncMock) as mock_h2n, \
+             patch.object(NpuClient, "configure_nics", new_callable=AsyncMock,
+                          return_value=[("eth0", "1")]) as mock_configure:
+            response = client.post(
+                "/vm/create",
+                json={"upi": "0x1", "xml_text": VM_XML, "npu_count": 1, "need_nic": True},
+            )
 
         assert response.status_code == 200
+        mock_h2n.assert_awaited_once_with(["guid-2-1"])
+        mock_configure.assert_awaited_once_with([("guid-2-1", "1")])
         assert mock_alloc.call_args.kwargs["device_list"] == [
             {"device_id": "0-1", "device_type": "NPU"},
             {"device_id": "1-1", "device_type": "NIC_VFE"},
