@@ -126,7 +126,3 @@ rm -rf %{buildroot}
 %config(noreplace) %attr(0640, %{service_user}, %{service_user}) /etc/ub_device_manager/ub_device_manager.toml
 %dir %attr(0750, %{service_user}, %{service_user}) /var/log/ub_device_manager
 %attr(0755, root, root) %{_bindir}/ubdmctl
-
-%changelog
-* Tue Jun 30 2026 Developer - 1.0.0
-- Refactor the install paths, support passing the Python version dynamically, and generate the global ubdmctl control command
