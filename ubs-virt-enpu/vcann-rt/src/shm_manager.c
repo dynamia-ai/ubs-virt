@@ -229,22 +229,6 @@ uint64_t shm_get_hbm_request_free(shm_state_t *state)
     return hbm_request_free;
 }
 
-uint64_t shm_get_swap_size(shm_state_t *state, int32_t vnpu_id)
-{
-    if (state == NULL) {
-        LOG_ERROR("shm_state is NULL");
-        return 0;
-    }
-
-    vnpu_shm_entry_t *entry = shm_get_entry(state, vnpu_id);
-    if (entry == NULL) {
-        LOG_ERROR("Failed to get entry for vnpu_id: %d", vnpu_id);
-        return 0;
-    }
-
-    return entry->swap_size;
-}
-
 int shm_check_swap_cmd(shm_state_t *state, int32_t *vnpu_id, int32_t *action)
 {
     if (state == NULL || vnpu_id == NULL || action == NULL) {
@@ -272,36 +256,113 @@ void shm_ack_swap_cmd(shm_state_t *state)
     }
 }
 
-void shm_set_swapped(shm_state_t *state, int32_t vnpu_id, bool swapped)
+bool shm_swap_ack_done(shm_state_t *state, int32_t vnpu_id, uint64_t seq)
 {
-    if (state == NULL) {
-        LOG_ERROR("shm_state is NULL");
-        return;
+    if (state == NULL || vnpu_id < 0 || vnpu_id >= MAX_VNPU_PER_DIE) {
+        LOG_ERROR("shm_swap_ack_done: invalid params, vnpu_id=%d", vnpu_id);
+        return false;
     }
 
-    vnpu_shm_entry_t *entry = shm_get_entry(state, vnpu_id);
-    if (entry == NULL) {
-        LOG_ERROR("Failed to get entry for vnpu_id: %d", vnpu_id);
-        return;
+    if (seq == 0) {
+        return true; /* 没有 epoch, 不存在待办 */
     }
 
-    entry->swapped = swapped;
-    LOG_INFO("Set swapped=%d for vnpu_id=%d", swapped, vnpu_id);
+    vnpu_shm_entry_t *entry = &state->entries[vnpu_id];
+    for (int i = 0; i < MAX_PROCESSES_PER_VNPU; i++) {
+        if (atomic_load(&entry->processes[i].ack_pending_seq) == seq) {
+            return false; /* 仍有槽位欠本 epoch 一次 ack */
+        }
+    }
+    return true;
 }
 
-bool shm_get_swapped(shm_state_t *state, int32_t vnpu_id)
+/* 收尾: 仅当共享内存里的当前 epoch 仍是 seq 时置 completed, 避免把 acks 打到一个
+ * manager 刚刚下发的新命令上. 先看 action 是因为 watchdog 完成时会同时把 action 清成 NONE. */
+static void swap_cmd_finish_if_epoch(shm_state_t *state, int32_t vnpu_id, uint64_t seq)
+{
+    if (atomic_load(&state->swap_cmd.cmd_seq) != seq) {
+        return;
+    }
+    if (atomic_load(&state->swap_cmd.action) != SWAP_ACTION_OUT) {
+        return; /* 已被其他 ack 者/watchdog 收尾 */
+    }
+    if (!shm_swap_ack_done(state, vnpu_id, seq)) {
+        return;
+    }
+    if (atomic_load(&state->swap_cmd.cmd_seq) != seq) {
+        return;
+    }
+    shm_ack_swap_cmd(state);
+}
+
+int shm_try_ack_swap_cmd(shm_state_t *state, int32_t vnpu_id, int slot, uint64_t seq)
+{
+    bool bad_vnpu = (vnpu_id < 0) || (vnpu_id >= MAX_VNPU_PER_DIE);
+    bool bad_slot = (slot < 0) || (slot >= MAX_PROCESSES_PER_VNPU);
+    if (state == NULL || bad_vnpu || bad_slot || (seq == 0)) {
+        LOG_ERROR("shm_try_ack_swap_cmd: invalid params, vnpu_id=%d, slot=%d, seq=%lu", vnpu_id, slot,
+                  (unsigned long)seq);
+        return -1;
+    }
+
+    process_entry_t *entry = &state->entries[vnpu_id].processes[slot];
+    /* 抢占式清 marker: 进程自己 ack 与 watchdog 代 ack 之间只有一方能成功, 保证恰好一次 */
+    if (atomic_exchange(&entry->ack_pending_seq, 0) != seq) {
+        return -1;
+    }
+
+    int prev = atomic_fetch_sub(&state->swap_cmd.refcount, 1);
+    int remain = (prev > 0) ? prev - 1 : 0;
+
+    swap_cmd_finish_if_epoch(state, vnpu_id, seq);
+    return remain;
+}
+
+void shm_set_process_swapped(shm_state_t *state, int32_t vnpu_id, int slot, bool swapped)
+{
+    if (state == NULL) {
+        LOG_ERROR("shm_state is NULL");
+        return;
+    }
+    if (vnpu_id < 0 || vnpu_id >= MAX_VNPU_PER_DIE || slot < 0 || slot >= MAX_PROCESSES_PER_VNPU) {
+        LOG_ERROR("Invalid vnpu_id=%d or slot=%d", vnpu_id, slot);
+        return;
+    }
+
+    atomic_store(&state->entries[vnpu_id].processes[slot].swapped, swapped);
+    LOG_DEBUG("Set process[%d].swapped=%d for vnpu_id=%d", slot, swapped, vnpu_id);
+}
+
+bool shm_get_process_swapped(shm_state_t *state, int32_t vnpu_id, int slot)
 {
     if (state == NULL) {
         LOG_ERROR("shm_state is NULL");
         return false;
     }
-
-    vnpu_shm_entry_t *entry = shm_get_entry(state, vnpu_id);
-    if (entry == NULL) {
-        LOG_ERROR("Failed to get entry for vnpu_id: %d", vnpu_id);
+    if (vnpu_id < 0 || vnpu_id >= MAX_VNPU_PER_DIE || slot < 0 || slot >= MAX_PROCESSES_PER_VNPU) {
+        LOG_ERROR("Invalid vnpu_id=%d or slot=%d", vnpu_id, slot);
         return false;
     }
 
-    LOG_DEBUG("Get swapped=%d for vnpu_id=%d", entry->swapped, vnpu_id);
-    return entry->swapped;
+    return atomic_load(&state->entries[vnpu_id].processes[slot].swapped);
+}
+
+bool shm_get_vnpu_all_swapped(shm_state_t *state, int32_t vnpu_id)
+{
+    if (state == NULL) {
+        LOG_ERROR("shm_state is NULL");
+        return false;
+    }
+    if (vnpu_id < 0 || vnpu_id >= MAX_VNPU_PER_DIE) {
+        LOG_ERROR("Invalid vnpu_id=%d", vnpu_id);
+        return false;
+    }
+
+    vnpu_shm_entry_t *entry = &state->entries[vnpu_id];
+    for (int i = 0; i < MAX_PROCESSES_PER_VNPU; i++) {
+        if (atomic_load(&entry->processes[i].active) && !atomic_load(&entry->processes[i].swapped)) {
+            return false;
+        }
+    }
+    return true;
 }

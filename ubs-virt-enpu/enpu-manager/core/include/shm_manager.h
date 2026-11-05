@@ -35,13 +35,33 @@
 #define SWAP_OUT_FROM_BORROWED 1
 #define SWAP_OUT_FROM_ALL 2
 
-#define SHM_STATE_VERSION 2 /* bump: 删除 pod_alive 字段，结构布局变化 */
+#define SHM_STATE_VERSION 4 /* bump: 新增 ack_pending_seq（换出 ack 欠账标记），结构布局变化 */
+
+#define MAX_PROCESSES_PER_VNPU 64                       /* 每个 vNPU 最多注册的 vcann-rt 进程数 */
+#define PROCESS_ALIVE_TIMEOUT_NS (5ULL * 1000000000ULL) /* 进程心跳超时阈值: 5 秒 */
+
+typedef struct process_entry {
+    int32_t vcann_rt_id;                    /* vcann-rt 唯一 ID (atomic 计数器分配) */
+    int32_t pid;                            /* OS 进程 PID */
+    atomic_bool swapped;                    /* 该进程是否已换出 */
+    atomic_bool active;                     /* 该进程是否活跃 (false=空槽位) */
+    atomic_uint_fast64_t last_heartbeat_ns; /* 心跳时间戳 (进程存活检测) */
+    atomic_uint_fast64_t hbm_used;          /* 该进程实际占用的 HBM 字节数 */
+    uint64_t swap_offset;                   /* 该进程在 swap buffer 中的偏移 */
+    uint64_t swap_size;                     /* 该进程换出的数据大小 */
+    /* 换出 ack 欠账标记: 0=本槽位不欠 ack, ==swap_cmd.cmd_seq=欠当前 epoch 一次 ack.
+     * 写命令时由 enpu-manager 置位, 只有真正 ack(进程自己或 watchdog 代 ack) 才清零.
+     * 完成判定 = 目标 vNPU 上没有任何槽位的 ack_pending_seq 等于当前 cmd_seq. */
+    atomic_uint_fast64_t ack_pending_seq;
+} process_entry_t;
 
 typedef struct swap_cmd {
     char target_pod_uid[MAX_UUID_LEN];
     int32_t target_vnpu_id;
     atomic_int action;
     atomic_bool completed;
+    atomic_int refcount;          /* 待换出的进程数，最后一个进程置 completed=true */
+    atomic_uint_fast64_t cmd_seq; /* 命令序号（epoch），进程据此避免重复处理/递减 */
     uint64_t timestamp_ns;
 } swap_cmd_t;
 
@@ -76,13 +96,11 @@ typedef struct vnpu_shm_entry {
     int32_t vnpu_id;
     uint64_t hbm_request;
     uint64_t hbm_limit;
-    atomic_uint_fast64_t hbm_used;
+    atomic_uint_fast64_t hbm_used; /* 该 vNPU 所有进程的 hbm_used 之和 (atomic_fetch_add/sub) */
     int32_t sched_policy;
-    bool swapped;
-    uint64_t swap_offset;
-    uint64_t swap_size;
     bool swap_enabled;
     int32_t swap_priority;
+    process_entry_t processes[MAX_PROCESSES_PER_VNPU]; /* 进程注册表（嵌套） */
 } vnpu_shm_entry_t;
 
 typedef struct shm_state {
@@ -98,6 +116,7 @@ typedef struct shm_state {
     swap_cmd_t swap_cmd;
     swap_out_cmd_t swap_out_cmd;
     pthread_mutex_t swap_in_mutex;
+    atomic_int next_vcann_rt_id; /* vcann_rt_id 自增计数器（0 表示未分配） */
     uint8_t reserved[64];
 } shm_state_t;
 
@@ -170,6 +189,12 @@ int shm_manager_write_swap_cmd(shm_manager_t *mgr, int phy_id, const char *pod_u
 int shm_manager_read_swap_cmd(shm_manager_t *mgr, int phy_id, char *pod_uid, int *vnpu_id, int *action,
                               bool *completed);
 int shm_manager_ack_swap_cmd(shm_manager_t *mgr, int phy_id);
+/* watchdog 代死进程 ack: 仅当该槽位 ack_pending_seq==当前 cmd_seq 时清零并递减 refcount,
+ * 随后若无任何槽位仍欠本 epoch 的 ack 则置 completed. 幂等, 可重复调用. */
+int shm_manager_proxy_ack_process(shm_manager_t *mgr, int phy_id, int vnpu_id, int slot);
+/* 兜底完成判定: 当前换出命令仍待完成且目标 vNPU 上无槽位欠 ack 时置 completed.
+ * 用于覆盖"进程 ack 后半路消失/槽位被复用"等无法靠逐进程代 ack 收敛的残留场景. */
+int shm_manager_try_complete_swap_cmd(shm_manager_t *mgr, int phy_id);
 
 int shm_manager_set_swap_enabled(shm_manager_t *mgr, int phy_id, int vnpu_id, bool enabled);
 int shm_manager_get_swap_enabled(shm_manager_t *mgr, int phy_id, int vnpu_id, bool *enabled);
@@ -189,6 +214,11 @@ int shm_swap_buffer_get_status(swap_buffer_status_t *status);
 
 int shm_alloc(shm_state_t *state, int vnpu_id, uint64_t size);
 int shm_free(shm_state_t *state, int vnpu_id);
+/* 进程级 swap buffer 分配/释放：偏移与大小记录在 processes[slot] */
+int shm_alloc_per_process(shm_state_t *state, int vnpu_id, int slot, uint64_t size);
+int shm_free_per_process(shm_state_t *state, int vnpu_id, int slot);
+/* 聚合查询: 该 vNPU 是否"存在活跃进程且全部已换出"（空 vNPU 返回 false） */
+int shm_manager_get_vnpu_all_swapped(shm_manager_t *mgr, int phy_id, int vnpu_id, bool *swapped);
 void shm_print_free_block_info(void);
 
 #if defined(__cplusplus)

@@ -8,6 +8,7 @@
 #include <string.h>
 #include "core_limiter.h"
 #include "log.h"
+#include "npu_manager.h"
 #include "swap_buffer_shm.h"
 #include "swap_monitor_thread.h"
 
@@ -65,9 +66,15 @@ int swap_hook_malloc_mem(swap_hook_t *hook, void **ptr, uint64_t size)
     ret = memory_tracker_add(hook->tracker, *ptr, size, handle, false);
     CHECK_RETURN_ERROR_CODE(ret, "Memory tracker add record failed when malloc mem.");
 
-    uint64_t used = atomic_load(&(shm_get_entry(get_shm_state(), get_vnpu_id())->hbm_used)) + size;
-    ret = shm_update_used(get_shm_state(), get_vnpu_id(), used);
-    CHECK_RETURN_ERROR_CODE(ret, "Shm update used failed when malloc mem.");
+    shm_state_t *state = get_shm_state();
+    vnpu_shm_entry_t *entry = state != NULL ? shm_get_entry(state, get_vnpu_id()) : NULL;
+    int my_slot = get_registry_slot();
+    if (entry != NULL) {
+        if (my_slot >= 0) {
+            atomic_fetch_add(&entry->processes[my_slot].hbm_used, size);
+        }
+        atomic_fetch_add(&entry->hbm_used, size);
+    }
 
     return ENPU_SUCCESS;
 }
@@ -92,9 +99,15 @@ int swap_hook_malloc_physical_mem(swap_hook_t *hook, rtDrvMemHandle handle, uint
     ret = memory_tracker_add_handle_record(hook->tracker, handle, size, rtProp, flags);
     CHECK_RETURN_ERROR_CODE(ret, "Memory tracker add handle record failed when malloc physical mem.");
 
-    uint64_t used = atomic_load(&(shm_get_entry(get_shm_state(), get_vnpu_id())->hbm_used)) + size;
-    ret = shm_update_used(get_shm_state(), get_vnpu_id(), used);
-    CHECK_RETURN_ERROR_CODE(ret, "Shm update used failed when malloc physical mem.");
+    shm_state_t *state = get_shm_state();
+    vnpu_shm_entry_t *entry = state != NULL ? shm_get_entry(state, get_vnpu_id()) : NULL;
+    int my_slot = get_registry_slot();
+    if (entry != NULL) {
+        if (my_slot >= 0) {
+            atomic_fetch_add(&entry->processes[my_slot].hbm_used, size);
+        }
+        atomic_fetch_add(&entry->hbm_used, size);
+    }
 
     return ENPU_SUCCESS;
 }
@@ -111,13 +124,19 @@ int swap_hook_check_and_swap_in(swap_hook_t *hook)
     }
     pthread_mutex_lock(&hook->tracker->lock);
 
-    if (!shm_get_swapped(get_shm_state(), get_vnpu_id())) {
-        /* 另一个线程已经 swap_in 完了 */
+    int my_slot = get_registry_slot();
+    if (my_slot < 0) {
         pthread_mutex_unlock(&hook->tracker->lock);
         return ENPU_SUCCESS;
     }
 
-    LOG_INFO("swap_hook: triggering swap_in for vnpu %d.", get_vnpu_id());
+    if (!shm_get_process_swapped(get_shm_state(), get_vnpu_id(), my_slot)) {
+        /* 本进程未处于换出状态, 无需(重新)换入 */
+        pthread_mutex_unlock(&hook->tracker->lock);
+        return ENPU_SUCCESS;
+    }
+
+    LOG_INFO("swap_hook: triggering swap_in for vnpu %d, slot %d.", get_vnpu_id(), my_slot);
 
     shm_state_t *state = get_shm_state();
     int rc = pthread_mutex_lock(&state->swap_in_mutex);
@@ -128,11 +147,17 @@ int swap_hook_check_and_swap_in(swap_hook_t *hook)
         return ENPU_FAIL;
     }
     update_last_kernel_time_now();
-    uint64_t swap_size = shm_get_swap_size(state, get_vnpu_id());
+
+    /* 使用本进程的换出量作为换入前的腾挪量估算 */
+    process_entry_t *my_entry = &state->entries[get_vnpu_id()].processes[my_slot];
+    uint64_t swap_size = my_entry->swap_size;
     int ret = check_and_swap_out(swap_size, SWAP_OUT_FROM_ALL);
     CHECK_RETURN_ERROR_CODE(ret, "Check and swap out failed when swap in.");
 
-    uint64_t used = atomic_load(&(shm_get_entry(state, get_vnpu_id())->hbm_used));
+    /* 恢复量取进程槽位记录的真实换出量: swap_size 在换出时写为 act_swapped, 与换出侧 clamp 扣减
+     * 的 hbm_used 完全同一口径; 恢复逻辑仅对双级 hbm_used 做 atomic_fetch_add(used), 不再逐 record
+     * 累加 size, 避免与实拷字节数不一致导致的偏差 */
+    uint64_t used = my_entry->swap_size;
     hook->tracker->check_record_in = 0;
     for (size_t i = 0; i < hook->tracker->count; ++i) {
         memory_record_t *record = &(hook->tracker->records[i]);
@@ -158,7 +183,6 @@ int swap_hook_check_and_swap_in(swap_hook_t *hook)
             continue;
         }
 
-        used += record->size;
         hook->tracker->check_record_in++;
         LOG_DEBUG("swap_hook: swap_in record success for ptr=%p, offset=%lu, size=%lu", record->ptr,
                   record->swap_offset, record->size);
@@ -170,14 +194,15 @@ int swap_hook_check_and_swap_in(swap_hook_t *hook)
     }
 
     if (used != 0) {
-        ret = shm_update_used(get_shm_state(), get_vnpu_id(), used);
-        if (ret != ENPU_SUCCESS) {
-            LOG_ERROR("Shm update used failed when swap in.");
+        /* 进程级 + vNPU 级 hbm_used 恢复 */
+        atomic_fetch_add(&my_entry->hbm_used, used);
+        vnpu_shm_entry_t *vnpu_entry = shm_get_entry(state, get_vnpu_id());
+        if (vnpu_entry != NULL) {
+            atomic_fetch_add(&vnpu_entry->hbm_used, used);
         }
-        shm_set_swapped(get_shm_state(), get_vnpu_id(), false);
+        shm_set_process_swapped(state, get_vnpu_id(), my_slot, false);
 
-        LOG_INFO("swap_hook: swap_in completed for vnpu %d, is_swapped=%u", get_vnpu_id(),
-                 shm_get_swapped(get_shm_state(), get_vnpu_id()));
+        LOG_INFO("swap_hook: swap_in completed for vnpu %d, vcann_rt_id %d", get_vnpu_id(), my_slot);
     }
     pthread_mutex_unlock(&state->swap_in_mutex);
     pthread_mutex_unlock(&hook->tracker->lock);
@@ -208,9 +233,15 @@ int swap_hook_free_mem(swap_hook_t *hook, void *ptr)
     ret = memory_tracker_remove(hook->tracker, ptr);
     CHECK_RETURN_ERROR_CODE(ret, "Memory tracker remove record failed when free mem.");
 
-    uint64_t used = atomic_load(&(shm_get_entry(get_shm_state(), get_vnpu_id())->hbm_used)) - size;
-    ret = shm_update_used(get_shm_state(), get_vnpu_id(), used);
-    CHECK_RETURN_ERROR_CODE(ret, "Shm update used failed when free mem.");
+    shm_state_t *state = get_shm_state();
+    vnpu_shm_entry_t *entry = state != NULL ? shm_get_entry(state, get_vnpu_id()) : NULL;
+    int my_slot = get_registry_slot();
+    if (entry != NULL) {
+        if (my_slot >= 0) {
+            atomic_fetch_sub(&entry->processes[my_slot].hbm_used, size);
+        }
+        atomic_fetch_sub(&entry->hbm_used, size);
+    }
 
     return ENPU_SUCCESS;
 }
@@ -236,9 +267,15 @@ int swap_hook_free_physical_mem(swap_hook_t *hook, rtDrvMemHandle handle)
     ret = memory_tracker_remove_handle_record(hook->tracker, handle);
     CHECK_RETURN_ERROR_CODE(ret, "Memory tracker remove handle record failed when free physical mem.");
 
-    uint64_t used = atomic_load(&(shm_get_entry(get_shm_state(), get_vnpu_id())->hbm_used)) - size;
-    ret = shm_update_used(get_shm_state(), get_vnpu_id(), used);
-    CHECK_RETURN_ERROR_CODE(ret, "Shm update used failed when free physical mem.");
+    shm_state_t *state = get_shm_state();
+    vnpu_shm_entry_t *entry = state != NULL ? shm_get_entry(state, get_vnpu_id()) : NULL;
+    int my_slot = get_registry_slot();
+    if (entry != NULL) {
+        if (my_slot >= 0) {
+            atomic_fetch_sub(&entry->processes[my_slot].hbm_used, size);
+        }
+        atomic_fetch_sub(&entry->hbm_used, size);
+    }
 
     return ENPU_SUCCESS;
 }
@@ -323,7 +360,13 @@ int swap_hook_global_init(int vnpu_id)
         swap_monitor_thread_t **monitor_thread = swap_monitor_get_thread();
         *monitor_thread = swap_monitor_thread_create(vnpu_id, state, executor, tracker, 10);
         if (*monitor_thread == NULL) {
-            LOG_INFO("swap_hook_global_init: swap_monitor_thread_create failed, swap monitoring disabled");
+            LOG_WARN("swap_hook_global_init: swap_monitor_thread_create failed, swap monitoring disabled");
+            /* 无 monitor 线程的进程无法响应换出命令, 若仍留在注册表中会永久占用
+             * swap_cmd.refcount 的递减份额, 使换出完成判定永远无法置位; 此处注销本进程 */
+            int slot = get_registry_slot();
+            if (slot >= 0) {
+                unregister_from_shm_state(state, vnpu_id, slot);
+            }
         }
     }
 
@@ -348,6 +391,11 @@ void swap_hook_global_destroy(void)
     if (g_swap_buffer_base != NULL) {
         swap_buffer_shm_detach(g_swap_buffer_base);
         g_swap_buffer_base = NULL;
+    }
+
+    int slot = get_registry_slot();
+    if (slot >= 0) {
+        unregister_from_shm_state(get_shm_state(), get_vnpu_id(), slot);
     }
 }
 
