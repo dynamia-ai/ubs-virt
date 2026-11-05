@@ -179,6 +179,69 @@ TEST_F(ConfigTest, LoadConfigQuotaOnlyCompletesRequestLimit)
     ASSERT_EQ(load_config(MOCK_NPU_CONFIG_PATH), ENPU_SUCCESS);
 }
 
+TEST_F(ConfigTest, LoadConfigHighPriorityRejectsIncorrectComputeSettings)
+{
+    const char *path = "../__build/high_priority.config";
+    const char *configs[] = {
+        "physical-npu-id=0\nvirtual-npu-id=0\naicore-quota=20\nmemory-quota=32768\n"
+        "scheduling-policy=3\nvnpu_priority=1\nshm-id=test-shm\n",
+        "physical-npu-id=0\nvirtual-npu-id=0\naicore-quota=0\nmemory-quota=32768\n"
+        "scheduling-policy=2\nvnpu_priority=1\nshm-id=test-shm\n",
+    };
+    for (const char *content : configs) {
+        FILE *f = fopen(path, "w");
+        ASSERT_NE(f, nullptr);
+        ASSERT_GE(fputs(content, f), 0);
+        ASSERT_EQ(fclose(f), 0);
+
+        EXPECT_EQ(load_config(path), ENPU_FAIL);
+        remove(path);
+    }
+
+    ASSERT_EQ(load_config(MOCK_NPU_CONFIG_PATH), ENPU_SUCCESS);
+}
+
+TEST_F(ConfigTest, LoadConfigHighPriorityAcceptsCorrectOrOmittedComputeSettings)
+{
+    const char *path = "../__build/high_priority_valid.config";
+    const char *configs[] = {
+        "physical-npu-id=0\nvirtual-npu-id=0\naicore-quota=0\nmemory-quota=32768\n"
+        "scheduling-policy=3\nvnpu_priority=1\nshm-id=test-shm\n",
+        "physical-npu-id=0\nvirtual-npu-id=0\nmemory-quota=32768\n"
+        "vnpu_priority=1\nshm-id=test-shm\n",
+    };
+    for (const char *content : configs) {
+        FILE *f = fopen(path, "w");
+        ASSERT_NE(f, nullptr);
+        ASSERT_GE(fputs(content, f), 0);
+        ASSERT_EQ(fclose(f), 0);
+
+        EXPECT_EQ(load_config(path), ENPU_SUCCESS);
+        EXPECT_EQ(config.vnpu_priority, VNPU_PRIORITY_HIGH);
+        EXPECT_EQ(config.aicore_quota, 0);
+        EXPECT_EQ(config.scheduling_policy, 3);
+        remove(path);
+    }
+
+    ASSERT_EQ(load_config(MOCK_NPU_CONFIG_PATH), ENPU_SUCCESS);
+}
+
+TEST_F(ConfigTest, LoadConfigHighPriorityRejectsInvalidComputeSyntax)
+{
+    const char *path = "../__build/high_priority_invalid.config";
+    const char *content = "physical-npu-id=0\nvirtual-npu-id=0\naicore-quota=0.1\n"
+                          "memory-quota=32768\nscheduling-policy=3\nvnpu_priority=1\nshm-id=test-shm\n";
+    FILE *f = fopen(path, "w");
+    ASSERT_NE(f, nullptr);
+    ASSERT_GE(fputs(content, f), 0);
+    ASSERT_EQ(fclose(f), 0);
+
+    EXPECT_EQ(load_config(path), ENPU_FAIL);
+    remove(path);
+
+    ASSERT_EQ(load_config(MOCK_NPU_CONFIG_PATH), ENPU_SUCCESS);
+}
+
 // New-style config: request+limit without quota loads fine (enpu-manager generated form).
 TEST_F(ConfigTest, LoadConfigRequestLimitWithoutQuota)
 {

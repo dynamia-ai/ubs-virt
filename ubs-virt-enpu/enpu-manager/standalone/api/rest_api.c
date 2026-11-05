@@ -40,6 +40,7 @@
 #define HTTP_STATUS_BAD_REQUEST 400
 #define HTTP_STATUS_NOT_FOUND 404
 #define HTTP_STATUS_INTERNAL_ERROR 500
+#define PARSE_ALLOC_INVALID_PRIORITY (-2)
 
 #define HTTP_STATUS_METHOD_NOT_ALLOWED 405
 
@@ -92,6 +93,48 @@ static const char *json_number_value(const char *json, const char *key)
     return colon + 1;
 }
 
+static const char *skip_json_whitespace(const char *p)
+{
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+        p++;
+    }
+    return p;
+}
+
+static int parse_vnpu_priority(const char *body, int32_t *priority)
+{
+    const char *key = "\"vnpu_priority\"";
+    const char *p = strstr(body, key);
+    if (p == NULL) {
+        return 0;
+    }
+
+    p = skip_json_whitespace(p + strlen(key));
+    if (*p != ':') {
+        return -1;
+    }
+    p = skip_json_whitespace(p + 1);
+    if (*p != '0' && *p != '1') {
+        return -1;
+    }
+    *priority = *p - '0';
+    p = skip_json_whitespace(p + 1);
+    return (*p == ',' || *p == '}') ? 0 : -1;
+}
+
+static bool json_number_differs_from(const char *json, const char *key, int expected)
+{
+    const char *value = json_number_value(json, key);
+    if (value == NULL) {
+        return false;
+    }
+
+    /* Compare the supplied number before strtol truncates fractional values. */
+    char *end = NULL;
+    long double supplied = strtold(value, &end);
+    return end == value || supplied != expected;
+}
+
 static int format_allocate_priority_warnings(const char *body, const alloc_request_t *req, char *warnings,
                                              size_t warnings_size)
 {
@@ -100,9 +143,8 @@ static int format_allocate_priority_warnings(const char *body, const alloc_reque
         return 0;
     }
 
-    bool ignored_quota = json_number_value(body, "\"aicore_quota\"") != NULL && req->aicore_quota != 0;
-    bool ignored_policy = json_number_value(body, "\"sched_policy\"") != NULL &&
-                          req->sched_policy != SCHED_POLICY_BEST_EFFORT;
+    bool ignored_quota = json_number_differs_from(body, "\"aicore_quota\"", 0);
+    bool ignored_policy = json_number_differs_from(body, "\"sched_policy\"", SCHED_POLICY_BEST_EFFORT);
     if (!ignored_quota && !ignored_policy) {
         return 0;
     }
@@ -454,9 +496,14 @@ static int route_request(rest_api_server_t *server, const char *method, const ch
     if (strcmp(method, "POST") == 0 && strcmp(path, "/api/v1/allocate") == 0) {
         alloc_request_t req;
         alloc_response_t resp = {0};
-        if (parse_json_alloc_request(body, &req) != 0) {
-            ret = snprintf_s(response, REST_RESPONSE_SIZE, REST_RESPONSE_SIZE - 1,
-                             "{\"error\":\"Invalid request body\",\"result\":%d}", ENPU_INVALID_PARAM);
+        int parse_result = parse_json_alloc_request(body, &req);
+        if (parse_result != 0) {
+            const char *error = "Invalid request body";
+            if (parse_result == PARSE_ALLOC_INVALID_PRIORITY) {
+                error = "Invalid vnpu_priority: expected JSON integer 0 or 1";
+            }
+            ret = snprintf_s(response, REST_RESPONSE_SIZE, REST_RESPONSE_SIZE - 1, "{\"error\":\"%s\",\"result\":%d}",
+                             error, ENPU_INVALID_PARAM);
             CHECK_COND_LOG_(ret < 0, "snprintf_s response failed.");
             return HTTP_STATUS_BAD_REQUEST;
         }
@@ -734,9 +781,9 @@ static int parse_json_alloc_request(const char *body, alloc_request_t *req)
     if (num != NULL) {
         req->swap_priority = (int)strtol(num, NULL, 10);
     }
-    num = json_number_value(body, "\"vnpu_priority\"");
-    if (num != NULL) {
-        req->vnpu_priority = (int)strtol(num, NULL, 10);
+    if (parse_vnpu_priority(body, &req->vnpu_priority) != 0) {
+        LOG_ERROR("Invalid vnpu_priority: expected integer 0 or 1");
+        return PARSE_ALLOC_INVALID_PRIORITY;
     }
     num = json_number_value(body, "\"phy_id\"");
     if (num != NULL) {
