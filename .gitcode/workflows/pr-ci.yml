@@ -1,0 +1,511 @@
+name: UBS-VIRT-Validation
+
+on:
+  workflow_call:
+    inputs:
+      pr_id:
+        description: Pull request number
+        required: true
+        type: string
+      target_branch:
+        description: Pull request target branch
+        required: true
+        type: string
+      merge_commit_sha:
+        description: Pull request merge commit
+        required: true
+        type: string
+    secrets:
+      dependency_token:
+        description: Token used to clone the private dependency repository
+        required: false
+
+env:
+  PR_ID: ${{ inputs.pr_id }}
+  TARGET_BRANCH: ${{ inputs.target_branch }}
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  repository: read
+  pr: none
+  issue: none
+  note: none
+  project: none
+
+stages:
+  checks_stage:
+    name: Checks
+    fail_fast: false
+    jobs:
+      pre_commit:
+        name: pre-commit
+        runs-on: [self-hosted, ubse, arm, cpu=8]
+        timeout-minutes: 30
+        container:
+          image: swr.cn-north-4.myhuaweicloud.com/ubscore/soe:latest
+
+        steps:
+          - name: Checkout PR merge code
+            uses: checkout
+            with:
+              ref: ${{ inputs.merge_commit_sha }}
+              fetch-depth: 0
+              allow-unsafe-pr-checkout: true
+
+          - name: Install pre-commit dependencies
+            run: |
+              set -euxo pipefail
+
+              sudo dnf install -y \
+                dnf-plugins-core \
+                clang-tools-extra \
+                python3 \
+                python3-pip
+
+              if ! command -v python >/dev/null 2>&1; then
+                sudo ln -s "$(command -v python3)" /usr/bin/python
+              fi
+              python --version              
+              python3 --version
+              clang-format --version
+
+          - name: Prepare clang-format check
+            run: |
+              set -euxo pipefail
+
+              sed -i 's/, -i/, -n, --Werror, --verbose/g' \
+                .pre-commit-config.yaml
+
+          - name: Run pre-commit
+            uses: openlibing/pre-commit-action@v1.0.1
+            env:
+              SKIP: run-build,clang-tidy
+            with:
+              extra_args: --all-files
+
+          - name: Save result
+            if: ${{ always() }}
+            env:
+              CURRENT_JOB_STATUS: ${{ job.status }}
+            run: |
+              mkdir -p .ci-results
+              if [[ "${CURRENT_JOB_STATUS}" == "success" ]]; then
+                echo "SUCCESS" > .ci-results/pre-commit
+              else
+                echo "FAILED" > .ci-results/pre-commit
+              fi
+
+              echo "pre-commit: ${CURRENT_JOB_STATUS}" >> "${ATOMGIT_STEP_SUMMARY}"
+
+          - name: Upload result
+            if: ${{ always() }}
+            uses: upload-artifact
+            with:
+              name: ci-result-pre-commit
+              path: .ci-results/pre-commit
+
+      build_x86_64:
+        name: build-x86-64
+        runs-on: [self-hosted, ubse, x86, cpu=8]
+        timeout-minutes: 60
+        container:
+          image: swr.cn-north-4.myhuaweicloud.com/ubscore/soe:latest
+
+        steps:
+          - name: Checkout PR merge code
+            uses: checkout
+            with:
+              ref: ${{ inputs.merge_commit_sha }}
+              fetch-depth: 0
+              allow-unsafe-pr-checkout: true
+
+          - name: Build changed virt-optimizer module
+            run: |
+              set -euxo pipefail
+
+              git fetch --no-tags origin \
+                "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/${TARGET_BRANCH}"
+
+              git diff --name-only \
+                "origin/${TARGET_BRANCH}...HEAD" \
+                > prinfo.txt
+              cat prinfo.txt
+
+              if ! grep -vE '\.md$' prinfo.txt > /tmp/code_changes.txt; then
+                echo "no code modify"
+                echo "x86_64=SKIPPED_DOC_ONLY" >> "${ATOMGIT_STEP_SUMMARY}"
+                exit 0
+              fi
+
+              cat /tmp/code_changes.txt
+              modules="$(
+                awk -F '/' 'NF > 1 {print $1}' /tmp/code_changes.txt |
+                  sort -u
+              )"
+              echo "Changed modules: ${modules}"
+
+              if ! grep -qx 'virt-optimizer' <<<"${modules}"; then
+                echo "not module virt-optimizer"
+                echo "x86_64=SKIPPED_NO_VIRT_OPTIMIZER" >> "${ATOMGIT_STEP_SUMMARY}"
+                exit 0
+              fi
+
+              cd virt-optimizer
+
+              sudo dnf install -y \
+                dnf-plugins-core \
+                rpm-build \
+                git
+
+              sudo dnf builddep -y --skip-unavailable \
+                ubs_optimizer.spec
+
+              bash build.sh
+
+              test -n "$(find output/release -maxdepth 1 -name 'ubs-optimizer-*.rpm' -print -quit)"
+
+          - name: Save result
+            if: ${{ always() }}
+            env:
+              CURRENT_JOB_STATUS: ${{ job.status }}
+            run: |
+              mkdir -p .ci-results
+              if [[ "${CURRENT_JOB_STATUS}" == "success" ]]; then
+                echo "SUCCESS" > .ci-results/x86_64
+              else
+                echo "FAILED" > .ci-results/x86_64
+              fi
+
+              echo "x86_64: ${CURRENT_JOB_STATUS}" >> "${ATOMGIT_STEP_SUMMARY}"
+
+          - name: Upload result
+            if: ${{ always() }}
+            uses: upload-artifact
+            with:
+              name: ci-result-x86-64
+              path: .ci-results/x86_64
+
+      build_aarch64:
+        name: build-aarch64
+        runs-on: [self-hosted, ubse, arm, cpu=8]
+        timeout-minutes: 120
+        container:
+          image: swr.cn-north-4.myhuaweicloud.com/ubscore/soe:latest
+
+        steps:
+          - name: Checkout PR merge code
+            uses: checkout
+            with:
+              ref: ${{ inputs.merge_commit_sha }}
+              fetch-depth: 0
+              allow-unsafe-pr-checkout: true
+
+          - name: Build changed modules
+            env:
+              DEPENDENCY_TOKEN: ${{ secrets.dependency_token }}
+            run: |
+              set -eo pipefail
+
+              git fetch --no-tags origin "${TARGET_BRANCH}"
+              git diff --name-only "FETCH_HEAD...HEAD" > prinfo.txt
+              cat prinfo.txt
+
+              if ! grep -qvE '\.md$' prinfo.txt; then
+                echo "no code modify"
+                echo "aarch64=SKIPPED_DOC_ONLY" >> "${ATOMGIT_STEP_SUMMARY}"
+                exit 0
+              fi
+
+              module_list="$(
+                awk -F '/' 'NF > 1 {print $1}' prinfo.txt |
+                  sort -u
+              )"
+              echo "Changed modules: ${module_list}"
+
+              sudo dnf install -y dnf-plugins-core
+
+              for module in ${module_list}; do
+                case "${module}" in
+                  virt-awaresched)
+                    echo "build virt-awaresched"
+                    (
+                      cd virt-awaresched
+                      sudo dnf builddep -y --skip-unavailable \
+                        virt-awaresched.spec
+                      bash build.sh
+                    )
+                    ;;
+
+                  ubs-virt-enpu)
+                    echo "build ubs-virt-enpu"
+                    (
+                      cd ubs-virt-enpu
+                      sudo dnf install -y \
+                        gcc \
+                        gcc-c++ \
+                        cmake \
+                        make \
+                        libboundscheck
+
+                      cd vcann-rt
+
+                      GIT_TERMINAL_PROMPT=0 \
+                      git \
+                        -c credential.helper='!f() { echo "username=liangkun_gitcode"; echo "password=${DEPENDENCY_TOKEN}"; }; f' \
+                        clone -b main \
+                        https://gitcode.com/BeiMing_Dev/build_dependency.git
+
+                      sudo tar -zxf build_dependency/Ascend.tar.gz -C /usr/local/
+                      sudo chmod 755 -R /usr/local/Ascend
+                      ls -al /usr/local/Ascend/cann-8.5.0/lib64
+
+                      source /usr/local/Ascend/cann-8.5.0/set_env.sh
+                      bash make_build.sh 8.5.0
+                    )
+                    ;;
+
+                  virt-optimizer)
+                    echo "build virt-optimizer"
+                    (
+                      cd virt-optimizer
+                      sudo dnf builddep -y --skip-unavailable \
+                        ubs_optimizer.spec
+                      bash build.sh
+                    )
+                    ;;
+
+                  *)
+                    echo "new module: ${module}"
+                    ;;
+                esac
+              done
+
+          - name: Save result
+            if: ${{ always() }}
+            env:
+              CURRENT_JOB_STATUS: ${{ job.status }}
+            run: |
+              mkdir -p .ci-results
+              if [[ "${CURRENT_JOB_STATUS}" == "success" ]]; then
+                echo "SUCCESS" > .ci-results/aarch64
+              else
+                echo "FAILED" > .ci-results/aarch64
+              fi
+
+              echo "aarch64: ${CURRENT_JOB_STATUS}" >> "${ATOMGIT_STEP_SUMMARY}"
+
+          - name: Upload result
+            if: ${{ always() }}
+            uses: upload-artifact
+            with:
+              name: ci-result-aarch64
+              path: .ci-results/aarch64
+
+      dt:
+        name: DT
+        runs-on: [self-hosted, ubse, arm, cpu=8]
+        timeout-minutes: 120
+        container:
+          image: swr.cn-north-4.myhuaweicloud.com/ubscore/openeuler-24.03-lts-sp3_ci_build:latest
+
+        steps:
+          - name: Checkout PR merge code
+            uses: checkout
+            with:
+              ref: ${{ inputs.merge_commit_sha }}
+              fetch-depth: 0
+              allow-unsafe-pr-checkout: true
+
+          - name: Run DT for changed modules
+            env:
+              DEPENDENCY_TOKEN: ${{ secrets.dependency_token }}
+            run: |
+              set -eo pipefail
+
+              CI_ROOT="${PWD}"
+              mkdir -p ".ci-results/dt-reports"
+              echo "DT started" > ".ci-results/dt-reports/run.txt"
+
+              check_coverage() {
+                local lines_limit="$1"
+                local branches_limit="$2"
+                local lines_cov
+                local branches_cov
+
+                lines_cov="$(
+                  grep -A3 '>Lines:<' index.html |
+                    grep '%' |
+                    head -n 1 |
+                    sed -E 's/.*>([0-9.]+)[[:space:]]*%.*/\1/'
+                )"
+                branches_cov="$(
+                  grep -A3 '>Branches:<' index.html |
+                    grep '%' |
+                    head -n 1 |
+                    sed -E 's/.*>([0-9.]+)[[:space:]]*%.*/\1/'
+                )"
+
+                if [[ -z "${lines_cov}" ]]; then
+                  echo "lines coverage is null" >&2
+                  return 1
+                fi
+                echo "lines coverage: ${lines_cov}%"
+                if ! awk -v actual="${lines_cov}" -v limit="${lines_limit}" \
+                  'BEGIN { exit !(actual >= limit) }'; then
+                  echo "lines coverage is below ${lines_limit}%" >&2
+                  return 1
+                fi
+
+                if [[ "${branches_limit}" != "0" ]]; then
+                  if [[ -z "${branches_cov}" ]]; then
+                    echo "branches coverage is null" >&2
+                    return 1
+                  fi
+                  echo "branches coverage: ${branches_cov}%"
+                  if ! awk -v actual="${branches_cov}" -v limit="${branches_limit}" \
+                    'BEGIN { exit !(actual >= limit) }'; then
+                    echo "branches coverage is below ${branches_limit}%" >&2
+                    return 1
+                  fi
+                fi
+              }
+
+              git fetch --no-tags origin "${TARGET_BRANCH}"
+              git diff --name-only "FETCH_HEAD...HEAD" > prinfo.txt
+              cat prinfo.txt
+
+              if ! grep -qvE '\.md$' prinfo.txt; then
+                echo "no code modify"
+                echo "DT=SKIPPED_DOC_ONLY" >> "${ATOMGIT_STEP_SUMMARY}"
+                exit 0
+              fi
+
+              module_list="$(
+                awk -F '/' 'NF > 1 {print $1}' prinfo.txt |
+                  sort -u
+              )"
+              echo "Changed modules: ${module_list}"
+
+              sudo dnf install -y \
+                dnf-plugins-core \
+                perl-Capture-Tiny \
+                patch \
+                python3-pip
+
+              for module in ${module_list}; do
+                case "${module}" in
+                  virt-awaresched)
+                    echo "test virt-awaresched"
+                    (
+                      cd virt-awaresched
+                      sudo dnf builddep -y --skip-unavailable \
+                        virt-awaresched.spec
+                      bash build.sh test -C
+                    )
+
+                    mkdir -p ".ci-results/dt-reports/virt-awaresched"
+                    cp -a virt-awaresched/build/coverage/. \
+                      ".ci-results/dt-reports/virt-awaresched/"
+                    (
+                      cd virt-awaresched/build/coverage
+                      check_coverage 50 0
+                    )
+                    ;;
+
+                  ubs-virt-enpu)
+                    echo "test ubs-virt-enpu"
+                    (
+                      cd ubs-virt-enpu
+                      sudo dnf install -y \
+                        gcc \
+                        gcc-c++ \
+                        cmake \
+                        make \
+                        libboundscheck
+
+                      cd vcann-rt
+
+                      GIT_TERMINAL_PROMPT=0 \
+                      git \
+                        -c credential.helper='!f() { echo "username=liangkun_gitcode"; echo "password=${DEPENDENCY_TOKEN}"; }; f' \
+                        clone -b main \
+                        https://gitcode.com/BeiMing_Dev/build_dependency.git
+
+                      sudo tar -zxf build_dependency/Ascend.tar.gz -C /usr/local/
+                      sudo chmod 755 -R /usr/local/Ascend
+
+                      source /usr/local/Ascend/cann-8.5.0/set_env.sh
+                      bash build_ut.sh
+                    ) 2>&1 | tee ".ci-results/dt-reports/ubs-virt-enpu-ut.log"
+                    ;;
+
+                  virt-optimizer)
+                    echo "test virt-optimizer"
+                    (
+                      cd virt-optimizer
+                      sudo dnf builddep -y --skip-unavailable \
+                        ubs_optimizer.spec
+                      cd ebpf
+                      bash run_ut.sh
+                    )
+
+                    mkdir -p ".ci-results/dt-reports/virt-optimizer"
+                    cp -a virt-optimizer/build/debug/tests/gcover_report/. \
+                      ".ci-results/dt-reports/virt-optimizer/"
+                    (
+                      cd virt-optimizer/build/debug/tests/gcover_report
+                      check_coverage 70 30
+                    )
+                    ;;
+
+                  ub-device-manager)
+                    echo "test ub-device-manager"
+                    (
+                      cd ub-device-manager
+                      sudo python3 -m pip install \
+                        pytest pytest-cov pytest-asyncio \
+                        -i https://repo.huaweicloud.com/repository/pypi/simple \
+                        --trusted-host repo.huaweicloud.com
+                      sudo python3 -m pip install -r requirements.txt \
+                        -i https://repo.huaweicloud.com/repository/pypi/simple \
+                        --trusted-host repo.huaweicloud.com
+                      python3 -m pytest
+                    ) 2>&1 | tee ".ci-results/dt-reports/ub-device-manager-pytest.log"
+                    ;;
+
+                  *)
+                    echo "new module: ${module}"
+                    ;;
+                esac
+              done
+
+          - name: Upload DT reports
+            if: ${{ always() }}
+            uses: upload-artifact
+            with:
+              name: ubs-virt-dt
+              path: .ci-results/dt-reports/
+
+          - name: Save result
+            if: ${{ always() }}
+            env:
+              CURRENT_JOB_STATUS: ${{ job.status }}
+            run: |
+              mkdir -p .ci-results
+              if [[ "${CURRENT_JOB_STATUS}" == "success" ]]; then
+                echo "SUCCESS" > .ci-results/DT
+              else
+                echo "FAILED" > .ci-results/DT
+              fi
+
+              echo "DT: ${CURRENT_JOB_STATUS}" >> "${ATOMGIT_STEP_SUMMARY}"
+
+          - name: Upload result
+            if: ${{ always() }}
+            uses: upload-artifact
+            with:
+              name: ci-result-dt
+              path: .ci-results/DT
