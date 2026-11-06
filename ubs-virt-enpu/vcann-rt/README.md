@@ -528,6 +528,7 @@ vCANN-RT支持两种方式启动业务容器：
       memory-quota=1024
       shm-id=xxx
       scheduling-policy=2
+      vnpu_priority=0
     ```
 
     **表 11 配置项说明**
@@ -536,10 +537,15 @@ vCANN-RT支持两种方式启动业务容器：
     |:---|:---|:---|
     |physical-npu-id|物理NPU id|`physical-npu-id=0`表示使用第0张物理NPU。|
     |virtual-npu-id|vNPU id|需要从0开始配置，并且同一个物理NPU下的vNPU不允许重复。|
-    |aicore-quota|AI Core资源配额，单位为%|表示算力使用的时间比例，需配置为整数。假设当前每个time slice为100ms, 申请了20%的算力资源，那么该容器有20ms的NPU使用权。|
+    |aicore-quota|AI Core资源配额，单位为%|策略1（fixed-share）和2（elastic）下启用 AICore 配额限制，需配置1～100的整数；例如配额20%表示按时间片使用约20%的算力。策略3（best-effort）下关闭 AICore 配额限制，配置值不用于限制算力；高优先级必须使用策略3，且此字段必须为0。|
     |memory-quota|HBM资源配额，单位为MB|表示显存资源使用容量，需配置为整数。当前容器内所有进程使用的HBM总量不能超过HBM资源配额。|
     |shm-id|共享内存文件名称|该文件名称采用物理NPU对应的VDie ID, 可以保证全局唯一。<br>通过`npu-smi info -t board -i ${id} -c ${chip_id}`命令查询VDie ID。<br>查询完成之后，可以通过`-`符号拼接成文件名称，例如：`shm-id=11111111-22222222-33333333-44444444-55555555` |
     |scheduling-policy|<ul>默认配置为2。<li>1: 固定配额模式（fixed-share）</li><li>2: 弹性模式（elastic）</li><li>3: 争抢模式（best-effort）</li></ul>|调度策略（具体介绍可参见[表10](#table10)，其中在争抢模式下，为充分利用算力资源，此时aicore的使用将不受配额的限制，但 HBM 的使用仍受配额的限制）。|
+    |vnpu_priority|<ul>默认0。<li>0：普通优先级</li><li>1：高优先级</li></ul>|仅接受整数0或1。高优先级不预留软件AI Core配额，但仍受HBM配置约束。|
+
+    高优先级容器可将上例中的 `aicore-quota`、`scheduling-policy` 和 `vnpu_priority` 改为 `0`、`3`、`1`。直接配置 `vnpu_priority=1` 时，`aicore-quota` 只能为 `0`，`scheduling-policy` 只能为 `3`；任一字段配置为其他值会导致 vCANN-RT 初始化失败，错误原因见容器内 `/var/log/enpu/vcann-rt/` 日志。两字段省略时分别使用 `0` 和 `3`，初始化日志会记录生效值。`npu_info.config` 原文件不会被改写。
+
+    同一物理NPU上的普通和高优先级容器需使用相同的 `shm-id`，并挂载同一宿主机 `/dev/shm`，以共享任务提交状态。两类容器均有近期任务需求时，高优先级获得较长的提交窗口，普通优先级仍有周期性提交机会；另一类空闲时无需等待其窗口。该机制只控制向设备提交新任务，不抢占已经提交的任务，也不保证实时抢占。
 
     此外，需要设置配置文件具有合适的权限，建议为644。
 
@@ -664,14 +670,14 @@ export ENPU_LOG_LEVEL=4
 
 - 由于vCANN-RT解决方案使用了共享内存，因此用户需要确保在可信用户范围内使用。
 - 由于硬件设备的限制(可以参考昇腾社区[使用约束](https://www.hiascend.com/document/detail/zh/canncommercial/850/appdevg/acldevg/aclcppdevg_000222.html))，建议vCANN-RT最大切分数量不超过单个device支持的最大用户进程数。
-- 用户对aicore算力资源的配额设置不能超过100%，对HBM显存资源的配额设置不能超过当前物理卡的可用显存资源总量，否则可能在容器拉起或者业务运行时出现异常。例如：HBM配额设置超限之后，可能会在业务运行时出现OOM异常报错。
-- 采用docker方式部署时，用户需要保证同一个device设置为同一种调度策略，否则可能会导致业务运行异常。
+- 普通优先级用户对aicore算力资源的配额设置不能超过100%；高优先级使用 `aicore-quota=0`、`scheduling-policy=3`。HBM显存资源的配额设置不能超过当前物理卡的可用显存资源总量，否则可能在容器拉起或者业务运行时出现异常。例如：HBM配额设置超限之后，可能会在业务运行时出现OOM异常报错。
+- 采用docker方式部署时，同一个device上的普通优先级容器需设置为同一种调度策略；高优先级容器使用策略3，不参与普通优先级的策略一致性约束。
 - 若用户通过源码自行编译软切分动态库，则需要保证主机侧的CANN版本和容器镜像中的CANN版本保持一致。
 - 建议通过k8s的部署方式使用软切分能力，由MindCluster统一提供资源调度和管理能力。
-- 若不具备k8s部署条件，可以通过docker部署方式使用软切分能力，但需要管理员统一规划docker容器aicore和HBM的配置总和不超过资源总量，且单device仅允许配置单种调度策略。如若未按照上述约束配置，可能出现以下业务影响:
-  - 若多容器配置的aicore总量超出100%， 各容器无法按照原先设定的资源使用。
+- 若不具备k8s部署条件，可以通过docker部署方式使用软切分能力，但需要管理员统一规划普通优先级容器的aicore配额和各容器的HBM配额，且单device上的普通优先级容器仅允许配置单种调度策略。如若未按照上述约束配置，可能出现以下业务影响:
+  - 若多个普通优先级容器配置的aicore总量超出100%，各容器无法按照原先设定的资源使用。
   - 若多容器配置的HBM总量超出当前单Device可用内存大小，某一容器内的业务运行时，可能因为实际内存不足，导致报错OOM内存不足。
-  - 若单卡上各容器配置的调度策略不相同，各容器无法按照原先设定的资源使用，建议各容器配置的调度策略相同。
+  - 若单卡上普通优先级容器配置的调度策略不相同，各容器无法按照原先设定的资源使用，建议普通优先级容器配置相同的调度策略。
 - CANN 商发版本的支持范围以[软件版本](#version)中对应硬件的表格为准。暂时不支持 persistent task 的使用。
 - 显存超分仅在 docker 部署场景下可用。
 - `scheduling-policy = 1`（fixed-share）的容器不支持显存超分，必须满足 `memory-request == memory-limit`；需要显存超分请使用 `scheduling-policy = 2`（elastic）或 `3`（best-effort）。

@@ -242,7 +242,7 @@ enpu-manager 通过 HTTP REST API 接收请求，默认端口 8080，返回 JSON
 
 | 字段               | 类型    | 必填 | 说明                                                                                       |
 |:-------------------|:--------|:-----|:-------------------------------------------------------------------------------------------|
-| `aicore_quota`     | int     | 普通优先级必填 | AICore 配额，普通优先级范围 1~100；高优先级可省略，实际使用 0，表示不预留软件算力配额。 |
+| `aicore_quota`     | int     | 普通优先级必填 | 普通优先级范围 1~100；策略 `1`/`2` 下用于 AICore 配额限制，策略 `3` 下仍需填写但不用于限制算力。高优先级可省略，实际使用 0。 |
 | `hbm_quota`        | int | 是   | HBM Request（保底预留），单位 MB，等价别名 `hbm_request`。                                            |
 | `hbm_limit`        | int | 否   | HBM Limit（硬上限），单位 MB。未填时默认等于 `hbm_quota`。                                              |
 | `sched_policy`     | int     | 普通优先级必填 | 调度策略：`1`=fixed-share，`2`=elastic，`3`=best-effort；高优先级可省略，实际使用 `3`。 |
@@ -255,6 +255,8 @@ enpu-manager 通过 HTTP REST API 接收请求，默认端口 8080，返回 JSON
 > `pod_uid` 和 `container_name` 共同构成 vNPU 的复合主键，后续释放/查询时需要提供。未指定时使用默认值，响应体中会回显实际使用的值。
 >
 > 未填 `hbm_limit` 时默认等于 `hbm_quota`，相当于 `hbm_request == hbm_limit`。**普通优先级采用 `sched_policy=1`（fixed-share）时建议显式传 `hbm_limit` 与 `hbm_quota` 相等**，避免误解。
+
+`vnpu_priority` 只接受 JSON 整数 `0` 或 `1`；字符串、小数及其他值会返回 HTTP 400。
 
 当`vnpu_priority=1`时，若用户显式传入非`0`的`aicore_quota`或非`3`的`sched_policy`，分配成功的响应会通过`warnings`数组对相应字段返回英文提示，并回显最终生效值。未传入的字段、已使用正确值的字段不产生提示；没有提示时省略`warnings`字段。分配失败仍通过`error_msg`说明原因。
 
@@ -331,6 +333,23 @@ curl -X POST http://localhost:8080/api/v1/allocate \
   }'
 ```
 
+**示例 4：分配高优先级 vNPU**
+
+```bash
+curl -X POST http://localhost:8080/api/v1/allocate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "vnpu_priority": 1,
+    "hbm_quota": 15360,
+    "hbm_limit": 15360,
+    "phy_id": 1,
+    "pod_uid": "high-priority-pod",
+    "container_name": "high-priority-container"
+  }'
+```
+
+此请求无需填写 `aicore_quota` 和 `sched_policy`，最终生效值分别为 `0` 和 `3`。高优先级不预留软件 AI Core 配额；当同卡普通优先级容器也有任务需求时，vCANN-RT 会为其保留周期性提交机会。`swap_priority` 控制显存换出顺序，与 `vnpu_priority` 的算力调度优先级无关。
+
 ### 释放 vNPU
 
 ```bash
@@ -371,13 +390,13 @@ curl http://localhost:8080/api/v1/allocations
 
 | 类别             | 约束                                                                                                                                                                                                |
 |:-----------------|:----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| AICore          | `aicore_quota` ∈ [1, 100]。                                                                                                                                                                          |
+| AICore          | 普通优先级的 `aicore_quota` ∈ [1, 100]；策略 `3`（best-effort）下仍需提供该值，但 vCANN-RT 不按此值限制算力。高优先级的生效值固定为 `0`。                                                     |
 | HBM 基础        | `0 ≤ hbm_request ≤ hbm_limit`。                                                                                                                                                                     |
 | HBM 上限        | `hbm_limit` 不得超过单 DIE HBM 总量。                                                                                                                                                                |
 | DIE 超分        | 同 DIE 上所有 vNPU 的 `hbm_limit` 之和 ≤ `(1 + oversub_ratio[phy_id]) × die_hbm_total`。                                                                                                            |
 | 调度策略        | `sched_policy=1`（fixed-share）：要求 `hbm_request > 0` 且 `hbm_request == hbm_limit`，**不支持显存超分**。                                                                                            |
 | 调度策略        | `sched_policy=2`（elastic）/ `sched_policy=3`（best-effort）：允许任意 `0 ≤ hbm_request ≤ hbm_limit` 组合，**支持显存超分**。                                                                                  |
-| 同卡策略一致性  | 同一 DIE 上所有 vNPU 必须使用相同 `sched_policy`。                                                                                                                                                  |
+| 同卡策略一致性  | 同一 DIE 上的普通优先级 vNPU 必须使用相同 `sched_policy`；高优先级固定使用 `3`，不参与普通优先级策略一致性校验。                                                                                       |
 | 超分 die 匹配   | vNPU 需要超分（`hbm_request < hbm_limit`）时，**只能**分配到 `oversub_ratio > 0` 的 die。                                                                                                            |
 | 非超分优先      | vNPU 不需要超分（`hbm_request == hbm_limit`）时，**优先**分配到 `oversub_ratio == 0` 的 die；非超分 die 资源不足时才会回退到超分 die。                                                                          |
 | 跨 DIE          | 不支持跨 DIE 分配（一个 vNPU 只能占用单 DIE 资源）。                                                                                                                                                  |
@@ -395,13 +414,14 @@ vNPU 分配成功后，enpu-manager 会在宿主机侧生成 vCANN-RT 所需的�
 |:--------------------|:----------------------------------------------------------------------------------------------|
 | `physical-npu-id`   | 物理 NPU id（即 phy_id）。                                                                     |
 | `virtual-npu-id`    | vNPU id（同一 phy 下唯一）。                                                                   |
-| `aicore-quota`      | AICore 配额（%）。                                                                              |
+| `aicore-quota`      | AICore 配额（%）；高优先级写入 `0`。                                                              |
 | `memory-request`    | HBM 保底预留（MB）。                                                                            |
 | `memory-limit`      | HBM 硬上限（MB）。                                                                              |
 | `shm-id`            | 共享内存标识。                              |
-| `scheduling-policy` | 调度策略（1/2/3，含义同 `sched_policy`）。                                                       |
+| `scheduling-policy` | 调度策略（1/2/3，含义同 `sched_policy`）；高优先级写入 `3`。                                      |
+| `vnpu_priority`     | vNPU 算力调度优先级（0=普通，1=高）；由分配请求写入。                                             |
 
-业务容器启动时需要把这个文件挂载到容器内的固定路径 `/etc/enpu/vcann-rt/npu_info.config`，vCANN-RT 据此完成算力切分与显存控制。具体挂载方式参见 [vCANN-RT 使用说明](../vcann-rt/README.md)。
+业务容器启动时需要把这个文件挂载到容器内的固定路径 `/etc/enpu/vcann-rt/npu_info.config`，vCANN-RT 据此完成算力切分与显存控制。高优先级请求即使显式填写其他 AICore 配额或策略，生成文件中仍写入生效值 `0` 和 `3`；若绕过 enpu-manager 直接编写配置文件，则必须自行满足高优先级配置约束。具体挂载方式参见 [vCANN-RT 使用说明](../vcann-rt/README.md)。
 
 ## 环境变量汇总
 

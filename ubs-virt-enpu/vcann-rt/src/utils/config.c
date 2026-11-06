@@ -77,7 +77,20 @@ int check_config()
         return 0;
     }
     if (config.vnpu_priority == VNPU_PRIORITY_HIGH) {
-        // High priority bypasses compute scheduling; quota and scheduling-policy are unused.
+        bool invalid_compute_setting = false;
+        if (config.aicore_quota != INVALID_VALUE && config.aicore_quota != 0) {
+            LOG_ERROR("%s must be 0 when vnpu_priority=1, got %d", OPTION_AICORE_QUOTA, config.aicore_quota);
+            invalid_compute_setting = true;
+        }
+        if (config.scheduling_policy != INVALID_VALUE && config.scheduling_policy != 3) {
+            LOG_ERROR("%s must be 3 (best-effort) when vnpu_priority=1, got %d", OPTION_SCHEDULING_POLICY,
+                      config.scheduling_policy);
+            invalid_compute_setting = true;
+        }
+        if (invalid_compute_setting) {
+            return 0;
+        }
+        // High priority bypasses compute scheduling; fill defaults for omitted fields.
         config.aicore_quota = 0;
         config.scheduling_policy = 3;
     }
@@ -196,6 +209,7 @@ int load_config(const char *file_path)
     CHECK_COND_RETURN_ERROR_CODE(!file, "Failed to open file: %s, error msg: %s.", file_path, strerror(errno));
 
     reset_config();
+    bool invalid_compute_setting = false;
 
     while (fgets(buffer, sizeof(buffer), file) != NULL) {
         size_t pos = 0; // Cur position in the buffer
@@ -223,13 +237,28 @@ int load_config(const char *file_path)
 
         int rc = save2config(key, value);
         if (rc == ENPU_SUCCESS) {
-            LOG_INFO("Success to load config: %s, value: %s", key, value);
+            /* Validate these fields after vnpu_priority is read, then log the effective values. */
+            if (strcmp(key, OPTION_AICORE_QUOTA) != 0 && strcmp(key, OPTION_SCHEDULING_POLICY) != 0) {
+                LOG_INFO("Success to load config: %s, value: %s", key, value);
+            }
         } else {
             LOG_WARN("Failed to load config: %s, value: %s", key, value);
+            if (strcmp(key, OPTION_AICORE_QUOTA) == 0 || strcmp(key, OPTION_SCHEDULING_POLICY) == 0) {
+                invalid_compute_setting = true;
+            }
         }
     }
     if (fclose(file) != 0) {
         LOG_ERROR("Failed to close config file. Reason: %s", strerror(errno));
     }
-    return check_config() ? ENPU_SUCCESS : ENPU_FAIL;
+    if (invalid_compute_setting && config.vnpu_priority == VNPU_PRIORITY_HIGH) {
+        LOG_ERROR("Invalid aicore-quota or scheduling-policy in high-priority config");
+        return ENPU_FAIL;
+    }
+    if (!check_config()) {
+        return ENPU_FAIL;
+    }
+    LOG_INFO("Success to load config: %s, effective value: %d", OPTION_AICORE_QUOTA, config.aicore_quota);
+    LOG_INFO("Success to load config: %s, effective value: %d", OPTION_SCHEDULING_POLICY, config.scheduling_policy);
+    return ENPU_SUCCESS;
 }
