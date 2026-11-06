@@ -22,7 +22,7 @@
 
 主机侧通过`npu-smi`工具开启容器共享模式，可支持多个容器挂载同一设备。若设备未开启容器共享模式，则只能挂载到单个容器。若配合MindCluster使用，要求整节点开启容器共享模式。
 
-```shell
+```bash
 # Atlas A2 推理系列产品：设置容器共享模式
 npu-smi set -t device-share -i ${id} -c ${chip_id} -d ${value}
 
@@ -44,14 +44,14 @@ npu-smi info -t device-share -i ${id}
 示例：
 开启设备0所有芯片的容器共享模式，查询设备0容器共享模式。
 
-  ```shell
+  ```bash
   npu-smi set -t device-share -i 0 -d 1
   npu-smi info -t device-share -i 0
   ```
 
 主机侧可设置容器共享持久化使能状态。若持久化功能为开启状态，则重启系统后设备的容器共享模式使能状态与重启前保持一致。
 
-```shell
+```bash
 npu-smi set -t device-share-cfg-recover -d ${value}
 ```
 
@@ -65,7 +65,7 @@ npu-smi set -t device-share-cfg-recover -d ${value}
 
 可以使用如下方式获取`MCS`源码。
 
-```shell
+```bash
 git clone https://gitcode.com/openeuler/ubs-virt.git
 cd ubs-virt-enpu/mcs
 ```
@@ -74,7 +74,7 @@ cd ubs-virt-enpu/mcs
 
 `MCS`源码的主要目录结构如下所示：
 
-```shell
+```bash
 .
 ├── common    // 公共模块：runtime hook框架、显存配额检查（guard_memory）
 ├── scripts   // 存放项目中编译构建使用的cmake脚本文件
@@ -83,15 +83,15 @@ cd ubs-virt-enpu/mcs
 
 ## 编译
 
-编译前需要根据CANN环境设置环境变量：
+编译前先加载所选 CANN 版本的环境。以下路径请替换为实际安装路径：
 
-```shell
-source /usr/local/Ascend/cann/set_env.sh
+```bash
+source /path/to/cann/set_env.sh
 ```
 
 `MCS`在代码仓中提供了统一的编译构建脚本（即`make_build.sh`文件），可以直接执行该脚本文件进行编译构建。
 
-```shell
+```bash
 bash make_build.sh
 ```
 
@@ -129,49 +129,44 @@ vnpu_priority=0
 
 启动业务容器时，需要将NPU设备、驱动、MCS动态库和配置文件挂载到容器，并共享`/dev/shm`（优先级调度依赖POSIX共享内存）。容器启动命令可参考（假如使用第0张NPU卡）：
 
-```shell
+```bash
 docker run -it --name=${container_name} \
   --device=/dev/davinci0:/dev/davinci0 \
   --device=/dev/davinci_manager \
   --device=/dev/hisi_hdc:/dev/hisi_hdc \
   -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
-  -v /usr/local/Ascend/cann-9.1.0:/usr/local/Ascend/cann-9.1.0 \
-  -v /xxx/libmcs.so:/opt/enpu/mcs/libmcs.so \
+  -v /xxx/libmcs.so:/opt/enpu/mcs/lib/libmcs.so \
   -v /xxx/mcs_config.config:/etc/enpu/mcs/mcs_config.config \
+  -v ${preload_path}/ld.so.preload:/etc/ld.so.preload \
   -v /dev/shm:/dev/shm \
   ${image_name} /bin/bash
 ```
+
+    注：若启动容器时，不映射ld.so.preload文件时，可通过`export LD_PRELOAD=/opt/enpu/mcs/lib/libmcs.so`命令加载动态库。
 
 **表 5 参数说明**
 
 | 文件/工具 | 路径 |
 |:-----|:-----|
-| MCS动态库 | 容器内建议路径：`/opt/enpu/mcs/libmcs.so` |
+| MCS动态库 | 容器内建议路径：`/opt/enpu/mcs/lib/libmcs.so` |
 | 物理NPU设备 | 主机侧和容器内均为固定路径：`/dev/davinci0` |
 | 共享内存设备 | 主机侧和容器内均为固定路径：`/dev/shm` |
 | 配置文件 | <ul><li>主机侧可存放在自定义路径。</li><li>容器内为固定路径：`/etc/enpu/mcs/mcs_config.config`</li></ul> |
 
 ### 启动业务，使用MCS服务
 
-在容器内通过`LD_PRELOAD`环境变量预加载MCS动态库，启动业务进程：
-
-```shell
-source /usr/local/Ascend/cann/set_env.sh
-
-export LD_PRELOAD=/opt/enpu/mcs/libmcs.so
-export ENPU_LOG_LEVEL=3
-
-python3 inference.py
-```
-
-- 业务进程首次调用`rtSetDevice`时会自动初始化MCS服务；初始化成功之后，日志中会出现`Initialized vNPU ...`字样。
 - 拉起业务时，可通过环境变量`ENPU_LOG_LEVEL`配置日志级别，例如：
 
-    ```shell
+    ```bash
     export ENPU_LOG_LEVEL=3
     ```
-
     日志级别由高到低分别是FATAL(0), ERROR(1), WARN(2), INFO(3), DEBUG(4)。默认日志级别为INFO，设置日志级别为DEBUG后，可在日志文件（日志文件路径：`/var/log/enpu/mcs/`）中查看DEBUG日志，屏显仅打印INFO及以上级别日志。
+
+  - 在容器内可查询配置文件获取vNPU资源配额等信息：
+
+    ```bash
+    cat /etc/enpu/mcs/mcs_config.config
+    ```
 
 ## 环境变量汇总
 
