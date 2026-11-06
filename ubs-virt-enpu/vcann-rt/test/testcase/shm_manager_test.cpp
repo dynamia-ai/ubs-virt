@@ -16,7 +16,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <atomic>
+#include "core_limiter.h"
 #include "log.h"
+#include "npu_manager.h"
 
 class ShmManagerTest : public testing::Test {
 protected:
@@ -179,14 +181,73 @@ TEST_F(ShmManagerTest, ShmGetHbmRequestFreeNullState)
     EXPECT_EQ(freeSize, 0);
 }
 
-TEST_F(ShmManagerTest, ShmSetAndGetSwapped)
+/* 多进程注册到同一 vNPU: 各自占用独立槽位; 注销单个进程不影响其它进程 */
+TEST_F(ShmManagerTest, ProcessRegisterMultipleSlotsAndUnregisterOne)
 {
     shm_state_t state = {0};
     vnpu_bitmap_set(state.vnpu_bitmap, 5);
+    state.next_vcann_rt_id.store(1);
 
-    EXPECT_FALSE(shm_get_swapped(&state, 5));
-    shm_set_swapped(&state, 5, true);
-    EXPECT_TRUE(shm_get_swapped(&state, 5));
-    shm_set_swapped(&state, 5, false);
-    EXPECT_FALSE(shm_get_swapped(&state, 5));
+    ASSERT_EQ(register_to_shm_state(&state, 5), ENPU_SUCCESS);
+    int slot0 = get_registry_slot();
+    ASSERT_GE(slot0, 0);
+    ASSERT_EQ(register_to_shm_state(&state, 5), ENPU_SUCCESS);
+    int slot1 = get_registry_slot();
+    ASSERT_GE(slot1, 0);
+    EXPECT_NE(slot0, slot1);
+    EXPECT_TRUE(state.entries[5].processes[slot0].active.load());
+    EXPECT_TRUE(state.entries[5].processes[slot1].active.load());
+    EXPECT_NE(state.entries[5].processes[slot0].vcann_rt_id, state.entries[5].processes[slot1].vcann_rt_id);
+
+    /* 换出状态按进程槽位独立维护, vNPU 级聚合要求全部活跃进程均已换出 */
+    EXPECT_FALSE(shm_get_vnpu_all_swapped(&state, 5));
+    shm_set_process_swapped(&state, 5, slot0, true);
+    EXPECT_TRUE(shm_get_process_swapped(&state, 5, slot0));
+    EXPECT_FALSE(shm_get_vnpu_all_swapped(&state, 5));
+    shm_set_process_swapped(&state, 5, slot1, true);
+    EXPECT_TRUE(shm_get_vnpu_all_swapped(&state, 5));
+
+    int32_t id1 = state.entries[5].processes[slot1].vcann_rt_id;
+    unregister_from_shm_state(&state, 5, slot0);
+    EXPECT_FALSE(state.entries[5].processes[slot0].active.load());
+    EXPECT_TRUE(state.entries[5].processes[slot1].active.load());
+    EXPECT_TRUE(shm_get_process_swapped(&state, 5, slot1));
+    EXPECT_EQ(state.entries[5].processes[slot1].vcann_rt_id, id1);
+
+    unregister_from_shm_state(&state, 5, slot1);
+    EXPECT_TRUE(shm_get_vnpu_all_swapped(&state, 5)); /* 无活跃进程视为已换出 */
+}
+
+/* 进程心跳: 注册时写入时间戳; 心跳超过超时阈值时可被判定为死进程, 槽位回收后可复用 */
+TEST_F(ShmManagerTest, ProcessHeartbeatTimeoutAndSlotReclaim)
+{
+    shm_state_t state = {0};
+    vnpu_bitmap_set(state.vnpu_bitmap, 6);
+    state.next_vcann_rt_id.store(1);
+
+    ASSERT_EQ(register_to_shm_state(&state, 6), ENPU_SUCCESS);
+    int slot = get_registry_slot();
+    ASSERT_GE(slot, 0);
+
+    process_entry_t *pe = &state.entries[6].processes[slot];
+    uint64_t hb = pe->last_heartbeat_ns.load();
+    EXPECT_GT(hb, (uint64_t)0);
+
+    const uint64_t timeoutNs = 5ULL * NS_PER_S; /* 与 enpu-manager PROCESS_ALIVE_TIMEOUT_NS 一致 */
+    uint64_t now = ns_now();
+    ASSERT_GT(now, timeoutNs + NS_PER_S);
+    pe->last_heartbeat_ns.store(now - timeoutNs - NS_PER_S);
+    hb = pe->last_heartbeat_ns.load();
+    EXPECT_GT(now - hb, timeoutNs);
+
+    /* 死进程回收: 余额清零、槽位释放后可被新进程复用 */
+    pe->hbm_used.store(4096);
+    state.entries[6].hbm_used.store(4096);
+    unregister_from_shm_state(&state, 6, slot);
+    EXPECT_FALSE(pe->active.load());
+    EXPECT_EQ(state.entries[6].hbm_used.load(), (uint64_t)0);
+
+    ASSERT_EQ(register_to_shm_state(&state, 6), ENPU_SUCCESS);
+    EXPECT_EQ(get_registry_slot(), slot);
+    unregister_from_shm_state(&state, 6, get_registry_slot());
 }

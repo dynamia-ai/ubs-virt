@@ -310,29 +310,64 @@ int swap_resolver_write_swap_command(swap_resolver_t *resolver, int phy_id, cons
             return ENPU_NOT_FOUND;
         }
 
-        uint64_t hbm_used = atomic_load(&entry->hbm_used);
-        uint64_t aligned_size = (hbm_used + SWAP_BUFFER_ALIGN_SIZE - 1) & ~(SWAP_BUFFER_ALIGN_SIZE - 1);
-
-        // 用新的CPU内存池算法
-        int ret = shm_alloc(state, vnpu_id, aligned_size);
-        if (ret != ENPU_SUCCESS) {
-            LOG_ERROR("swap_resolver_write_swap_command: shm_alloc failed, vnpu=%d, size=%lu, ret=%d", vnpu_id,
-                      aligned_size, ret);
-            return ret;
+        /* 进程粒度: 统计目标 vNPU 的活跃进程.
+         * 注: refcount 由 shm_manager_write_swap_cmd 置为全部活跃进程数(含已 swapped),
+         * 已换出的活跃进程通过 cmd_seq guard 恰好递减一次; 仅对 active && !swapped 的进程分配
+         * 新的 swap buffer. */
+        int active_count = 0;
+        for (int i = 0; i < MAX_PROCESSES_PER_VNPU; i++) {
+            if (atomic_load(&entry->processes[i].active)) {
+                active_count++;
+            }
         }
 
-        uint64_t new_offset = 0, new_size = 0;
-        bool swapped = false;
-        ret =
-            shm_manager_get_swap_state(resolver->allocator->shm_mgr, phy_id, vnpu_id, &swapped, &new_offset, &new_size);
-        if (ret != ENPU_SUCCESS) {
-            LOG_ERROR("swap_resolver_write_swap_command: shm_manager_get_swap_state failed, ret=%d", ret);
-            shm_free(state, vnpu_id);
-            return ret;
+        if (active_count == 0) {
+            /* 无活跃进程: 写命令会导致 refcount=0 而 completed 永不置位, 直接跳过 */
+            LOG_INFO("swap_resolver_write_swap_command: no active process for vnpu_id=%d, skip swap_out", vnpu_id);
+            return ENPU_SUCCESS;
         }
 
-        LOG_INFO("swap_resolver: shm_alloc for vnpu_id=%d, new_offset=%lu, new_size=%lu", vnpu_id, new_offset,
-                 new_size);
+        /* 为每个需要换出 (active && !swapped) 的进程精确分配 swap buffer,
+         * 直接读取进程级 hbm_used; 用 bitmask 记录本次已分配的槽位, 失败时回滚避免泄漏 */
+        uint64_t allocated_mask = 0;
+        for (int i = 0; i < MAX_PROCESSES_PER_VNPU; i++) {
+            process_entry_t *pe = &entry->processes[i];
+            if (!atomic_load(&pe->active)) {
+                continue;
+            }
+            if (atomic_load(&pe->swapped)) {
+                continue;
+            }
+
+            uint64_t process_used = atomic_load(&pe->hbm_used);
+            if (process_used == 0) {
+                /* 该进程尚未占用显存, 无需 swap buffer, 避免 tlsf_alloc(0) 必然失败
+                 * 导致整个 vNPU 的换出被判定失败 */
+                LOG_INFO("swap_resolver_write_swap_command: skip slot=%d of vnpu_id=%d, no hbm used", i, vnpu_id);
+                continue;
+            }
+            uint64_t aligned = (process_used + SWAP_BUFFER_ALIGN_SIZE - 1) & ~(uint64_t)(SWAP_BUFFER_ALIGN_SIZE - 1);
+            int ret = shm_alloc_per_process(state, vnpu_id, i, aligned);
+            if (ret != ENPU_SUCCESS) {
+                LOG_ERROR("swap_resolver_write_swap_command: shm_alloc_per_process failed, "
+                          "phy_id=%d, vnpu=%d, slot=%d, size=%lu, ret=%d",
+                          phy_id, vnpu_id, i, aligned, ret);
+
+                /* 回滚本次已成功分配的槽位, 释放 swap buffer, 避免泄漏 */
+                for (int j = 0; j < MAX_PROCESSES_PER_VNPU; j++) {
+                    if ((allocated_mask >> j) & 1ULL) {
+                        (void)shm_free_per_process(state, vnpu_id, j);
+                        LOG_WARN("swap_resolver_write_swap_command: rollback slot=%d for phy_id=%d, vnpu_id=%d", j,
+                                 phy_id, vnpu_id);
+                    }
+                }
+                return ret;
+            }
+            allocated_mask |= 1ULL << i;
+            LOG_INFO("swap_resolver: shm_alloc_per_process for phy_id=%d, vnpu_id=%d, slot=%d, "
+                     "process_used=%lu, alloc_size=%lu",
+                     phy_id, vnpu_id, i, process_used, aligned);
+        }
     }
 
     return npu_allocator_write_swap_cmd(resolver->allocator, phy_id, pod_uid, vnpu_id, action, to_swap_out);
@@ -364,11 +399,21 @@ int swap_resolver_check_and_swap_in(swap_resolver_t *resolver, int phy_id)
         uint64_t bitmap = (idx == 0) ? bitmap0 : bitmap1;
 
         if ((bitmap >> bit) & 1) {
-            if ((!state->entries[vnpu_id].swapped) && (state->entries[vnpu_id].swap_size != 0)) {
-                LOG_INFO("Free swap buffer for phy_id=%d vnpu_id=%d.", phy_id, vnpu_id);
-                int ret = shm_free(state, vnpu_id);
-                if (ret != ENPU_SUCCESS) {
-                    LOG_ERROR("Free swap buffer for phy_id=%d vnpu_id=%d failed.", phy_id, vnpu_id);
+            vnpu_shm_entry_t *vnpu_entry = &state->entries[vnpu_id];
+
+            /* 进程粒度: 遍历该 vNPU 的所有活跃且未换出但已分配了 swap buffer 的进程,
+             * 逐一释放各自的 swap buffer. 各进程 swap_size 记录在 processes[slot] 上. */
+            for (int slot = 0; slot < MAX_PROCESSES_PER_VNPU; slot++) {
+                process_entry_t *pe = &vnpu_entry->processes[slot];
+                if (!atomic_load(&pe->active)) {
+                    continue;
+                }
+                if (!atomic_load(&pe->swapped) && pe->swap_size != 0) {
+                    LOG_INFO("Free swap buffer for phy_id=%d vnpu_id=%d slot=%d.", phy_id, vnpu_id, slot);
+                    int ret = shm_free_per_process(state, vnpu_id, slot);
+                    if (ret != ENPU_SUCCESS) {
+                        LOG_ERROR("Free swap buffer for phy_id=%d vnpu_id=%d slot=%d failed.", phy_id, vnpu_id, slot);
+                    }
                 }
             }
         }

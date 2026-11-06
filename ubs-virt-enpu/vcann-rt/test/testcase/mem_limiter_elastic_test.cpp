@@ -22,7 +22,6 @@ static size_t g_stub_mem_used = 0;
 static size_t g_stub_mem_request_quota = 0;
 static size_t g_stub_mem_limit_quota = 0;
 static uint64_t g_stub_dynamic_free = 0;
-static shm_state_t *g_stub_shm_state = NULL;
 static int g_stub_get_mem_used_ret = 0;
 
 static int stub_get_mem_used(size_t *used)
@@ -51,11 +50,6 @@ static size_t stub_get_hbm_request_free(void)
     return g_stub_dynamic_free;
 }
 
-static shm_state_t *stub_get_shm_state(void)
-{
-    return g_stub_shm_state;
-}
-
 class MemLimiterElasticTest : public testing::Test {
 protected:
     static void SetUpTestCase()
@@ -74,7 +68,6 @@ protected:
         g_stub_mem_request_quota = 1024 * 1024 * 1024;      // 1GB request
         g_stub_mem_limit_quota = 2ULL * 1024 * 1024 * 1024; // 2GB limit
         g_stub_dynamic_free = 1024 * 1024 * 1024;           // 1GB dynamic free
-        g_stub_shm_state = (shm_state_t *)0x1;              // non-NULL to enable elastic mode
         g_stub_get_mem_used_ret = 0;
 
         MOCKER(get_mem_used).stubs().will(invoke(stub_get_mem_used));
@@ -82,7 +75,6 @@ protected:
         MOCKER(get_mem_limit_quota).stubs().will(invoke(stub_get_mem_limit_quota));
         MOCKER(get_mem_dynamic_free).stubs().will(invoke(stub_get_mem_dynamic_free));
         MOCKER(get_hbm_request_free).stubs().will(invoke(stub_get_hbm_request_free));
-        MOCKER(get_shm_state).stubs().will(invoke(stub_get_shm_state));
         MOCKER(check_and_swap_out).stubs().will(returnValue(ENPU_SUCCESS));
     }
 
@@ -90,7 +82,6 @@ protected:
     {
         GlobalMockObject::verify();
         GlobalMockObject::reset();
-        g_stub_shm_state = NULL;
     }
 };
 
