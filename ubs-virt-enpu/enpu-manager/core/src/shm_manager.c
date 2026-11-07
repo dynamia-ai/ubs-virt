@@ -349,12 +349,18 @@ int shm_manager_register_vnpu(shm_manager_t *mgr, int phy_id, int vnpu_id, int a
         .hbm_request = 0,
         .hbm_limit = 0,
         .sched_policy = sched_policy,
-        .swapped = false,
-        .swap_offset = 0,
-        .swap_size = 0,
         .swap_enabled = false,
     };
     atomic_store(&new_entry.hbm_used, 0);
+    for (int p = 0; p < MAX_PROCESSES_PER_VNPU; p++) {
+        atomic_store(&new_entry.processes[p].active, false);
+        atomic_store(&new_entry.processes[p].swapped, false);
+        atomic_store(&new_entry.processes[p].hbm_used, 0);
+        atomic_store(&new_entry.processes[p].last_heartbeat_ns, 0);
+        new_entry.processes[p].swap_offset = 0;
+        new_entry.processes[p].swap_size = 0;
+        atomic_store(&new_entry.processes[p].ack_pending_seq, 0);
+    }
 
     state->entries[vnpu_id] = new_entry;
     atomic_fetch_or(&state->vnpu_bitmap[idx], (1ULL << bit));
@@ -529,8 +535,13 @@ int shm_manager_set_swap_state(shm_manager_t *mgr, int phy_id, int vnpu_id, uint
         return ENPU_NOT_FOUND;
     }
 
-    entry->swap_offset = offset;
-    entry->swap_size = size;
+    /* 进程粒度: swap 偏移/大小位于各 processes[slot] 上, vNpU 级不再维护聚合的 swap_offset/swap_size.
+     * 调用方如需"清除该 vNpU 的 swap 状态", 使用 shm_free(state, vnpu_id).
+     * 显式打印被忽略的入参, 避免调用方误以为 vNPU 级 swap 状态已被写入. */
+    if (offset != 0 || size != 0) {
+        LOG_WARN("[SHM-MANAGER] set_swap_state ignored offset=%lu size=%lu (vnpu_id=%d): swap state is per-process",
+                 offset, size, vnpu_id);
+    }
 
     pthread_mutex_unlock(&mgr->lock);
 
@@ -562,9 +573,19 @@ int shm_manager_get_swap_state(shm_manager_t *mgr, int phy_id, int vnpu_id, bool
         return ENPU_NOT_FOUND;
     }
 
-    *swapped = entry->swapped;
-    *offset = entry->swap_offset;
-    *size = entry->swap_size;
+    *swapped = true;
+    *offset = 0;
+    *size = 0;
+    for (int slot = 0; slot < MAX_PROCESSES_PER_VNPU; slot++) {
+        process_entry_t *pe = &entry->processes[slot];
+        if (atomic_load(&pe->active) && !atomic_load(&pe->swapped)) {
+            *swapped = false;
+        }
+        *size += pe->swap_size;
+        if (*offset == 0 && pe->swap_size != 0) {
+            *offset = pe->swap_offset;
+        }
+    }
 
     pthread_mutex_unlock(&mgr->lock);
     return ENPU_SUCCESS;
@@ -577,7 +598,7 @@ int shm_manager_write_swap_cmd(shm_manager_t *mgr, int phy_id, const char *pod_u
         return ENPU_INVALID_PARAM;
     }
 
-    if (pod_uid == NULL || vnpu_id < 0) {
+    if (pod_uid == NULL || vnpu_id < 0 || vnpu_id >= MAX_VNPU_PER_DIE) {
         return ENPU_INVALID_PARAM;
     }
 
@@ -604,9 +625,34 @@ int shm_manager_write_swap_cmd(shm_manager_t *mgr, int phy_id, const char *pod_u
     if (to_swap_out != SWAP_OUT_NONE) {
         state->swap_out_cmd.target_vnpu_id = vnpu_id;
     }
-    atomic_store(&state->swap_cmd.action, action);
-    atomic_store(&state->swap_cmd.completed, false);
+
+    if (action == SWAP_ACTION_OUT) {
+        vnpu_shm_entry_t *vnpu_entry = &state->entries[vnpu_id];
+        /* 命令序号递增, 作为进程端去重与 ack 的 epoch */
+        uint64_t seq = atomic_fetch_add(&state->swap_cmd.cmd_seq, 1) + 1;
+
+        /* 先给每个活跃进程落下"欠当前 epoch 一次 ack"的标记, 再发布命令.
+         * 标记只在真正 ack 时清零, 因此进程无论死在换出前/拷贝中/ack 前, 完成判定都不会丢失依据. */
+        int count = 0;
+        for (int i = 0; i < MAX_PROCESSES_PER_VNPU; i++) {
+            process_entry_t *pe = &vnpu_entry->processes[i];
+            if (atomic_load(&pe->active)) {
+                atomic_store(&pe->ack_pending_seq, seq);
+                count++;
+            }
+        }
+        /* refcount 降级为快速路径计数(与 marker 扫描冗余), 不再单独承担完成判定 */
+        atomic_store(&state->swap_cmd.refcount, count);
+
+        /* completed 必须先于 action 发布: 否则最后一个进程可能在 completed=false 落盘前
+         * 就完成 ack 并置 true, 随后被这里覆盖回 false, 导致命令永久不完成 */
+        atomic_store(&state->swap_cmd.completed, count == 0);
+    } else {
+        atomic_store(&state->swap_cmd.completed, false);
+    }
+
     state->swap_cmd.timestamp_ns = (uint64_t)time(NULL) * 1000000000ULL;
+    atomic_store(&state->swap_cmd.action, action);
 
     pthread_mutex_unlock(&mgr->lock);
     return ENPU_SUCCESS;
@@ -644,6 +690,33 @@ int shm_manager_read_swap_cmd(shm_manager_t *mgr, int phy_id, char *pod_uid, int
     return ENPU_SUCCESS;
 }
 
+/* 目标 vNPU 上是否还有槽位欠 seq 这次 ack (调用方需持有 mgr->lock) */
+static bool swap_cmd_has_pending_ack_locked(shm_state_t *state, int vnpu_id, uint64_t seq)
+{
+    vnpu_shm_entry_t *entry = find_entry(state, vnpu_id);
+    if (entry == NULL) {
+        return false;
+    }
+
+    for (int i = 0; i < MAX_PROCESSES_PER_VNPU; i++) {
+        if (atomic_load(&entry->processes[i].ack_pending_seq) == seq) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* 置换出命令完成: 与 vcann-rt 侧 shm_ack_swap_cmd 的行为保持一致,
+ * 同时唤醒在 swap_out_cmd.completed 上忙等的 RT 进程 */
+static void swap_cmd_mark_completed_locked(shm_state_t *state)
+{
+    atomic_store(&state->swap_cmd.completed, true);
+    atomic_store(&state->swap_cmd.action, SWAP_ACTION_NONE);
+    if (state->swap_cmd.target_vnpu_id == state->swap_out_cmd.target_vnpu_id) {
+        atomic_store(&state->swap_out_cmd.completed, true);
+    }
+}
+
 int shm_manager_ack_swap_cmd(shm_manager_t *mgr, int phy_id)
 {
     if (mgr == NULL || phy_id < 0) {
@@ -658,13 +731,106 @@ int shm_manager_ack_swap_cmd(shm_manager_t *mgr, int phy_id)
         return ENPU_NOT_FOUND;
     }
 
-    atomic_store(&state->swap_cmd.completed, true);
+    swap_cmd_mark_completed_locked(state);
 
     pthread_mutex_unlock(&mgr->lock);
     return ENPU_SUCCESS;
 }
 
-int shm_manager_get_vnpu_swapped(shm_manager_t *mgr, int phy_id, int vnpu_id, bool *swapped)
+int shm_manager_proxy_ack_process(shm_manager_t *mgr, int phy_id, int vnpu_id, int slot)
+{
+    if (mgr == NULL || phy_id < 0) {
+        return ENPU_INVALID_PARAM;
+    }
+
+    if (vnpu_id < 0 || vnpu_id >= MAX_VNPU_PER_DIE || slot < 0 || slot >= MAX_PROCESSES_PER_VNPU) {
+        return ENPU_INVALID_PARAM;
+    }
+
+    pthread_mutex_lock(&mgr->lock);
+
+    shm_state_t *state = shm_manager_get_state(mgr, phy_id);
+    if (state == NULL) {
+        pthread_mutex_unlock(&mgr->lock);
+        return ENPU_NOT_FOUND;
+    }
+
+    /* 只处理换出命令: 换入/无命令时槽位没有欠账, 不做任何改动 */
+    if (atomic_load(&state->swap_cmd.action) != SWAP_ACTION_OUT) {
+        pthread_mutex_unlock(&mgr->lock);
+        return ENPU_SUCCESS;
+    }
+
+    uint64_t seq = atomic_load(&state->swap_cmd.cmd_seq);
+    if (seq == 0) {
+        pthread_mutex_unlock(&mgr->lock);
+        return ENPU_SUCCESS;
+    }
+
+    process_entry_t *pe = &state->entries[vnpu_id].processes[slot];
+    /* exchange 抢占: 只有"仍欠本 epoch"的槽位才会被代 ack, 已 ack 过的返回 0 不重复递减 */
+    if (atomic_exchange(&pe->ack_pending_seq, 0) != seq) {
+        pthread_mutex_unlock(&mgr->lock);
+        return ENPU_SUCCESS;
+    }
+
+    int prev = atomic_fetch_sub(&state->swap_cmd.refcount, 1);
+    int remain = (prev > 0) ? prev - 1 : 0;
+    LOG_WARN("[POD-WATCHDOG] proxy ack for dead process: phy_id=%d vnpu_id=%d slot=%d vcann_rt_id=%d seq=%lu "
+             "refcount %d->%d",
+             phy_id, vnpu_id, slot, pe->vcann_rt_id, (unsigned long)seq, prev, remain);
+
+    if (!swap_cmd_has_pending_ack_locked(state, vnpu_id, seq)) {
+        swap_cmd_mark_completed_locked(state);
+        LOG_WARN("[POD-WATCHDOG] swap_out completed after proxy ack: phy_id=%d vnpu_id=%d seq=%lu", phy_id, vnpu_id,
+                 (unsigned long)seq);
+    }
+
+    pthread_mutex_unlock(&mgr->lock);
+    return ENPU_SUCCESS;
+}
+
+int shm_manager_try_complete_swap_cmd(shm_manager_t *mgr, int phy_id)
+{
+    if (mgr == NULL || phy_id < 0) {
+        return ENPU_INVALID_PARAM;
+    }
+
+    pthread_mutex_lock(&mgr->lock);
+
+    shm_state_t *state = shm_manager_get_state(mgr, phy_id);
+    if (state == NULL) {
+        pthread_mutex_unlock(&mgr->lock);
+        return ENPU_NOT_FOUND;
+    }
+
+    if (atomic_load(&state->swap_cmd.completed) || atomic_load(&state->swap_cmd.action) != SWAP_ACTION_OUT) {
+        pthread_mutex_unlock(&mgr->lock);
+        return ENPU_SUCCESS;
+    }
+
+    uint64_t seq = atomic_load(&state->swap_cmd.cmd_seq);
+    int vnpu_id = state->swap_cmd.target_vnpu_id;
+    if (seq == 0 || vnpu_id < 0 || vnpu_id >= MAX_VNPU_PER_DIE) {
+        pthread_mutex_unlock(&mgr->lock);
+        return ENPU_SUCCESS;
+    }
+
+    if (swap_cmd_has_pending_ack_locked(state, vnpu_id, seq)) {
+        pthread_mutex_unlock(&mgr->lock);
+        return ENPU_SUCCESS;
+    }
+
+    /* 已无任何槽位欠本 epoch 的 ack, 但仍未完成: 兜底置完成, 避免 die 级换出线程永久停摆 */
+    LOG_WARN("[POD-WATCHDOG] swap_cmd completed by marker scan: phy_id=%d vnpu_id=%d seq=%lu refcount=%d", phy_id,
+             vnpu_id, (unsigned long)seq, atomic_load(&state->swap_cmd.refcount));
+    swap_cmd_mark_completed_locked(state);
+
+    pthread_mutex_unlock(&mgr->lock);
+    return ENPU_SUCCESS;
+}
+
+int shm_manager_get_vnpu_all_swapped(shm_manager_t *mgr, int phy_id, int vnpu_id, bool *swapped)
 {
     if (mgr == NULL || phy_id < 0 || vnpu_id < 0) {
         return ENPU_INVALID_PARAM;
@@ -688,10 +854,33 @@ int shm_manager_get_vnpu_swapped(shm_manager_t *mgr, int phy_id, int vnpu_id, bo
         return ENPU_NOT_FOUND;
     }
 
-    *swapped = entry->swapped;
+    int active_count = 0;
+    int swapped_count = 0;
+    for (int slot = 0; slot < MAX_PROCESSES_PER_VNPU; slot++) {
+        process_entry_t *pe = &entry->processes[slot];
+        if (!atomic_load(&pe->active)) {
+            continue;
+        }
+        active_count++;
+        if (atomic_load(&pe->swapped)) {
+            swapped_count++;
+        }
+    }
+
+    /* 仅当存在活跃进程且全部已换出时才为 true; 空 vNPU 没有换出数据, 判 false */
+    *swapped = (active_count > 0) && (swapped_count == active_count);
+
+    /* 排查用: 区分"空 vNPU(无活跃进程)"与"真的全部换出" */
+    LOG_DEBUG("[SHM] all_swapped check: phy_id=%d vnpu_id=%d active=%d swapped=%d all_swapped=%d%s", phy_id, vnpu_id,
+              active_count, swapped_count, *swapped, active_count == 0 ? " (no active process)" : "");
 
     pthread_mutex_unlock(&mgr->lock);
     return ENPU_SUCCESS;
+}
+
+int shm_manager_get_vnpu_swapped(shm_manager_t *mgr, int phy_id, int vnpu_id, bool *swapped)
+{
+    return shm_manager_get_vnpu_all_swapped(mgr, phy_id, vnpu_id, swapped);
 }
 
 int shm_manager_set_swap_enabled(shm_manager_t *mgr, int phy_id, int vnpu_id, bool enabled)
@@ -812,6 +1001,26 @@ shm_state_t *shm_state_posix_shm_create(int phy_id, const char *die_id)
 
     atomic_store(&state->initialized, false);
     (void)memset_s(state->reserved, sizeof(state->reserved), 0, sizeof(state->reserved));
+
+    /* 新增: 初始化 vcann_rt_id 计数器 (ID 从 1 开始, 0 表示未分配) */
+    atomic_store(&state->next_vcann_rt_id, 1);
+
+    /* 新增: 初始化每个 vNPU 的进程注册表 */
+    for (int v = 0; v < MAX_VNPU_PER_DIE; v++) {
+        for (int p = 0; p < MAX_PROCESSES_PER_VNPU; p++) {
+            atomic_store(&state->entries[v].processes[p].active, false);
+            atomic_store(&state->entries[v].processes[p].swapped, false);
+            atomic_store(&state->entries[v].processes[p].hbm_used, 0);
+            atomic_store(&state->entries[v].processes[p].last_heartbeat_ns, 0);
+            state->entries[v].processes[p].swap_offset = 0;
+            state->entries[v].processes[p].swap_size = 0;
+            atomic_store(&state->entries[v].processes[p].ack_pending_seq, 0);
+        }
+    }
+
+    /* 新增: 初始化 swap_cmd.refcount / cmd_seq */
+    atomic_store(&state->swap_cmd.refcount, 0);
+    atomic_store(&state->swap_cmd.cmd_seq, 0);
 
     return state;
 }
@@ -1376,19 +1585,53 @@ int shm_swap_buffer_get_status(swap_buffer_status_t *status)
     return ENPU_SUCCESS;
 }
 
-int shm_alloc(shm_state_t *state, int vnpu_id, uint64_t size)
+int shm_alloc_per_process(shm_state_t *state, int vnpu_id, int slot, uint64_t size)
 {
-    if (!state || vnpu_id < 0 || vnpu_id >= MAX_VNPU_PER_DIE)
+    if (!state || vnpu_id < 0 || vnpu_id >= MAX_VNPU_PER_DIE || slot < 0 || slot >= MAX_PROCESSES_PER_VNPU)
         return -1;
+
+    process_entry_t *pe = &state->entries[vnpu_id].processes[slot];
+    if (!atomic_load(&pe->active)) {
+        return -1;
+    }
 
     uint64_t off = shm_swap_buffer_alloc_offset(state, size);
     if (off == (uint64_t)-1)
         return -1;
 
-    state->entries[vnpu_id].swap_offset = off;
-    state->entries[vnpu_id].swap_size = size;
+    pe->swap_offset = off;
+    pe->swap_size = size;
     shm_print_free_block_info();
     return 0;
+}
+
+int shm_free_per_process(shm_state_t *state, int vnpu_id, int slot)
+{
+    if (!state || vnpu_id < 0 || vnpu_id >= MAX_VNPU_PER_DIE || slot < 0 || slot >= MAX_PROCESSES_PER_VNPU)
+        return -1;
+
+    process_entry_t *pe = &state->entries[vnpu_id].processes[slot];
+    if (pe->swap_size == 0) {
+        return 0;
+    }
+
+    shm_swap_buffer_free_offset(state, pe->swap_offset, pe->swap_size);
+    pe->swap_offset = 0;
+    pe->swap_size = 0;
+    shm_print_free_block_info();
+    return 0;
+}
+
+int shm_alloc(shm_state_t *state, int vnpu_id, uint64_t size)
+{
+    (void)size;
+    if (!state || vnpu_id < 0 || vnpu_id >= MAX_VNPU_PER_DIE)
+        return -1;
+
+    /* 进程粒度: 为每个活跃未换出的进程分配其 hbm_used 大小的 swap buffer.
+     * 由调用方 (swap_resolver_write_swap_command) 逐进程分配. */
+    LOG_WARN("shm_alloc: vNpU 级分配已废弃, 请改用 shm_alloc_per_process (vnpu=%d)", vnpu_id);
+    return -1;
 }
 
 int shm_free(shm_state_t *state, int vnpu_id)
@@ -1396,12 +1639,11 @@ int shm_free(shm_state_t *state, int vnpu_id)
     if (!state || vnpu_id < 0 || vnpu_id >= MAX_VNPU_PER_DIE)
         return -1;
 
+    /* 进程粒度: 释放该 vNPU 下所有进程的 swap buffer */
     vnpu_shm_entry_t *entry = &state->entries[vnpu_id];
-
-    shm_swap_buffer_free_offset(state, entry->swap_offset, entry->swap_size);
-    entry->swap_offset = 0;
-    entry->swap_size = 0;
-    shm_print_free_block_info();
+    for (int slot = 0; slot < MAX_PROCESSES_PER_VNPU; slot++) {
+        (void)shm_free_per_process(state, vnpu_id, slot);
+    }
     return 0;
 }
 

@@ -436,7 +436,19 @@ void *vnpu_scheduler_flush_thread(void *arg)
     (void)arg;
     while (!g_terminate) {
         uint64_t now = ns_now();
+        /* ① vNPU 级心跳：核调度用. 多进程 atomic_store 同一字段安全（单操作原子） */
         atomic_store(&g_vnpu_sched_context->last_alive_time_ns[g_vnpu_id], now);
+
+        /* ② 进程级心跳：进程存活检测用. 复用同一线程, 各进程只刷新自己的槽位.
+         * 未注册槽位的进程不访问共享内存, 避免无谓的周期性 get_shm_state 调用 */
+        int slot = get_registry_slot();
+        if (slot >= 0) {
+            shm_state_t *state = get_shm_state();
+            if (state != NULL) {
+                atomic_store(&state->entries[g_vnpu_id].processes[slot].last_heartbeat_ns, now);
+            }
+        }
+
         ns_sleep(VNPU_FLUSH_PERIOD);
     }
     return NULL;

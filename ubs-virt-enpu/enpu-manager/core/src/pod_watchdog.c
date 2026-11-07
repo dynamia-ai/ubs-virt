@@ -92,12 +92,97 @@ static void reset_runtime_state(shm_state_t *state, vnpu_time_slice_sched_t *sch
 {
     vnpu_shm_entry_t *entry = &state->entries[vnpu_id];
     atomic_store(&entry->hbm_used, 0);
-    entry->swapped = false;
-    entry->swap_offset = 0;
-    entry->swap_size = 0;
+
+    /* 进程粒度: 清理该 vNPU 的进程注册表, 避免死进程槽位/计数持续污染水位 */
+    for (int slot = 0; slot < MAX_PROCESSES_PER_VNPU; slot++) {
+        process_entry_t *pe = &entry->processes[slot];
+        atomic_store(&pe->swapped, false);
+        atomic_store(&pe->active, false);
+        atomic_store(&pe->hbm_used, 0);
+        atomic_store(&pe->last_heartbeat_ns, 0);
+        pe->swap_offset = 0;
+        pe->swap_size = 0;
+        atomic_store(&pe->ack_pending_seq, 0);
+    }
 
     if (sched != NULL) {
         atomic_store(&sched->last_alive_time_ns[vnpu_id], 0);
+    }
+}
+
+/* 进程级存活检测: 心跳超时 (PROCESS_ALIVE_TIMEOUT_NS) 的僵死进程, 回收其
+ * hbm_used 余额与 swap buffer, 并释放槽位. 与正常注销 (unregister_from_shm_state)
+ * 幂等兼容, 两者对 active/hbm_used 的操作均为 atomic_store/atomic_fetch_sub.
+ * 回收前先代死进程 ack 换出命令: 槽位一旦被清空就再也无法判断它是否欠一次 ack. */
+static void reap_dead_processes(shm_manager_t *shm_mgr, shm_state_t *state, int phy_id, uint64_t now_ns,
+                                uint64_t timeout_ns)
+{
+    if (state == NULL) {
+        return;
+    }
+
+    for (int v = 0; v < MAX_VNPU_PER_DIE; v++) {
+        vnpu_shm_entry_t *vnpu_entry = &state->entries[v];
+        for (int i = 0; i < MAX_PROCESSES_PER_VNPU; i++) {
+            process_entry_t *pe = &vnpu_entry->processes[i];
+            if (!atomic_load(&pe->active)) {
+                /* 已注销进程遗留的 swap buffer: 槽位已无主且不会再换入, 由 manager 侧回收
+                 * (TLSF 池由 manager 独占, vcann-rt 无法释放), 避免进程反复启停耗尽换出池 */
+                if (atomic_load(&pe->ack_pending_seq) != 0) {
+                    (void)shm_manager_proxy_ack_process(shm_mgr, phy_id, v, i);
+                }
+                if (pe->swap_size > 0) {
+                    LOG_WARN("[POD-WATCHDOG] reclaim orphan swap buffer vnpu_id=%d slot=%d size=%llu", v, i,
+                             (unsigned long long)pe->swap_size);
+                    (void)shm_free_per_process(state, v, i);
+                }
+                continue;
+            }
+
+            uint64_t hb = atomic_load(&pe->last_heartbeat_ns);
+            if (hb == 0) {
+                continue; /* 已注册但尚未开始刷新, 不误判 */
+            }
+
+            /* 时钟重置保护: 系统重启后 CLOCK_MONOTONIC 归零, 与 vnpu 级保护 (line 144) 一致 */
+            if (hb > now_ns) {
+                LOG_WARN("[POD-WATCHDOG] vnpu_id=%d slot=%d hb > now "
+                         "(clock reset after reboot?), recalibrating to 0",
+                         v, i);
+                atomic_store(&pe->last_heartbeat_ns, 0);
+                continue;
+            }
+
+            if (now_ns - hb <= timeout_ns) {
+                continue; /* 仍活 */
+            }
+
+            LOG_WARN("[POD-WATCHDOG] reap dead process vcann_rt_id=%d vnpu_id=%d slot=%d (hb_age=%llums)",
+                     pe->vcann_rt_id, v, i, (unsigned long long)((now_ns - hb) / 1000000ULL));
+
+            /* 0. 代死进程 ack 换出命令: 必须在清理 swapped/active 之前, 否则槽位被复用后
+             * 就再也没有依据判断它是否欠过一次 ack (幂等, 仅 marker==cmd_seq 时生效) */
+            if (atomic_load(&pe->ack_pending_seq) != 0) {
+                (void)shm_manager_proxy_ack_process(shm_mgr, phy_id, v, i);
+            }
+
+            /* 1. 释放 hbm_used 余额, 扣减 vnpu 级计数 */
+            uint64_t leaked = atomic_load(&pe->hbm_used);
+            if (leaked > 0) {
+                atomic_fetch_sub(&vnpu_entry->hbm_used, leaked);
+                atomic_store(&pe->hbm_used, 0);
+            }
+
+            /* 2. 释放 swap buffer: swap_size != 0 表示 manager 已分配 buffer(可能尚未完成换出),
+             * 只要求 swapped 会在"已分配未换出"时漏回收, 导致 TLSF 块永久泄漏 */
+            if (pe->swap_size > 0) {
+                (void)shm_free_per_process(state, v, i);
+            }
+
+            /* 3. 清理标志并释放槽位, 允许新进程复用 */
+            atomic_store(&pe->swapped, false);
+            atomic_store(&pe->active, false);
+        }
     }
 }
 
@@ -154,8 +239,8 @@ int pod_watchdog_poll_and_cleanup(pod_watchdog_t *wd)
             }
 
             /* 清理超时的 vNPU 的 swap 资源和运行时资源 */
-            vnpu_shm_entry_t *entry = &state->entries[vnpu_id];
-            bool was_swapped = entry->swapped;
+            bool was_swapped = false;
+            (void)shm_manager_get_vnpu_all_swapped(wd->shm_mgr, phy_id, vnpu_id, &was_swapped);
 
             LOG_WARN("[POD-WATCHDOG] phy_id=%d vnpu_id=%d timeout (last_alive %.3fs ago > %.3fs); "
                      "cleaning runtime state (was_swapped=%d)",
@@ -170,8 +255,23 @@ int pod_watchdog_poll_and_cleanup(pod_watchdog_t *wd)
                 }
             }
 
+            /* 整个 vNPU 已失联: 先为所有仍欠 ack 的槽位代 ack, 再清空运行时状态,
+             * 否则 ack 依据会随槽位一起被清零 */
+            for (int slot = 0; slot < MAX_PROCESSES_PER_VNPU; slot++) {
+                if (atomic_load(&state->entries[vnpu_id].processes[slot].ack_pending_seq) != 0) {
+                    (void)shm_manager_proxy_ack_process(wd->shm_mgr, phy_id, vnpu_id, slot);
+                }
+            }
+
             reset_runtime_state(state, sched, vnpu_id);
         }
+
+        /* 进程级存活检测: 周期回收心跳超时的僵死进程 (独立于 swap_cmd, 见方案 §4.4.3) */
+        reap_dead_processes(wd->shm_mgr, state, phy_id, now_ns, PROCESS_ALIVE_TIMEOUT_NS);
+
+        /* 兜底完成判定: 覆盖"进程在 ack 成功后消失、槽位被复用"等逐进程代 ack 无法收敛的残留;
+         * 无待办 marker 说明所有参与者都已 ack, 命令必须收尾, 否则 die 级换出线程永久停摆 */
+        (void)shm_manager_try_complete_swap_cmd(wd->shm_mgr, phy_id);
     }
 
     return ENPU_SUCCESS;

@@ -178,3 +178,30 @@ TEST_F(NpuManagerTest, EnpuGlobalInitSuccess)
     enpu_global_init(); // should not call again
     // No crash or error expected
 }
+
+/* cmd_seq 去重依赖的进程级序号存取接口 */
+TEST_F(NpuManagerTest, CmdSeqAccessorRoundTrip)
+{
+    uint64_t saved = get_last_seen_cmd_seq();
+    set_last_seen_cmd_seq(12345);
+    EXPECT_EQ(get_last_seen_cmd_seq(), (uint64_t)12345);
+    set_last_seen_cmd_seq(saved);
+}
+
+/* 注册后写回本进程槽位; 注销后槽位复位为 -1 */
+TEST_F(NpuManagerTest, RegisterToShmStateAssignsRegistrySlot)
+{
+    shm_state_t state = {0};
+    state.next_vcann_rt_id.store(1);
+
+    ASSERT_EQ(register_to_shm_state(&state, 0), ENPU_SUCCESS);
+    int slot = get_registry_slot();
+    EXPECT_GE(slot, 0);
+    EXPECT_LT(slot, MAX_PROCESSES_PER_VNPU);
+    EXPECT_TRUE(state.entries[0].processes[slot].active.load());
+    EXPECT_GE(state.entries[0].processes[slot].vcann_rt_id, 1);
+
+    unregister_from_shm_state(&state, 0, slot);
+    EXPECT_EQ(get_registry_slot(), -1);
+    EXPECT_FALSE(state.entries[0].processes[slot].active.load());
+}

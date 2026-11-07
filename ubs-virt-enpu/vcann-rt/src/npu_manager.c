@@ -12,6 +12,8 @@
 
 #include "npu_manager.h"
 #include <runtime/rt.h>
+#include <stdlib.h>
+#include <unistd.h>
 #include "acl/acl.h"
 #include "common.h"
 #include "config.h"
@@ -28,7 +30,9 @@
 
 pthread_once_t once_init = PTHREAD_ONCE_INIT;
 pthread_once_t post_init_flag = PTHREAD_ONCE_INIT;
-static struct npu_info g_npu_info = {0};
+/* registry_slot/vcann_rt_id 以 -1 表示"未注册": 若默认值为 0, 注册失败(降级)的进程
+ * 会把自身显存计入 slot 0 并误用别人的 swap buffer, 因此这里显式初始化为 -1 */
+static struct npu_info g_npu_info = {.registry_slot = -1, .vcann_rt_id = -1};
 
 #define SOC_VERSION_SIZE 50
 
@@ -238,6 +242,94 @@ shm_state_t *get_shm_state(void)
     return g_shm_state;
 }
 
+int32_t get_registry_slot(void)
+{
+    return g_npu_info.registry_slot;
+}
+
+uint64_t get_last_seen_cmd_seq(void)
+{
+    return g_npu_info.last_seen_cmd_seq;
+}
+
+void set_last_seen_cmd_seq(uint64_t seq)
+{
+    g_npu_info.last_seen_cmd_seq = seq;
+}
+
+int register_to_shm_state(shm_state_t *state, int vnpu_id)
+{
+    if (state == NULL || vnpu_id < 0 || vnpu_id >= MAX_VNPU_PER_DIE) {
+        LOG_ERROR("register_to_shm_state: invalid params");
+        return ENPU_FAIL;
+    }
+
+    int32_t vcann_rt_id = atomic_fetch_add(&state->next_vcann_rt_id, 1);
+    if (vcann_rt_id <= 0) {
+        vcann_rt_id = 1;
+        atomic_store(&state->next_vcann_rt_id, 2);
+    }
+
+    vnpu_shm_entry_t *vnpu_entry = &state->entries[vnpu_id];
+
+    int slot = -1;
+    for (int i = 0; i < MAX_PROCESSES_PER_VNPU; i++) {
+        bool expected = false;
+        if (atomic_compare_exchange_strong(&vnpu_entry->processes[i].active, &expected, true)) {
+            slot = i;
+            break;
+        }
+    }
+
+    if (slot < 0) {
+        LOG_ERROR("register_to_shm_state: no free slot for vnpu_id=%d", vnpu_id);
+        return ENPU_FAIL;
+    }
+
+    process_entry_t *entry = &vnpu_entry->processes[slot];
+    entry->vcann_rt_id = vcann_rt_id;
+    entry->pid = (int32_t)getpid();
+    atomic_store(&entry->swapped, false);
+    atomic_store(&entry->last_heartbeat_ns, ns_now());
+    atomic_store(&entry->hbm_used, 0);
+    entry->swap_offset = 0;
+    entry->swap_size = 0;
+    atomic_store(&entry->ack_pending_seq, 0); /* 新注册进程不参与注册前已下发的换出命令 */
+
+    g_npu_info.vcann_rt_id = vcann_rt_id;
+    g_npu_info.registry_slot = slot;
+    g_npu_info.last_seen_cmd_seq = atomic_load(&state->swap_cmd.cmd_seq);
+
+    LOG_INFO("register_to_shm_state: vcann_rt_id=%d, pid=%d, vnpu_id=%d, slot=%d", vcann_rt_id, entry->pid, vnpu_id,
+             slot);
+    return ENPU_SUCCESS;
+}
+
+void unregister_from_shm_state(shm_state_t *state, int vnpu_id, int slot)
+{
+    if (state == NULL || vnpu_id < 0 || vnpu_id >= MAX_VNPU_PER_DIE || slot < 0 || slot >= MAX_PROCESSES_PER_VNPU) {
+        return;
+    }
+
+    process_entry_t *entry = &state->entries[vnpu_id].processes[slot];
+
+    /* 主动释放本进程剩余的 hbm_used，避免水位计算短暂偏高（不依赖 watchdog 兜底） */
+    uint64_t remaining = atomic_load(&entry->hbm_used);
+    if (remaining > 0) {
+        atomic_fetch_sub(&state->entries[vnpu_id].hbm_used, remaining);
+        atomic_store(&entry->hbm_used, 0);
+    }
+
+    atomic_store(&entry->swapped, false);
+    atomic_store(&entry->active, false);
+
+    LOG_INFO("unregister_from_shm_state: vcann_rt_id=%d, vnpu_id=%d, slot=%d, released_hbm=%llu", entry->vcann_rt_id,
+             vnpu_id, slot, (unsigned long long)remaining);
+
+    g_npu_info.registry_slot = -1;
+    g_npu_info.vcann_rt_id = -1;
+}
+
 static void __enpu_global_init(void)
 {
     int rc = enpu_load_config();
@@ -251,11 +343,24 @@ static void __enpu_global_init(void)
 
     shm_state_t *state = get_shm_state();
     if (state != NULL) {
+        rc = register_to_shm_state(state, g_npu_info.vnpu_id);
+        if (rc != ENPU_SUCCESS) {
+            /* 注册失败（如槽位耗尽）不阻断原有软切分流程，仅降级为本进程不参与换入换出 */
+            LOG_WARN("Failed to register to shm_state (ret=%d), swap disabled for this process.", rc);
+        }
+
         rc = swap_hook_global_init(g_npu_info.vnpu_id);
         if (rc != ENPU_SUCCESS) {
             /* swap 是附加能力: 初始化失败(如 swap buffer 尚未就绪)不阻断原有软切分流程,
              * 仅告警并降级为本进程不参与换入换出 */
             LOG_WARN("Failed to initialize swap hook (ret=%d), swap disabled for this session.", rc);
+
+            /* 初始化失败的进程不会创建 monitor 线程, 留在注册表中会永久占用
+             * swap_cmd.refcount 的递减份额, 导致换出完成判定卡死; 这里注销该进程 */
+            int slot = get_registry_slot();
+            if (slot >= 0) {
+                unregister_from_shm_state(state, g_npu_info.vnpu_id, slot);
+            }
         }
     }
 
@@ -376,8 +481,14 @@ int check_and_swap_out(size_t requested, uint8_t flag)
             completed = atomic_load(&state->swap_out_cmd.completed);
         } while (!completed);
 
-        atomic_store(&state->swap_out_cmd.action, flag);
-        atomic_store(&state->swap_out_cmd.completed, false);
+        /* 多进程并置请求：取"并集"。已有更高优先级请求则不覆盖（仅设置请求标志，
+         * 由 enpu-manager 写 swap_cmd 触发所有相关进程各自换出） */
+        int existing = atomic_load(&state->swap_out_cmd.action);
+        if (existing == SWAP_OUT_NONE || (flag == SWAP_OUT_FROM_ALL && existing == SWAP_OUT_FROM_BORROWED)) {
+            atomic_store(&state->swap_out_cmd.target_vnpu_id, get_vnpu_id());
+            atomic_store(&state->swap_out_cmd.action, flag);
+            atomic_store(&state->swap_out_cmd.completed, false);
+        }
 
         do {
             completed = atomic_load(&state->swap_out_cmd.completed);

@@ -477,9 +477,8 @@ static int shm_apply_vnpu_locked(npu_allocator_t *a, int32_t phy_id, const char 
      *    K8s 路径处理 mindcluster 重写 npu_info.config 的场景 */
     shm_state_t *state = shm_manager_get_state(a->shm_mgr, phy_id);
     if (state != NULL && vnpu_bitmap_test(state->vnpu_bitmap, entry->vnpu_id)) {
-        if (state->entries[entry->vnpu_id].swapped) {
-            shm_free(state, entry->vnpu_id);
-        }
+        /* 进程粒度: swap 偏移/大小位于各 processes[slot] 上, shm_free 遍历释放所有进程的 buffer */
+        shm_free(state, entry->vnpu_id);
         shm_manager_remove_entry(a->shm_mgr, phy_id, entry->vnpu_id);
         LOG("shm_apply: update existing vnpu phy=%d vnpu=%d", phy_id, entry->vnpu_id);
     }
@@ -535,10 +534,8 @@ static int shm_release_vnpu_locked(npu_allocator_t *a, int32_t phy_id, int32_t v
         return ENPU_SUCCESS;
     }
 
-    /* 若 swapped, 先释放 swap buffer */
-    if (state->entries[vnpu_id].swapped) {
-        shm_free(state, vnpu_id);
-    }
+    /* 进程粒度: swap 偏移/大小位于各 processes[slot] 上, shm_free 遍历释放所有进程的 buffer */
+    shm_free(state, vnpu_id);
 
     /* 清 entry（bitmap + vnpu_id=-1） */
     int ret = shm_manager_remove_entry(a->shm_mgr, phy_id, vnpu_id);
@@ -1302,8 +1299,21 @@ int npu_allocator_foreach_swapped_vnpu(npu_allocator_t *a, swapped_vnpu_callback
 
             if ((bitmap >> bit) & 1) {
                 vnpu_shm_entry_t *entry = &state->entries[vnpu_id];
-                if (entry->swapped) {
-                    callback(phy_id, entry->vnpu_id, entry->swap_size, user_data);
+
+                /* 进程粒度: 该 vNPU 的所有活跃进程均已换出才视为"已换出",
+                 * swap_size 为该 vNPU 各进程 swap_size 之和 */
+                bool all_swapped = true;
+                uint64_t total_swap_size = 0;
+                for (int slot = 0; slot < MAX_PROCESSES_PER_VNPU; slot++) {
+                    process_entry_t *pe = &entry->processes[slot];
+                    if (atomic_load(&pe->active) && !atomic_load(&pe->swapped)) {
+                        all_swapped = false;
+                        break;
+                    }
+                    total_swap_size += pe->swap_size;
+                }
+                if (all_swapped && total_swap_size > 0) {
+                    callback(phy_id, entry->vnpu_id, total_swap_size, user_data);
                 }
             }
         }

@@ -84,6 +84,9 @@ typedef struct npu_info {
     bool initialization;
     uint8_t soc_version;
     uint32_t aicore_num;
+    int32_t vcann_rt_id;        /* 本进程在 vcann-rt 注册表中的唯一 ID */
+    int32_t registry_slot;      /* 本进程在 entries[vnpu_id].processes[] 中的槽位 (-1=未注册) */
+    uint64_t last_seen_cmd_seq; /* 本进程最近处理过的 swap_cmd.cmd_seq（防重复处理/递减） */
 } npu_info;
 
 extern void enpu_global_init(void);
@@ -101,6 +104,9 @@ extern int get_mem_used(size_t *used);
 extern int get_device_id(void);
 extern uint8_t get_vnpu_id(void);
 extern uint8_t get_vnpu_priority(void);
+extern int32_t get_registry_slot(void);
+extern uint64_t get_last_seen_cmd_seq(void);
+extern void set_last_seen_cmd_seq(uint64_t seq);
 extern int get_card_id(void);
 extern schedule_policy_t get_sched_policy(void);
 extern bool check_init_success(void);

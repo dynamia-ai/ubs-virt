@@ -205,8 +205,8 @@ shm_state_t *create_state_shm(const char *dieId, int phyId, bool versionOk)
     state->entries[kVnpuId].vnpu_id = kVnpuId;
     state->entries[kVnpuId].hbm_request = kTestRequestMb;
     state->entries[kVnpuId].hbm_limit = kTestLimitMb;
-    state->entries[kVnpuId].swap_offset = 0;
-    state->entries[kVnpuId].swap_size = 0; /* 为 0 时 check_and_swap_out 立即成功, 避免自旋 */
+    /* 单容器多进程: 进程槽位由 memset 清零(active=false), ID 计数器从 1 开始 */
+    state->next_vcann_rt_id.store(1);
     pthread_mutex_init(&state->swap_in_mutex, nullptr);
     state->initialized = true;
     return state;
@@ -241,6 +241,16 @@ protected:
         create_swap_buffer_shm();
         state_shm_ = create_state_shm(kDieId, kPhyId, true);
         ASSERT_NE(state_shm_, nullptr);
+        /* 固定本进程的 vNPU/shm_id, 使 get_vnpu_id() 与本套件构造的 state 一致 */
+        config.phy_npu_id = kPhyId;
+        config.vnpu_id = kVnpuId;
+        config.scheduling_policy = SCHED_POLICY_FIXED_SHARE;
+        config.aicore_quota = DEFAULT_AICORE_NUM;
+        config.memory_request = 0;
+        config.memory_limit = 0;
+        config.memory_quota = static_cast<int32_t>(kHbmTotalMb);
+        ASSERT_EQ(strcpy_s(config.shm_id, sizeof(config.shm_id), kDieId), 0);
+        ASSERT_EQ(enpu_config_info_init(), ENPU_SUCCESS);
         /* 重置惰性标志后由真实代码完成 attach */
         g_shm_state_init = false;
         set_mem_request_quota(kTestRequestMb * MB_TO_B);
@@ -248,6 +258,9 @@ protected:
         attached_ = get_shm_state();
         ASSERT_NE(attached_, nullptr);
         ASSERT_EQ(attached_->hbm_total, kHbmTotalMb * MB_TO_B);
+        /* 单容器多进程: 显式注册本进程, 取得进程级换出槽位 */
+        ASSERT_EQ(register_to_shm_state(attached_, kVnpuId), ENPU_SUCCESS);
+        ASSERT_GE(get_registry_slot(), 0);
     }
 
     static void TearDownTestCase()
@@ -425,10 +438,6 @@ TEST_F(SwapModuleTest, ShmStateApi)
     EXPECT_EQ(shm_get_hbm_request_free(nullptr), (uint64_t)0);
     EXPECT_EQ(shm_get_hbm_request_free(state), (uint64_t)((kHbmTotalMb - kTestRequestMb) * MB_TO_B));
 
-    EXPECT_EQ(shm_get_swap_size(nullptr, kVnpuId), (uint64_t)0);
-    EXPECT_EQ(shm_get_swap_size(state, MAX_VNPU_PER_DIE), (uint64_t)0);
-    EXPECT_EQ(shm_get_swap_size(state, kVnpuId), (uint64_t)0);
-
     int32_t cmdVnpu = -1;
     int32_t action = -1;
     EXPECT_EQ(shm_check_swap_cmd(nullptr, &cmdVnpu, &action), -1);
@@ -448,15 +457,23 @@ TEST_F(SwapModuleTest, ShmStateApi)
     EXPECT_TRUE(state->swap_cmd.completed);
     EXPECT_TRUE(state->swap_out_cmd.completed);
 
-    shm_set_swapped(nullptr, kVnpuId, true);
-    shm_set_swapped(state, MAX_VNPU_PER_DIE, true);
-    EXPECT_FALSE(shm_get_swapped(state, kVnpuId));
-    shm_set_swapped(state, kVnpuId, true);
-    EXPECT_TRUE(shm_get_swapped(state, kVnpuId));
-    shm_set_swapped(state, kVnpuId, false);
-    EXPECT_FALSE(shm_get_swapped(state, kVnpuId));
-    EXPECT_FALSE(shm_get_swapped(nullptr, kVnpuId));
-    EXPECT_FALSE(shm_get_swapped(state, MAX_VNPU_PER_DIE));
+    /* 进程级 swapped: 越界参数静默忽略, 合法槽位按进程独立维护 */
+    int slot = get_registry_slot();
+    ASSERT_GE(slot, 0);
+    shm_set_process_swapped(nullptr, kVnpuId, slot, true);
+    shm_set_process_swapped(state, MAX_VNPU_PER_DIE, slot, true);
+    shm_set_process_swapped(state, kVnpuId, MAX_PROCESSES_PER_VNPU, true);
+    EXPECT_FALSE(shm_get_process_swapped(state, kVnpuId, slot));
+    EXPECT_FALSE(shm_get_vnpu_all_swapped(state, kVnpuId));
+    shm_set_process_swapped(state, kVnpuId, slot, true);
+    EXPECT_TRUE(shm_get_process_swapped(state, kVnpuId, slot));
+    EXPECT_TRUE(shm_get_vnpu_all_swapped(state, kVnpuId));
+    shm_set_process_swapped(state, kVnpuId, slot, false);
+    EXPECT_FALSE(shm_get_process_swapped(state, kVnpuId, slot));
+    EXPECT_FALSE(shm_get_process_swapped(nullptr, kVnpuId, slot));
+    EXPECT_FALSE(shm_get_process_swapped(state, MAX_VNPU_PER_DIE, slot));
+    /* 非法参数走 fail-closed: 返回 false, 避免调用方误认为该 vNPU 已整体换出 */
+    EXPECT_FALSE(shm_get_vnpu_all_swapped(nullptr, kVnpuId));
 
     /* npu_manager 包装接口: 已挂载状态下走 shm 更新 */
     EXPECT_EQ(update_shm_hbm_request(0), ENPU_SUCCESS);
@@ -544,6 +561,9 @@ TEST_F(SwapModuleTest, SwapHookGlobalInitSuccess)
     /* 已初始化时重复调用失败 */
     EXPECT_EQ(swap_hook_global_init(kVnpuId), ENPU_FAIL);
     EXPECT_NE(swap_hook_get_global(), nullptr);
+    /* 上面的 destroy 已注销本进程, 重新注册以恢复进程级换出槽位供后续用例使用 */
+    ASSERT_EQ(register_to_shm_state(get_shm_state(), kVnpuId), ENPU_SUCCESS);
+    ASSERT_GE(get_registry_slot(), 0);
 }
 
 TEST_F(SwapModuleTest, SwapHookMallocAndMapMem)
@@ -586,6 +606,34 @@ TEST_F(SwapModuleTest, SwapHookMallocAndMapMem)
     EXPECT_EQ(swap_hook_free_physical_mem(hook, (rtDrvMemHandle)(intptr_t)0x8888), RT_ERROR_NONE);
 }
 
+/* 进程级 hbm 记账: malloc/free 前后 processes[slot].hbm_used 与 vNPU 级 hbm_used 同步增减 */
+TEST_F(SwapModuleTest, SwapHookProcessHbmAccounting)
+{
+    swap_hook_t *hook = swap_hook_get_global();
+    ASSERT_NE(hook, nullptr);
+    shm_state_t *state = get_shm_state();
+    ASSERT_NE(state, nullptr);
+    int slot = get_registry_slot();
+    ASSERT_GE(slot, 0);
+    process_entry_t *myEntry = &state->entries[kVnpuId].processes[slot];
+
+    uint64_t procBefore = myEntry->hbm_used.load();
+    uint64_t vnpuBefore = state->entries[kVnpuId].hbm_used.load();
+
+    /* 用未占用的 handle 走物理内存记账路径, 避免与先前用例的指针记录冲突 */
+    rtDrvMemHandle handle = (rtDrvMemHandle)(intptr_t)0x4400;
+    rtDrvMemProp_t prop;
+    (void)memset_s(&prop, sizeof(prop), 0, sizeof(prop));
+    prop.side = ACL_MEM_LOCATION_TYPE_DEVICE;
+    ASSERT_EQ(swap_hook_malloc_physical_mem(hook, handle, 8192, &prop, 0), ENPU_SUCCESS);
+    EXPECT_EQ(myEntry->hbm_used.load(), procBefore + 8192);
+    EXPECT_EQ(state->entries[kVnpuId].hbm_used.load(), vnpuBefore + 8192);
+
+    ASSERT_EQ(swap_hook_free_physical_mem(hook, handle), ENPU_SUCCESS);
+    EXPECT_EQ(myEntry->hbm_used.load(), procBefore);
+    EXPECT_EQ(state->entries[kVnpuId].hbm_used.load(), vnpuBefore);
+}
+
 TEST_F(SwapModuleTest, SwapHookDeepSwapIn)
 {
     swap_hook_t *hook = swap_hook_get_global();
@@ -610,15 +658,22 @@ TEST_F(SwapModuleTest, SwapHookDeepSwapIn)
     ASSERT_EQ(memory_tracker_add_map_record(hook->tracker, (void *)(intptr_t)0x8100, 1024, 0, handleB, 0),
               ENPU_SUCCESS);
 
-    /* 标记本 vnpu 已换出, 触发换入全流程 */
-    shm_set_swapped(state, kVnpuId, true);
-    uint64_t usedBefore = state->entries[kVnpuId].hbm_used;
+    /* 单容器多进程: 标记本进程槽位已换出, 触发换入全流程.
+     * swap_size 置 0 以避免 check_and_swap_out 在无 enpu-manager 的单测环境等待应答自旋 */
+    int slot = get_registry_slot();
+    ASSERT_GE(slot, 0);
+    process_entry_t *myEntry = &state->entries[kVnpuId].processes[slot];
+    myEntry->swap_size = 0;
+    shm_set_process_swapped(state, kVnpuId, slot, true);
+    uint64_t usedBefore = state->entries[kVnpuId].hbm_used.load();
     EXPECT_EQ(swap_hook_check_and_swap_in(hook), ENPU_SUCCESS);
-    EXPECT_FALSE(shm_get_swapped(state, kVnpuId));
     EXPECT_FALSE(memory_tracker_find(hook->tracker, ptrA)->is_swapped);
     EXPECT_FALSE(memory_tracker_find(hook->tracker, ptrB)->is_swapped);
-    uint64_t usedAfter = state->entries[kVnpuId].hbm_used;
-    EXPECT_GE(usedAfter, usedBefore + 2048);
+    /* swap_size=0 时不清 swapped 标志(仅 used!=0 才恢复并清除), 保持原值 */
+    EXPECT_TRUE(shm_get_process_swapped(state, kVnpuId, slot));
+    EXPECT_EQ(state->entries[kVnpuId].hbm_used.load(), usedBefore);
+    /* 显式复位, 隔离后续用例 */
+    shm_set_process_swapped(state, kVnpuId, slot, false);
 
     /* 未处于换出态时直接返回 */
     EXPECT_EQ(swap_hook_check_and_swap_in(hook), ENPU_SUCCESS);
@@ -636,19 +691,63 @@ TEST_F(SwapModuleTest, MonitorThreadSwapOut)
     ASSERT_NE(*monitorSlot, nullptr);
     EXPECT_EQ(swap_monitor_thread_start(*monitorSlot), ENPU_SUCCESS);
 
+    int slot = get_registry_slot();
+    ASSERT_GE(slot, 0);
     void *ptrC = (void *)(intptr_t)0x5300;
     ASSERT_EQ(memory_tracker_add(hook->tracker, ptrC, 512, (rtDrvMemHandle)(intptr_t)0x3300, false), ENPU_SUCCESS);
     state->swap_cmd.completed = false;
     state->swap_out_cmd.completed = false;
     state->swap_cmd.target_vnpu_id = kVnpuId;
     state->swap_out_cmd.target_vnpu_id = kVnpuId;
+    /* 单容器多进程: 命令需带序号并确保本进程未见过; refcount=1 使本进程为最后一个 ack 者.
+     * 同时给本槽位落下 ack 欠账标记(真实环境由 enpu-manager 写命令时置位) */
+    set_last_seen_cmd_seq(0);
+    state->swap_cmd.cmd_seq.store(1);
+    state->swap_cmd.refcount.store(1);
+    state->entries[kVnpuId].processes[slot].ack_pending_seq.store(1);
     state->swap_cmd.action = SWAP_ACTION_OUT;
 
     usleep(300000); /* 等待轮询线程消费换出命令 */
     EXPECT_EQ(swap_monitor_thread_stop(*monitorSlot), ENPU_SUCCESS);
     EXPECT_TRUE(state->swap_cmd.completed);
-    EXPECT_TRUE(shm_get_swapped(state, kVnpuId));
+    EXPECT_EQ(state->swap_cmd.refcount.load(), 0);
+    EXPECT_EQ(state->entries[kVnpuId].processes[slot].ack_pending_seq.load(), (uint64_t)0);
+    EXPECT_TRUE(shm_get_process_swapped(state, kVnpuId, slot));
     EXPECT_TRUE(memory_tracker_find(hook->tracker, ptrC)->is_swapped);
+}
+
+/* cmd_seq 去重: 序号与 last_seen 相同时监控线程跳过, 不换出/不递减 refcount/不置 completed */
+TEST_F(SwapModuleTest, MonitorCmdSeqDedup)
+{
+    swap_hook_t *hook = swap_hook_get_global();
+    ASSERT_NE(hook, nullptr);
+    shm_state_t *state = get_shm_state();
+    ASSERT_NE(state, nullptr);
+
+    void *ptrD = (void *)(intptr_t)0x5400;
+    ASSERT_EQ(memory_tracker_add(hook->tracker, ptrD, 256, (rtDrvMemHandle)(intptr_t)0x3400, false), ENPU_SUCCESS);
+
+    swap_monitor_thread_t **monitorSlot = swap_monitor_get_thread();
+    ASSERT_NE(*monitorSlot, nullptr);
+    /* 线程启动时会把本进程 swapped 复位为 false */
+    ASSERT_EQ(swap_monitor_thread_start(*monitorSlot), ENPU_SUCCESS);
+
+    state->swap_cmd.completed = false;
+    state->swap_out_cmd.completed = false;
+    state->swap_cmd.target_vnpu_id = kVnpuId;
+    state->swap_cmd.action = SWAP_ACTION_OUT;
+    state->swap_cmd.cmd_seq.store(get_last_seen_cmd_seq()); /* 重复序号: 应被 guard 跳过 */
+    state->swap_cmd.refcount.store(1);
+
+    usleep(300000);
+    EXPECT_FALSE(state->swap_cmd.completed.load());
+    EXPECT_EQ(state->swap_cmd.refcount.load(), 1);
+    EXPECT_FALSE(memory_tracker_find(hook->tracker, ptrD)->is_swapped);
+
+    /* 复位共享命令, 避免影响后续用例 */
+    state->swap_cmd.action = SWAP_ACTION_NONE;
+    state->swap_cmd.completed = true;
+    EXPECT_EQ(swap_monitor_thread_stop(*monitorSlot), ENPU_SUCCESS);
 }
 
 TEST_F(SwapModuleTest, MemoryInterceptPassthrough)
