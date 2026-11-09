@@ -42,8 +42,8 @@ void rollback_log_destroy(rollback_log_t *log)
 }
 
 int rollback_log_append(rollback_log_t *log, rollback_step_type_t type, int32_t phy_id, int vnpu_id,
-                        int32_t aicore_delta, int64_t hbm_delta, int32_t sched_policy, const char *pod_uid,
-                        const char *container_name, const char *shm_id)
+                        int32_t aicore_delta, int64_t hbm_delta, int32_t sched_policy, const char *allocation_id,
+                        const char *shm_id)
 {
     if (!log) {
         ERR("NULL log");
@@ -63,19 +63,12 @@ int rollback_log_append(rollback_log_t *log, rollback_step_type_t type, int32_t 
     step->hbm_delta = hbm_delta;
     step->sched_policy = sched_policy;
 
-    if (pod_uid) {
-        int ret = strncpy_s(step->pod_uid, sizeof(step->pod_uid), pod_uid, sizeof(step->pod_uid) - 1);
-        CHECK_COND_RETURN_ERROR_CODE(ret != 0, "strncpy_s pod_uid failed.");
+    if (allocation_id) {
+        int ret =
+            strncpy_s(step->allocation_id, sizeof(step->allocation_id), allocation_id, sizeof(step->allocation_id) - 1);
+        CHECK_COND_RETURN_ERROR_CODE(ret != 0, "strncpy_s allocation_id failed.");
     } else {
-        step->pod_uid[0] = '\0';
-    }
-
-    if (container_name) {
-        int ret = strncpy_s(step->container_name, sizeof(step->container_name), container_name,
-                            sizeof(step->container_name) - 1);
-        CHECK_COND_RETURN_ERROR_CODE(ret != 0, "strncpy_s container_name failed.");
-    } else {
-        step->container_name[0] = '\0';
+        step->allocation_id[0] = '\0';
     }
 
     if (shm_id) {
@@ -161,37 +154,35 @@ static int rollback_create_shm(npu_allocator_t *alloc, rollback_step_t *step)
 
 static int rollback_write_config(npu_allocator_t *alloc, rollback_step_t *step)
 {
-    if (strlen(step->pod_uid) == 0 || strlen(step->container_name) == 0) {
-        ERR("Rollback WRITE_CONFIG skipped: empty pod/container, phy=%d vnpu=%d", step->phy_id, step->vnpu_id);
+    if (!allocation_id_is_valid(step->allocation_id)) {
+        ERR("Rollback WRITE_CONFIG skipped: invalid allocation_id, phy=%d vnpu=%d", step->phy_id, step->vnpu_id);
         return ENPU_INVALID_PARAM;
     }
 
-    int ret = config_manager_delete_config(alloc->config_mgr, step->pod_uid, step->container_name);
+    int ret = config_manager_delete_config(alloc->config_mgr, step->allocation_id);
     if (ret != ENPU_SUCCESS) {
-        ERR("Rollback WRITE_CONFIG failed: delete_config pod=%s container=%s ret=%d", step->pod_uid,
-            step->container_name, ret);
+        ERR("Rollback WRITE_CONFIG failed: allocation_id=%s ret=%d", step->allocation_id, ret);
         return ret;
     }
 
-    LOG("Rollback WRITE_CONFIG: delete_config pod=%s container=%s", step->pod_uid, step->container_name);
+    LOG("Rollback WRITE_CONFIG: allocation_id=%s", step->allocation_id);
     return ENPU_SUCCESS;
 }
 
 static int rollback_save_checkpoint(npu_allocator_t *alloc, rollback_step_t *step)
 {
-    if (strlen(step->pod_uid) == 0 || strlen(step->container_name) == 0) {
-        ERR("Rollback SAVE_CHECKPOINT skipped: empty pod/container, phy=%d vnpu=%d", step->phy_id, step->vnpu_id);
+    if (!allocation_id_is_valid(step->allocation_id)) {
+        ERR("Rollback SAVE_CHECKPOINT skipped: invalid allocation_id, phy=%d vnpu=%d", step->phy_id, step->vnpu_id);
         return ENPU_INVALID_PARAM;
     }
 
-    int ret = allocation_registry_release(alloc->registry, step->pod_uid, step->container_name);
+    int ret = allocation_registry_release_by_id(alloc->registry, step->allocation_id);
     if (ret != ENPU_SUCCESS) {
-        ERR("Rollback SAVE_CHECKPOINT failed: release registry pod=%s container=%s ret=%d", step->pod_uid,
-            step->container_name, ret);
+        ERR("Rollback SAVE_CHECKPOINT failed: allocation_id=%s ret=%d", step->allocation_id, ret);
         return ret;
     }
 
-    LOG("Rollback SAVE_CHECKPOINT: release registry pod=%s container=%s", step->pod_uid, step->container_name);
+    LOG("Rollback SAVE_CHECKPOINT: allocation_id=%s", step->allocation_id);
     return ENPU_SUCCESS;
 }
 

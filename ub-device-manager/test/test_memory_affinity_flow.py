@@ -127,7 +127,7 @@ def test_topology_failure_is_reported_without_binding(flow):
     client, alloc, _, topology, *_ = flow
     topology.side_effect = AffinityTopologyUnavailable('UB FE NUMA file unavailable')
     response = client.post('/vm/create', json=payload())
-    assert response.status_code == 503
+    assert response.status_code == 550
     alloc.assert_not_called()
 
 

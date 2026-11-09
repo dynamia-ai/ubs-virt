@@ -25,7 +25,7 @@ typedef struct swap_candidate {
     char shm_id[DIE_ID_LEN];
     int vnpu_id;
     int sched_policy;
-    int swap_priority;
+    int swap_order;
     uint64_t last_kernel_time_ns;
     uint64_t hbm_used;
     bool swap_enabled;

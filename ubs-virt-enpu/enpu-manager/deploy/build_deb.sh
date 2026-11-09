@@ -18,6 +18,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+SOURCE_ROOT="$(cd "${PROJECT_ROOT}/.." && pwd)"
 PROJECT_NAME="enpu-manager"
 
 # === Configuration ===
@@ -62,7 +63,7 @@ echo "[INFO] ENPU_ASCEND_DRIVER_PATH=${ENPU_ASCEND_DRIVER_PATH}"
 for cmd in dpkg-buildpackage dh cmake gcc; do
     if ! command -v "$cmd" &>/dev/null; then
         echo "[ERROR] $cmd not found! Install build dependencies:"
-        echo "  sudo apt-get install build-essential cmake debhelper libcjson-dev"
+        echo "  sudo apt-get install build-essential cmake debhelper libcjson-dev uuid-dev"
         exit 1
     fi
 done
@@ -73,6 +74,11 @@ if ! dpkg -l libcjson-dev &>/dev/null 2>&1; then
     echo "  Install it: sudo apt-get install libcjson-dev"
 fi
 
+if ! dpkg -l uuid-dev &>/dev/null 2>&1; then
+    echo "[WARNING] uuid-dev not found."
+    echo "  Install it: sudo apt-get install uuid-dev"
+fi
+
 echo ""
 echo "[STEP 1] Setting up build directory..."
 rm -rf "${DEB_BUILD_DIR}"
@@ -80,9 +86,11 @@ mkdir -p "${DEB_BUILD_DIR}"
 
 # Export source tree from working tree (same approach as build_rpm.sh)
 echo "[INFO] Exporting source tree..."
-cd "${PROJECT_ROOT}" && \
-git ls-files | \
-    tar -cf - --transform "s|^|${PROJECT_NAME}-${VERSION}/|" -T - | \
+# Preserve the same sibling layout as the repository and the RPM source archive.
+git -C "${SOURCE_ROOT}" ls-files --cached --others --exclude-standard -z -- enpu-manager common \
+    ':(exclude)enpu-manager/rpmbuild/**' ':(exclude)enpu-manager/debbuild/**' \
+    ':(exclude)enpu-manager/core/build/**' ':(exclude)enpu-manager/standalone/build/**' | \
+    tar -cf - --transform "s|^|${PROJECT_NAME}-${VERSION}/|" -C "${SOURCE_ROOT}" --null -T - | \
     tar -xf - -C "${DEB_BUILD_DIR}"
 
 echo ""
@@ -94,7 +102,7 @@ cp -r "${SCRIPT_DIR}/debian/"* "${DEB_BUILD_DIR}/${PROJECT_NAME}-${VERSION}/debi
 # Generate service file with proper LD_LIBRARY_PATH
 LD_PATH="${ASCEND_HOME_PATH}/lib64:${ENPU_ASCEND_DRIVER_PATH}/driver/lib64/driver"
 sed -i "s|^\(Environment=LD_LIBRARY_PATH=\).*|\1${LD_PATH}|" \
-    "${DEB_BUILD_DIR}/${PROJECT_NAME}-${VERSION}/deploy/enpu-manager.service"
+    "${DEB_BUILD_DIR}/${PROJECT_NAME}-${VERSION}/enpu-manager/deploy/enpu-manager.service"
 echo "[INFO] LD_LIBRARY_PATH set to: ${LD_PATH}"
 
 echo ""

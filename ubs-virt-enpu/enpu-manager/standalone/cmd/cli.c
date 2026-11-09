@@ -18,7 +18,9 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <uuid/uuid.h>
 
+#include "allocation_id.h"
 #include "cli.h"
 #include "securec.h"
 
@@ -199,8 +201,8 @@ static void print_usage(const char *prog)
     printf("Usage: %s <command> [options]\n\n", prog);
     printf("Commands:\n");
     printf("  list                     List all NPU devices\n");
-    printf("  alloc -n <aicore> [-r <request>] [-l <limit>] | -m <hbm> -p <policy> "
-           "[-d <phy_id>] [-u <pod_uid>] [-c <container>]\n");
+    printf("  alloc [--allocation-id <allocation_id>] -n <aicore> [-r <request>] [-l <limit>] | -m <hbm> -p <policy> "
+           "[-d <phy_id>] [--swap-order 0|1|2] [-u <pod_uid>] [-c <container>]\n");
     printf("                           Allocate vNPU\n");
     printf("                           -r/--request: hbm request (保底预留)\n");
     printf("                           -l/--limit:   hbm limit (硬边界上限)\n");
@@ -248,6 +250,8 @@ static int cmd_alloc(int argc, char *argv[], const char *host, const char *port)
     uint64_t hbm_limit = 0;
     int policy = 0;
     int phy_id = -1;
+    int swap_order = 1;
+    char allocation_id[ALLOCATION_ID_LEN] = "";
     char pod_uid[128] = "";
     char container[64] = "";
 
@@ -256,7 +260,14 @@ static int cmd_alloc(int argc, char *argv[], const char *host, const char *port)
         const char *val = (i + 1 < argc) ? argv[i + 1] : NULL;
         int has_val = (val != NULL);
 
-        if (strcmp(argv[i], "-n") == 0 && has_val) {
+        if (strcmp(argv[i], "--allocation-id") == 0) {
+            uuid_t id;
+            if (!has_val || uuid_parse(val, id) != 0) {
+                fprintf(stderr, "Error: --allocation-id requires a UUID\n");
+                return 1;
+            }
+            uuid_unparse_lower(id, allocation_id);
+        } else if (strcmp(argv[i], "-n") == 0 && has_val) {
             aicore = atoi(val);
         } else if (strcmp(argv[i], "-m") == 0 && has_val) {
             hbm = strtoull(val, NULL, 10);
@@ -280,6 +291,12 @@ static int cmd_alloc(int argc, char *argv[], const char *host, const char *port)
             }
         } else if (strcmp(argv[i], "-d") == 0 && has_val) {
             phy_id = atoi(val);
+        } else if (strcmp(argv[i], "--swap-order") == 0) {
+            if (!has_val || strlen(val) != 1 || val[0] < '0' || val[0] > '2') {
+                fprintf(stderr, "Error: --swap-order requires 0, 1 or 2\n");
+                return 1;
+            }
+            swap_order = val[0] - '0';
         } else if (strcmp(argv[i], "-u") == 0 && has_val) {
             if (strncpy_s(pod_uid, sizeof(pod_uid), val, strnlen(val, sizeof(pod_uid) - 1)) != 0) {
                 fprintf(stderr, "Error: Failed to copy pod_uid\n");
@@ -307,13 +324,19 @@ static int cmd_alloc(int argc, char *argv[], const char *host, const char *port)
         return 1;
     }
 
+    char allocation_field[64] = "";
+    if (allocation_id[0] && snprintf_s(allocation_field, sizeof(allocation_field), sizeof(allocation_field) - 1,
+                                       "\"allocation_id\":\"%s\",", allocation_id) < 0) {
+        return 1;
+    }
     if (hbm_request > 0 && hbm_limit > 0) {
         char body[512];
         int body_len = snprintf_s(body, sizeof(body), sizeof(body) - 1,
-                                  "{\"aicore_quota\":%d,\"hbm_request\":%lu,\"hbm_limit\":%lu,"
+                                  "{%s\"aicore_quota\":%d,\"hbm_request\":%lu,\"hbm_limit\":%lu,"
                                   "\"sched_policy\":%d,\"phy_id\":%d,\"pod_uid\":\"%s\","
-                                  "\"container_name\":\"%s\"}",
-                                  aicore, hbm_request, hbm_limit, policy, phy_id, pod_uid, container);
+                                  "\"container_name\":\"%s\",\"swap_order\":%d}",
+                                  allocation_field, aicore, hbm_request, hbm_limit, policy, phy_id, pod_uid, container,
+                                  swap_order);
         if (body_len < 0 || body_len >= (int)sizeof(body)) {
             fprintf(stderr, "Error: Failed to build request body\n");
             return 1;
@@ -373,9 +396,9 @@ static int cmd_alloc(int argc, char *argv[], const char *host, const char *port)
 
     char body[512];
     int body_len = snprintf_s(body, sizeof(body), sizeof(body) - 1,
-                              "{\"aicore_quota\":%d,\"hbm_quota\":%lu,\"sched_policy\":%d,"
-                              "\"phy_id\":%d,\"pod_uid\":\"%s\",\"container_name\":\"%s\"}",
-                              aicore, hbm_request, policy, phy_id, pod_uid, container);
+                              "{%s\"aicore_quota\":%d,\"hbm_quota\":%lu,\"sched_policy\":%d,"
+                              "\"phy_id\":%d,\"pod_uid\":\"%s\",\"container_name\":\"%s\",\"swap_order\":%d}",
+                              allocation_field, aicore, hbm_request, policy, phy_id, pod_uid, container, swap_order);
     if (body_len < 0 || body_len >= (int)sizeof(body)) {
         fprintf(stderr, "Error: Failed to build request body\n");
         return 1;
@@ -423,6 +446,21 @@ static int cmd_alloc(int argc, char *argv[], const char *host, const char *port)
     return 0;
 }
 
+static void encode_query_value(const char *value, char *out)
+{
+    const char *hex = "0123456789ABCDEF";
+    for (const unsigned char *p = (const unsigned char *)value; *p; p++) {
+        if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || strchr("-._~", *p)) {
+            *out++ = (char)*p;
+        } else {
+            *out++ = '%';
+            *out++ = hex[*p >> 4];
+            *out++ = hex[*p & 15];
+        }
+    }
+    *out = '\0';
+}
+
 static int cmd_release(int argc, char *argv[], const char *host, const char *port)
 {
     char pod_uid[128] = "";
@@ -434,12 +472,12 @@ static int cmd_release(int argc, char *argv[], const char *host, const char *por
         int has_val = (val != NULL);
 
         if (strcmp(argv[i], "-u") == 0 && has_val) {
-            if (strncpy_s(pod_uid, sizeof(pod_uid), val, strnlen(val, sizeof(pod_uid) - 1)) != 0) {
+            if (strlen(val) >= sizeof(pod_uid) || strncpy_s(pod_uid, sizeof(pod_uid), val, strlen(val)) != 0) {
                 fprintf(stderr, "Error: Failed to copy pod_uid\n");
                 return 1;
             }
         } else if (strcmp(argv[i], "-c") == 0 && has_val) {
-            if (strncpy_s(container, sizeof(container), val, strnlen(val, sizeof(container) - 1)) != 0) {
+            if (strlen(val) >= sizeof(container) || strncpy_s(container, sizeof(container), val, strlen(val)) != 0) {
                 fprintf(stderr, "Error: Failed to copy container\n");
                 return 1;
             }
@@ -455,8 +493,12 @@ static int cmd_release(int argc, char *argv[], const char *host, const char *por
         return 1;
     }
 
-    char path[MAX_URL_LEN];
-    int path_len = snprintf_s(path, sizeof(path), sizeof(path) - 1, "/api/v1/allocate/%s/%s", pod_uid, container);
+    char encoded_pod[sizeof(pod_uid) * 3], encoded_container[sizeof(container) * 3];
+    encode_query_value(pod_uid, encoded_pod);
+    encode_query_value(container, encoded_container);
+    char path[sizeof(encoded_pod) + sizeof(encoded_container) + 64];
+    int path_len = snprintf_s(path, sizeof(path), sizeof(path) - 1, "/api/v1/allocations?pod_uid=%s&container_name=%s",
+                              encoded_pod, encoded_container);
     if (path_len < 0 || path_len >= (int)sizeof(path)) {
         fprintf(stderr, "Error: Failed to build request path\n");
         return 1;

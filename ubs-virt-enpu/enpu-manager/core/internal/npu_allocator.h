@@ -65,6 +65,7 @@ int npu_allocator_init(npu_allocator_t *alloc);
 int npu_allocator_destroy(npu_allocator_t *alloc);
 
 int npu_allocator_allocate(npu_allocator_t *alloc, alloc_request_t *req, alloc_response_t *resp);
+int npu_allocator_release_by_id(npu_allocator_t *alloc, const char *allocation_id);
 int npu_allocator_release(npu_allocator_t *alloc, const char *pod_uid, const char *container_name);
 int npu_allocator_release_by_vnpu(npu_allocator_t *alloc, int phy_id, int vnpu_id);
 

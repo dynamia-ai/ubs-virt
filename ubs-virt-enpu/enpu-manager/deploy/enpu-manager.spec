@@ -21,7 +21,9 @@ BuildRequires:  cmake >= 3.15
 BuildRequires:  gcc >= 9.3
 BuildRequires:  systemd
 BuildRequires:  cjson-devel
+BuildRequires:  libuuid-devel
 Requires:       cjson
+Requires:       libuuid
 Requires(post): systemd
 Requires(preun): systemd
 Requires(postun): systemd
@@ -46,29 +48,29 @@ export ASCEND_HOME_PATH="%{_ascend_home_path}"
 export ENPU_ASCEND_DRIVER_PATH="%{_enpu_ascend_driver_path}"
 
 # Step 1: Build core shared library
-pushd core
+pushd enpu-manager/core
 bash make_build.sh
 popd
 
 # Step 2: Build standalone binaries (enpu-manager + enpu-cli)
-pushd standalone
+pushd enpu-manager/standalone
 echo "[INFO] Building standalone binaries..."
 bash build.sh
 popd
 
 %install
-install -D standalone/build/output/enpu-manager %{buildroot}%{_bindir}/enpu-manager
-install -D standalone/build/output/enpu-cli %{buildroot}%{_bindir}/enpu-cli
+install -D enpu-manager/standalone/build/output/enpu-manager %{buildroot}%{_bindir}/enpu-manager
+install -D enpu-manager/standalone/build/output/enpu-cli %{buildroot}%{_bindir}/enpu-cli
 
 # Shared library — versioned and soversion symlinks
-install -D core/build/output/libenpu_manager.so.1.0.0 %{buildroot}%{_libdir}/libenpu_manager.so.1.0.0
+install -D enpu-manager/core/build/output/libenpu_manager.so.1.0.0 %{buildroot}%{_libdir}/libenpu_manager.so.1.0.0
 ln -sf libenpu_manager.so.1.0.0 %{buildroot}%{_libdir}/libenpu_manager.so.1
 
 # Configuration file
-install -D config/enpu-manager.conf %{buildroot}%{_sysconfdir}/enpu/enpu-manager.conf
+install -D enpu-manager/config/enpu-manager.conf %{buildroot}%{_sysconfdir}/enpu/enpu-manager.conf
 
 # Systemd service unit
-install -D deploy/enpu-manager.service %{buildroot}%{_unitdir}/enpu-manager.service
+install -D enpu-manager/deploy/enpu-manager.service %{buildroot}%{_unitdir}/enpu-manager.service
 
 # State / log / data directories
 install -d %{buildroot}%{_localstatedir}/lib/enpu-manager
@@ -110,7 +112,7 @@ fi
 # File Lists
 # ====================================================================
 %files
-%doc README.md
+%doc enpu-manager/README.md
 
 %attr(0500, root, root) %{_bindir}/enpu-manager
 %attr(0500, root, root) %{_bindir}/enpu-cli

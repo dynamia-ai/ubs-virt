@@ -163,7 +163,7 @@ int swap_resolver_get_idle_models(swap_resolver_t *resolver, int phy_id, swap_ca
         }
         candidates[count].vnpu_id = vnpu_id;
         candidates[count].sched_policy = entry->sched_policy;
-        candidates[count].swap_priority = entry->swap_priority;
+        candidates[count].swap_order = entry->swap_order;
         candidates[count].hbm_used = hbm_used;
         candidates[count].last_kernel_time_ns = last_kernel_time_ns;
         candidates[count].swapped = swapped;
@@ -242,12 +242,12 @@ int swap_resolver_select_candidate_from_list(swap_resolver_t *resolver, swap_can
             continue;
         }
 
-        int prio_current = candidates[i].swap_priority;
-        int prio_best = candidates[best_idx].swap_priority;
+        int order_current = candidates[i].swap_order;
+        int order_best = candidates[best_idx].swap_order;
 
-        if (prio_current > prio_best) {
+        if (order_current < order_best) {
             best_idx = i;
-        } else if (prio_current == prio_best) {
+        } else if (order_current == order_best) {
             if (candidates[i].last_kernel_time_ns < candidates[best_idx].last_kernel_time_ns) {
                 best_idx = i;
             }
@@ -259,8 +259,8 @@ int swap_resolver_select_candidate_from_list(swap_resolver_t *resolver, swap_can
     }
 
     LOG_INFO("swap_resolver_select_candidate_from_list: selected "
-             "phy_id=%d, vnpu_id=%d, swap_priority=%d, last_kernel_time_ns=%lu",
-             candidates[best_idx].phy_id, candidates[best_idx].vnpu_id, candidates[best_idx].swap_priority,
+             "phy_id=%d, vnpu_id=%d, swap_order=%d, last_kernel_time_ns=%lu",
+             candidates[best_idx].phy_id, candidates[best_idx].vnpu_id, candidates[best_idx].swap_order,
              candidates[best_idx].last_kernel_time_ns);
 
     *selected = candidates[best_idx];

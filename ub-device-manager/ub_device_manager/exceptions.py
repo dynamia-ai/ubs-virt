@@ -13,6 +13,11 @@ from fastapi import HTTPException
 from typing import Optional
 
 
+def ensure_terminal_period(detail: str) -> str:
+    detail = detail.rstrip()
+    return detail if detail.endswith(".") else f"{detail}."
+
+
 class UbDmHTTPException(HTTPException):
     msg = "an unexpected error"
     code = 500
@@ -28,7 +33,7 @@ class InvalidCreateVmRequest(UbDmHTTPException):
 
 class AffinityTopologyUnavailable(UbDmHTTPException):
     msg = 'host affinity topology is unavailable'
-    code = 503
+    code = 550
 
 
 class VmXmlTooLarge(InvalidCreateVmRequest):
@@ -73,6 +78,21 @@ class InvalidBindDeviceRequest(UbDmHTTPException):
 class ResolveNpuDevicesFailed(UbDmHTTPException):
     msg = 'resolve npu devices failed'
     code = 545
+
+
+class H2NRequirementFailed(UbDmHTTPException):
+    msg = 'failed to determine whether H2N check is required.'
+    code = 546
+
+
+class H2NCheckFailed(UbDmHTTPException):
+    msg = 'H2N link did not become healthy.'
+    code = 547
+
+
+class NicConfigurationFailed(UbDmHTTPException):
+    msg = 'NIC MAC/VFE configuration failed.'
+    code = 549
 
 
 class InvalidUnbindDeviceRequest(UbDmHTTPException):

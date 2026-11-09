@@ -18,6 +18,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+SOURCE_ROOT="$(cd "${PROJECT_ROOT}/.." && pwd)"
 PROJECT_NAME="enpu-manager"
 
 # === Configuration ===
@@ -68,8 +69,13 @@ echo ""
 echo "[STEP 2] Creating source tarball..."
 TARBALL="${RPMBUILD_DIR}/SOURCES/${PROJECT_NAME}-${VERSION}.tar.gz"
 
-git -C "${PROJECT_ROOT}" ls-files | \
-    tar -czf "${TARBALL}" --transform "s|^|${PROJECT_NAME}-${VERSION}/|" -C "${PROJECT_ROOT}" -T -
+# Keep enpu-manager/ and common/ as siblings so their relative build paths work.
+# Include new working-tree sources, but never recursively archive build outputs.
+git -C "${SOURCE_ROOT}" ls-files --cached --others --exclude-standard -z -- enpu-manager common \
+    ':(exclude)enpu-manager/rpmbuild/**' ':(exclude)enpu-manager/debbuild/**' \
+    ':(exclude)enpu-manager/core/build/**' ':(exclude)enpu-manager/standalone/build/**' | \
+    tar -czf "${TARBALL}" --transform "s|^|${PROJECT_NAME}-${VERSION}/|" \
+        -C "${SOURCE_ROOT}" --null -T -
 
 # Restore original service file
 mv -f "${SERVICE_FILE}.bak" "${SERVICE_FILE}"

@@ -195,10 +195,10 @@ enpu-manager [--port 8080]
   ```bash
   curl -X POST http://localhost:8080/api/v1/allocate \
     -H "Content-Type: application/json" \
-    -d '{"aicore_quota":10,"hbm_quota":1024,"hbm_limit":1024,"sched_policy":1}'
+    -d '{"allocation_id":"550e8400-e29b-41d4-a716-446655440000","aicore_quota":10,"hbm_quota":1024,"hbm_limit":1024,"sched_policy":1}'
   ```
 
-  正常返回包含 `phy_id / vnpu_id / pod_uid / container_name` 等字段，`result=0` 表示分配成功。
+  正常返回包含 `allocation_id / phy_id / vnpu_id / pod_uid / container_name` 等字段，`result=0` 表示分配成功。其中 `allocation_id` 是 UUID 格式的分配标识。
 
 - 查询当前分配记录，确认上一步分配的 vNPU 已登记：
 
@@ -210,13 +210,13 @@ enpu-manager [--port 8080]
 
   ```bash
   ls /etc/enpu/vcann-rt/
-  # 应能看到以 pod_uid 命名的目录，其下有 container_name 命名的子目录，里面包含 npu_info.config
+  # 在 allocations/<allocation_id>/ 下查看 npu_info.config，以创建响应的 config_path 为准
   ```
 
-- 释放测试 vNPU 完成清理（其中 `pod-0` / `container-0-X` 替换为上一步返回的实际值）：
+- 通过上一步的 allocation_id 释放测试 vNPU：
 
   ```bash
-  curl -X DELETE http://localhost:8080/api/v1/allocations/pod-0/container-0-0
+  curl -X DELETE http://localhost:8080/api/v1/allocations/550e8400-e29b-41d4-a716-446655440000
   ```
 
 ## REST API 使用
@@ -232,7 +232,8 @@ enpu-manager 通过 HTTP REST API 接收请求，默认端口 8080，返回 JSON
 | `/api/v1/devices`                     | GET    | 列出所有 NPU 设备及其可用资源。             |
 | `/api/v1/devices/{phy_id}`            | GET    | 查询指定物理卡详情（含 oversub_ratio）。    |
 | `/api/v1/allocate`                    | POST   | 分配 vNPU。                                |
-| `/api/v1/allocations/{pod_uid}/{container_name}` | DELETE | 释放指定 vNPU。                            |
+| `/api/v1/allocations/{allocation_id}` | DELETE | 按 allocation_id 释放指定分配。 |
+| `/api/v1/allocations?pod_uid={pod_uid}&container_name={container_name}` | DELETE | 按两个标签唯一匹配后释放分配。 |
 | `/api/v1/allocations`                 | GET    | 列出当前所有 vNPU 分配。                    |
 | `/api/v1/clean`                       | DELETE | 清理当前所有 vNPU 分配。                    |
 
@@ -244,19 +245,20 @@ enpu-manager 通过 HTTP REST API 接收请求，默认端口 8080，返回 JSON
 
 | 字段               | 类型    | 必填 | 说明                                                                                       |
 |:-------------------|:--------|:-----|:-------------------------------------------------------------------------------------------|
+| `allocation_id` | string | 否 | 未传时由 manager 生成；传入时检查重复，已有分配返回 409，不比较其他参数。 |
 | `aicore_quota`     | int     | 普通优先级必填 | 普通优先级范围 1~100；策略 `1`/`2` 下用于 AICore 配额限制，策略 `3` 下仍需填写但不用于限制算力。高优先级可省略，实际使用 0。 |
 | `hbm_quota`        | int | 是   | HBM Request（保底预留），单位 MB，等价别名 `hbm_request`。                                            |
 | `hbm_limit`        | int | 否   | HBM Limit（硬上限），单位 MB。未填时默认等于 `hbm_quota`。                                              |
 | `sched_policy`     | int     | 普通优先级必填 | 调度策略：`1`=fixed-share，`2`=elastic，`3`=best-effort；高优先级可省略，实际使用 `3`。 |
 | `vnpu_priority`    | int     | 否   | vNPU 优先级：`0`=普通优先级（默认），`1`=高优先级。 |
-| `swap_priority`    | int     | 否   | 换出优先级：`0`=HIGH（最后换出），`1`=MEDIUM（默认），`2`=LOW（最先换出）。                  |
+| `swap_order` | int | 否 | 换出顺序（CLI：`--swap-order`）：`0` 最先换出，`1` 默认，`2` 最后换出；同一顺序优先换出最久未执行的候选。 |
 | `phy_id`           | int     | 否   | 指定物理卡：`-1`=由 enpu-manager 自动选择（默认）；`>=0`=直接分配到该卡（跳过自动决策）。     |
-| `pod_uid`          | string  | 否   | Pod 标识符。未填时默认 `pod-<phy_id>`。                                                     |
-| `container_name`   | string  | 否   | 容器名。未填时默认 `container-<phy_id>-<vnpu_id>`。                                          |
+| `pod_uid`          | string  | 否   | Pod 元数据，可重复，未填时为空字符串。 |
+| `container_name`   | string  | 否   | 容器名元数据，可重复，未填时为空字符串。 |
 
-> `pod_uid` 和 `container_name` 共同构成 vNPU 的复合主键，后续释放/查询时需要提供。未指定时使用默认值，响应体中会回显实际使用的值。
->
 > 未填 `hbm_limit` 时默认等于 `hbm_quota`，相当于 `hbm_request == hbm_limit`。**普通优先级采用 `sched_policy=1`（fixed-share）时建议显式传 `hbm_limit` 与 `hbm_quota` 相等**，避免误解。
+
+CLI 可通过 `--allocation-id <allocation_id>` 指定标识。需要重试去重时，由调用方生成并复用同一个 allocation_id；收到 409 后，通过 `GET /api/v1/allocations` 查询已有记录。未传时每次创建独立分配；释放后不再保留该记录。
 
 `vnpu_priority` 只接受 JSON 整数 `0` 或 `1`；字符串、小数及其他值会返回 HTTP 400。
 
@@ -279,6 +281,7 @@ enpu-manager 通过 HTTP REST API 接收请求，默认端口 8080，返回 JSON
 curl -X POST http://localhost:8080/api/v1/allocate \
   -H "Content-Type: application/json" \
   -d '{
+    "allocation_id": "550e8400-e29b-41d4-a716-446655440001",
     "aicore_quota": 20,
     "hbm_quota": 10240,
     "hbm_limit": 32768,
@@ -290,10 +293,12 @@ curl -X POST http://localhost:8080/api/v1/allocate \
 
 ```json
 {
+  "allocation_id": "550e8400-e29b-41d4-a716-446655440001",
+  "config_path": "/etc/enpu/vcann-rt/allocations/550e8400-e29b-41d4-a716-446655440001/npu_info.config",
   "phy_id": 0,
   "vnpu_id": 5,
-  "pod_uid": "pod-0",
-  "container_name": "container-0-5",
+  "pod_uid": "",
+  "container_name": "",
   "die_id": "14422CC3-...",
   "shm_id": "14422CC3-...",
   "aicore_quota": 20,
@@ -312,6 +317,7 @@ curl -X POST http://localhost:8080/api/v1/allocate \
 curl -X POST http://localhost:8080/api/v1/allocate \
   -H "Content-Type: application/json" \
   -d '{
+    "allocation_id": "550e8400-e29b-41d4-a716-446655440002",
     "aicore_quota": 20,
     "hbm_quota": 10240,
     "hbm_limit": 10240,
@@ -328,6 +334,7 @@ curl -X POST http://localhost:8080/api/v1/allocate \
 curl -X POST http://localhost:8080/api/v1/allocate \
   -H "Content-Type: application/json" \
   -d '{
+    "allocation_id": "550e8400-e29b-41d4-a716-446655440003",
     "aicore_quota": 30,
     "hbm_quota": 16384,
     "hbm_limit": 16384,
@@ -350,12 +357,15 @@ curl -X POST http://localhost:8080/api/v1/allocate \
   }'
 ```
 
-此请求无需填写 `aicore_quota` 和 `sched_policy`，最终生效值分别为 `0` 和 `3`。高优先级不预留软件 AI Core 配额；当同卡普通优先级容器也有任务需求时，vCANN-RT 会为其保留周期性提交机会。`swap_priority` 控制显存换出顺序，与 `vnpu_priority` 的算力调度优先级无关。
+此请求无需填写 `aicore_quota` 和 `sched_policy`，最终生效值分别为 `0` 和 `3`。高优先级不预留软件 AI Core 配额；当同卡普通优先级容器也有任务需求时，vCANN-RT 会为其保留周期性提交机会。`swap_order` 控制显存换出顺序，与 `vnpu_priority` 的算力调度优先级无关。
 
 ### 释放 vNPU
 
+`pod_uid` 和 `container_name` 均必填且非空，仅唯一匹配时释放；无匹配返回 404，多个匹配返回 409，参数错误返回 400。
+特殊字符需 URL 编码，CLI 会自动编码。
+
 ```bash
-curl -X DELETE http://localhost:8080/api/v1/allocations/pod-0/container-0-5
+curl -X DELETE 'http://localhost:8080/api/v1/allocations?pod_uid=pod-0&container_name=container-0-5'
 ```
 
 ### 清理所有 vNPU 分配
@@ -408,7 +418,7 @@ curl http://localhost:8080/api/v1/allocations
 
 vNPU 分配成功后，enpu-manager 会在宿主机侧生成 vCANN-RT 所需的配置文件：
 
-**路径**：`/etc/enpu/vcann-rt/{pod_uid}/{container_name}/npu_info.config`
+**路径**：`/etc/enpu/vcann-rt/allocations/{allocation_id}/npu_info.config`
 
 **表 9 npu_info.config 字段**
 
@@ -480,5 +490,5 @@ vNPU 分配成功后，enpu-manager 会在宿主机侧生成 vCANN-RT 所需的�
    ```bash
    # 仅释放指定的 vNPU 分配。请勿使用 DELETE /api/v1/clean 全量清理，
    # clean 会释放节点上所有 vNPU 分配，包括正在运行业务的分配
-   curl -X DELETE http://localhost:8080/api/v1/allocations/pod-0/container-0-0
+   curl -X DELETE 'http://localhost:8080/api/v1/allocations?pod_uid=pod-0&container_name=container-0-0'
    ```

@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <uuid/uuid.h>
 #include "../internal/npu_allocator_internal.h"
 #include "allocation.h"
 #include "common.h"
@@ -299,62 +300,24 @@ int npu_allocator_init(npu_allocator_t *a)
     int count = 0;
     allocation_registry_list(a->registry, existing, &count);
     for (int i = 0; i < count; i++) {
-        allocation_registry_register(registry_with_adapter, &existing[i]);
+        if (allocation_registry_register(registry_with_adapter, &existing[i]) != ENPU_SUCCESS) {
+            allocation_registry_destroy(registry_with_adapter);
+            storage_adapter_destroy(storage);
+            pthread_mutex_unlock(&a->lock);
+            ERR("Failed to transfer allocation into checkpoint-backed registry: allocation_id=%s",
+                existing[i].allocation_id);
+            return ENPU_FAIL;
+        }
     }
 
     allocation_registry_destroy(a->registry);
     a->registry = registry_with_adapter;
 
-    allocation_registry_recover(a->registry);
-
-    // 修复旧 checkpoint 中 buggy 的 shm_id（旧代码写入phy_id, 正确值应为 die_id）
-    {
-        allocation_t loaded[MAX_ALLOC_COUNT] = {0};
-        int loaded_count = 0;
-        if (allocation_registry_list(a->registry, loaded, &loaded_count) == ENPU_SUCCESS) {
-            int migrated = 0;
-            for (int i = 0; i < loaded_count; i++) {
-                if (loaded[i].die_id[0] == '\0') {
-                    LOG("Skip shm_id migration: pod=%s container=%s has empty die_id", loaded[i].pod_uid,
-                        loaded[i].container_name);
-                    continue;
-                }
-                if (strncmp(loaded[i].shm_id, loaded[i].die_id, DIE_ID_LEN) == 0) {
-                    continue;
-                }
-
-                LOG("Migrating shm_id for pod=%s container=%s: '%s' -> '%s'", loaded[i].pod_uid,
-                    loaded[i].container_name, loaded[i].shm_id, loaded[i].die_id);
-
-                // 用真实 die_id 重写 npu_info.config
-                vnpu_config_t cfg = {.phy_npu_id = loaded[i].phy_id,
-                                     .vnpu_id = loaded[i].vnpu_id,
-                                     .aicore_quota = loaded[i].aicore_quota,
-                                     .memory_request = loaded[i].hbm_quota,
-                                     .memory_limit = loaded[i].hbm_limit,
-                                     .scheduling_policy = loaded[i].sched_policy,
-                                     .vnpu_priority = loaded[i].vnpu_priority};
-                alloc_copy_str(cfg.shm_id, SHM_ID_LEN, loaded[i].die_id);
-                if (config_manager_write_config(a->config_mgr, loaded[i].pod_uid, loaded[i].container_name, &cfg) !=
-                    ENPU_SUCCESS) {
-                    ERR("Failed to rewrite npu_info.config during migration: pod=%s container=%s", loaded[i].pod_uid,
-                        loaded[i].container_name);
-                    continue;
-                }
-
-                // 更新 registry 内存 + 持久化 checkpoint
-                if (allocation_registry_update_shm_id(a->registry, loaded[i].pod_uid, loaded[i].container_name,
-                                                      loaded[i].die_id) != ENPU_SUCCESS) {
-                    ERR("Failed to update registry shm_id: pod=%s container=%s", loaded[i].pod_uid,
-                        loaded[i].container_name);
-                    continue;
-                }
-                migrated++;
-            }
-            if (migrated > 0) {
-                LOG("Checkpoint migrated: %d allocations, shm_id aligned with die_id", migrated);
-            }
-        }
+    int registry_recover_ret = allocation_registry_recover(a->registry);
+    if (registry_recover_ret != ENPU_SUCCESS) {
+        pthread_mutex_unlock(&a->lock);
+        ERR("Failed to recover allocation registry: ret=%d", registry_recover_ret);
+        return registry_recover_ret;
     }
 
     pthread_mutex_unlock(&a->lock);
@@ -424,7 +387,7 @@ static evaluator_t *pick_evaluator(npu_allocator_t *a)
 }
 
 static void build_shm_entry(vnpu_shm_entry_t *entry, int32_t vnpu_id, uint64_t hbm_request, uint64_t hbm_limit,
-                            int32_t sched_policy, int32_t swap_priority, bool swap_enabled)
+                            int32_t sched_policy, int32_t swap_order, bool swap_enabled)
 {
     int zero_ret = memset_s(entry, sizeof(*entry), 0, sizeof(*entry));
     if (zero_ret != 0) {
@@ -434,7 +397,7 @@ static void build_shm_entry(vnpu_shm_entry_t *entry, int32_t vnpu_id, uint64_t h
     entry->hbm_request = hbm_request;
     entry->hbm_limit = hbm_limit;
     entry->sched_policy = sched_policy;
-    entry->swap_priority = swap_priority;
+    entry->swap_order = swap_order;
     entry->swap_enabled = swap_enabled;
 }
 
@@ -562,6 +525,20 @@ int npu_allocator_allocate(npu_allocator_t *a, alloc_request_t *req, alloc_respo
     CHECK(req, ENPU_INVALID_PARAM);
     CHECK(resp, ENPU_INVALID_PARAM);
 
+    if (!req->allocation_id[0] && allocation_id_generate(req->allocation_id) != ENPU_SUCCESS) {
+        alloc_snprintf(resp->error_msg, MAX_PATH_LEN, "failed to generate allocation_id");
+        resp->result = ENPU_FAIL;
+        return ENPU_FAIL;
+    }
+    if (!allocation_id_is_valid(req->allocation_id)) {
+        alloc_snprintf(resp->error_msg, MAX_PATH_LEN, "allocation_id must be a UUID");
+        resp->result = ENPU_INVALID_PARAM;
+        return ENPU_INVALID_PARAM;
+    }
+    uuid_t id;
+    uuid_parse(req->allocation_id, id);
+    uuid_unparse_lower(id, req->allocation_id);
+
     if (req->vnpu_priority != VNPU_PRIORITY_NORMAL && req->vnpu_priority != VNPU_PRIORITY_HIGH) {
         alloc_snprintf(resp->error_msg, MAX_PATH_LEN, "vnpu_priority must be 0 (normal) or 1 (high), got %d",
                        req->vnpu_priority);
@@ -604,6 +581,18 @@ int npu_allocator_allocate(npu_allocator_t *a, alloc_request_t *req, alloc_respo
 
     pthread_mutex_lock(&a->lock);
 
+    allocation_t existing;
+    int lookup = allocation_registry_get_by_id(a->registry, req->allocation_id, &existing);
+    if (lookup != ENPU_NOT_FOUND) {
+        resp->result = lookup == ENPU_SUCCESS ? ENPU_ALREADY_EXISTS : lookup;
+        alloc_snprintf(resp->error_msg, MAX_PATH_LEN,
+                       lookup == ENPU_SUCCESS ? "allocation_id already exists: %s" : "allocation_id lookup failed: %s",
+                       req->allocation_id);
+        LOG("Allocation rejected before resource allocation: %s", resp->error_msg);
+        pthread_mutex_unlock(&a->lock);
+        return resp->result;
+    }
+
     if (req->predicate_phy_id >= 0) {
         npu_node_t *target_node = npu_tree_get_leaf(a->tree, req->predicate_phy_id);
         if (target_node == NULL) {
@@ -613,26 +602,6 @@ int npu_allocator_allocate(npu_allocator_t *a, alloc_request_t *req, alloc_respo
             pthread_mutex_unlock(&a->lock);
             return ENPU_FAIL;
         }
-    }
-
-    allocation_t existing = {0};
-    if (allocation_registry_get(a->registry, req->pod_uid, req->container_name, &existing) == ENPU_SUCCESS) {
-        resp->phy_id = existing.phy_id;
-        resp->vnpu_id = existing.vnpu_id;
-        alloc_copy_str(resp->pod_uid, MAX_UUID_LEN, existing.pod_uid);
-        alloc_copy_str(resp->container_name, MAX_NAME_LEN, existing.container_name);
-        alloc_copy_str(resp->die_id, DIE_ID_LEN, existing.die_id);
-        resp->aicore_quota = existing.aicore_quota;
-        resp->hbm_quota = existing.hbm_quota;
-        resp->hbm_limit = existing.hbm_limit;
-        resp->sched_policy = existing.sched_policy;
-        resp->vnpu_priority = existing.vnpu_priority;
-        alloc_copy_str(resp->shm_id, SHM_ID_LEN, existing.shm_id);
-        resp->result = ENPU_ALREADY_EXISTS;
-        alloc_snprintf(resp->error_msg, MAX_PATH_LEN, "vNPU already exists: pod=%s container=%s phy=%d vnpu=%d",
-                       existing.pod_uid, existing.container_name, existing.phy_id, existing.vnpu_id);
-        pthread_mutex_unlock(&a->lock);
-        return ENPU_ALREADY_EXISTS;
     }
 
     evaluator_t *ev = pick_evaluator(a);
@@ -721,17 +690,8 @@ int npu_allocator_allocate(npu_allocator_t *a, alloc_request_t *req, alloc_respo
         return ENPU_INVALID_PARAM;
     }
 
-    /* pod_uid / container_name 是可选字段, 用户未指定时填默认值 */
-    if (req->pod_uid[0] == '\0') {
-        alloc_snprintf(req->pod_uid, MAX_UUID_LEN, "pod-%d", phy_id);
-        LOG("pod_uid not specified, using default: %s", req->pod_uid);
-    }
-    if (req->container_name[0] == '\0') {
-        alloc_snprintf(req->container_name, MAX_NAME_LEN, "container-%d-%d", phy_id, vnpu_id);
-        LOG("container_name not specified, using default: %s", req->container_name);
-    }
-
     allocation_t alloc = {0};
+    alloc_copy_str(alloc.allocation_id, ALLOCATION_ID_LEN, req->allocation_id);
     alloc.vnpu_id = vnpu_id;
     alloc_copy_str(alloc.pod_uid, MAX_UUID_LEN, req->pod_uid);
     alloc_copy_str(alloc.container_name, MAX_NAME_LEN, req->container_name);
@@ -740,9 +700,8 @@ int npu_allocator_allocate(npu_allocator_t *a, alloc_request_t *req, alloc_respo
     alloc.hbm_limit = hbm_limit;
     alloc.sched_policy = req->sched_policy;
     alloc.vnpu_priority = req->vnpu_priority;
-    alloc.swap_priority = (req->swap_priority >= SWAP_PRIORITY_HIGH && req->swap_priority <= SWAP_PRIORITY_LOW) ?
-                              req->swap_priority :
-                              SWAP_PRIORITY_MEDIUM;
+    alloc.swap_order = (req->swap_order >= SWAP_ORDER_MIN && req->swap_order <= SWAP_ORDER_MAX) ? req->swap_order :
+                                                                                                  SWAP_ORDER_DEFAULT;
     alloc_copy_str(alloc.die_id, DIE_ID_LEN, npu_node_get_die_id(node));
     alloc.create_time_ns = (uint64_t)time(NULL) * 1000000000ULL;
 
@@ -757,7 +716,7 @@ int npu_allocator_allocate(npu_allocator_t *a, alloc_request_t *req, alloc_respo
         pthread_mutex_unlock(&a->lock);
         return ret;
     }
-    rollback_log_append(a->rollback_log, STEP_MARK_OCCUPIED, phy_id, alloc.vnpu_id, 0, 0, 0, "", "", "");
+    rollback_log_append(a->rollback_log, STEP_MARK_OCCUPIED, phy_id, alloc.vnpu_id, 0, 0, 0, "", "");
 
     ret = npu_tree_update_quota(a->tree, node, -alloc.aicore_quota, -(int64_t)alloc.hbm_quota);
     if (ret != ENPU_SUCCESS) {
@@ -770,7 +729,7 @@ int npu_allocator_allocate(npu_allocator_t *a, alloc_request_t *req, alloc_respo
         return ret;
     }
     rollback_log_append(a->rollback_log, STEP_UPDATE_QUOTA, phy_id, alloc.vnpu_id, -alloc.aicore_quota,
-                        -(int64_t)alloc.hbm_quota, 0, "", "", "");
+                        -(int64_t)alloc.hbm_quota, 0, "", "");
 
     ret = npu_tree_attach_policy(a->tree, node, alloc.vnpu_id, alloc.sched_policy, alloc.vnpu_priority);
     if (ret != ENPU_SUCCESS) {
@@ -782,8 +741,7 @@ int npu_allocator_allocate(npu_allocator_t *a, alloc_request_t *req, alloc_respo
         pthread_mutex_unlock(&a->lock);
         return ret;
     }
-    rollback_log_append(a->rollback_log, STEP_ATTACH_POLICY, phy_id, alloc.vnpu_id, 0, 0, alloc.sched_policy, "", "",
-                        "");
+    rollback_log_append(a->rollback_log, STEP_ATTACH_POLICY, phy_id, alloc.vnpu_id, 0, 0, alloc.sched_policy, "", "");
 
     int resp_zero_ret = memset_s(resp, sizeof(alloc_response_t), 0, sizeof(alloc_response_t));
     if (resp_zero_ret != 0) {
@@ -791,7 +749,7 @@ int npu_allocator_allocate(npu_allocator_t *a, alloc_request_t *req, alloc_respo
     }
 
     vnpu_shm_entry_t shm_entry;
-    build_shm_entry(&shm_entry, alloc.vnpu_id, hbm_request, hbm_limit, alloc.sched_policy, alloc.swap_priority,
+    build_shm_entry(&shm_entry, alloc.vnpu_id, hbm_request, hbm_limit, alloc.sched_policy, alloc.swap_order,
                     a->oversub_ratio[phy_id] > 0);
 
     ret = shm_apply_vnpu_locked(a, phy_id, alloc.die_id, npu_node_get_total_memory(node), &shm_entry,
@@ -806,9 +764,10 @@ int npu_allocator_allocate(npu_allocator_t *a, alloc_request_t *req, alloc_respo
         ERR("Failed to create shm: %d", ret);
         return ret;
     }
-    rollback_log_append(a->rollback_log, STEP_CREATE_SHM, phy_id, alloc.vnpu_id, 0, 0, 0, "", "", resp->shm_id);
+    rollback_log_append(a->rollback_log, STEP_CREATE_SHM, phy_id, alloc.vnpu_id, 0, 0, 0, "", resp->shm_id);
 
     allocation_t registry_alloc = {0};
+    alloc_copy_str(registry_alloc.allocation_id, ALLOCATION_ID_LEN, alloc.allocation_id);
     registry_alloc.phy_id = npu_node_get_phy_id(node);
     registry_alloc.vnpu_id = alloc.vnpu_id;
     alloc_copy_str(registry_alloc.die_id, DIE_ID_LEN, npu_node_get_die_id(node));
@@ -817,7 +776,7 @@ int npu_allocator_allocate(npu_allocator_t *a, alloc_request_t *req, alloc_respo
     registry_alloc.hbm_limit = hbm_limit;
     registry_alloc.sched_policy = alloc.sched_policy;
     registry_alloc.vnpu_priority = alloc.vnpu_priority;
-    registry_alloc.swap_priority = alloc.swap_priority;
+    registry_alloc.swap_order = alloc.swap_order;
     registry_alloc.create_time_ns = alloc.create_time_ns;
     alloc_copy_str(registry_alloc.pod_uid, MAX_UUID_LEN, req->pod_uid);
     alloc_copy_str(registry_alloc.container_name, MAX_NAME_LEN, req->container_name);
@@ -828,26 +787,39 @@ int npu_allocator_allocate(npu_allocator_t *a, alloc_request_t *req, alloc_respo
                             .aicore_quota = registry_alloc.aicore_quota,
                             .memory_request = registry_alloc.hbm_quota,
                             .memory_limit = registry_alloc.hbm_limit,
-                            .scheduling_policy = registry_alloc.sched_policy};
-    config.vnpu_priority = registry_alloc.vnpu_priority;
+                            .scheduling_policy = registry_alloc.sched_policy,
+                            .vnpu_priority = registry_alloc.vnpu_priority};
+    alloc_copy_str(config.allocation_id, ALLOCATION_ID_LEN, registry_alloc.allocation_id);
     alloc_copy_str(config.shm_id, SHM_ID_LEN, registry_alloc.shm_id);
 
-    ret = config_manager_write_config(a->config_mgr, req->pod_uid, req->container_name, &config);
+    ret = config_manager_write_config(a->config_mgr, registry_alloc.allocation_id, &config);
     if (ret != ENPU_SUCCESS) {
         rollback_log_rollback(a->rollback_log, a);
-        alloc_snprintf(resp->error_msg, MAX_PATH_LEN, "write npu_info.config failed (pod=%s container=%s): ret=%d",
-                       req->pod_uid, req->container_name, ret);
+        alloc_snprintf(resp->error_msg, MAX_PATH_LEN, "write npu_info.config failed (allocation_id=%s): ret=%d",
+                       registry_alloc.allocation_id, ret);
         resp->result = ret;
         free(eval_resp.nodes);
         pthread_mutex_unlock(&a->lock);
         ERR("Failed to write config: %d", ret);
         return ret;
     }
-    rollback_log_append(a->rollback_log, STEP_WRITE_CONFIG, phy_id, alloc.vnpu_id, 0, 0, 0, req->pod_uid,
-                        req->container_name, "");
+    rollback_log_append(a->rollback_log, STEP_WRITE_CONFIG, phy_id, alloc.vnpu_id, 0, 0, 0,
+                        registry_alloc.allocation_id, "");
+
+    if (config_manager_get_config_path(a->config_mgr, registry_alloc.allocation_id, resp->config_path,
+                                       sizeof(resp->config_path)) == NULL) {
+        rollback_log_rollback(a->rollback_log, a);
+        alloc_snprintf(resp->error_msg, MAX_PATH_LEN, "failed to build config path for allocation_id=%s",
+                       registry_alloc.allocation_id);
+        resp->result = ENPU_FAIL;
+        free(eval_resp.nodes);
+        pthread_mutex_unlock(&a->lock);
+        return ENPU_FAIL;
+    }
 
     resp->phy_id = registry_alloc.phy_id;
     resp->vnpu_id = registry_alloc.vnpu_id;
+    alloc_copy_str(resp->allocation_id, ALLOCATION_ID_LEN, registry_alloc.allocation_id);
     alloc_copy_str(resp->pod_uid, MAX_UUID_LEN, registry_alloc.pod_uid);
     alloc_copy_str(resp->container_name, MAX_NAME_LEN, registry_alloc.container_name);
     alloc_copy_str(resp->die_id, DIE_ID_LEN, registry_alloc.die_id);
@@ -872,30 +844,40 @@ int npu_allocator_allocate(npu_allocator_t *a, alloc_request_t *req, alloc_respo
         ERR("Failed to register in registry: %d", ret);
         return ret;
     }
-    rollback_log_append(a->rollback_log, STEP_SAVE_CHECKPOINT, phy_id, alloc.vnpu_id, 0, 0, 0, req->pod_uid,
-                        req->container_name, "");
+    rollback_log_append(a->rollback_log, STEP_SAVE_CHECKPOINT, phy_id, alloc.vnpu_id, 0, 0, 0,
+                        registry_alloc.allocation_id, "");
 
     free(eval_resp.nodes);
     pthread_mutex_unlock(&a->lock);
 
     resp->result = ENPU_SUCCESS;
-    LOG("Allocated vNPU %d on phy %d for pod %s", resp->vnpu_id, resp->phy_id, req->pod_uid);
+    LOG("Allocated vNPU %d on phy %d: allocation_id=%s pod=%s container=%s swap_order=%d", resp->vnpu_id, resp->phy_id,
+        resp->allocation_id, req->pod_uid, req->container_name, registry_alloc.swap_order);
     return ENPU_SUCCESS;
 }
 
-int npu_allocator_release(npu_allocator_t *a, const char *pod_uid, const char *container_name)
+int npu_allocator_release_by_id(npu_allocator_t *a, const char *allocation_id)
 {
     CHECK(a, ENPU_INVALID_PARAM);
-    CHECK(pod_uid, ENPU_INVALID_PARAM);
-    CHECK(container_name, ENPU_INVALID_PARAM);
+    if (!allocation_id_is_valid(allocation_id)) {
+        return ENPU_INVALID_PARAM;
+    }
 
     pthread_mutex_lock(&a->lock);
 
     allocation_t alloc = {0};
-    if (allocation_registry_get(a->registry, pod_uid, container_name, &alloc) != ENPU_SUCCESS) {
+    if (allocation_registry_get_by_id(a->registry, allocation_id, &alloc) != ENPU_SUCCESS) {
         pthread_mutex_unlock(&a->lock);
-        ERR("Allocation not found: %s/%s", pod_uid, container_name);
+        ERR("Allocation not found: allocation_id=%s", allocation_id);
         return ENPU_NOT_FOUND;
+    }
+
+    /* Commit removal before making the slot reusable or deleting runtime state. */
+    int ret = allocation_registry_release_by_id(a->registry, allocation_id);
+    if (ret != ENPU_SUCCESS) {
+        ERR("Registry release failed: allocation_id=%s ret=%d; resources unchanged", allocation_id, ret);
+        pthread_mutex_unlock(&a->lock);
+        return ret;
     }
 
     npu_node_t *node = npu_tree_get_leaf(a->tree, alloc.phy_id);
@@ -912,16 +894,29 @@ int npu_allocator_release(npu_allocator_t *a, const char *pod_uid, const char *c
         shm_release_vnpu_locked(a, alloc.phy_id, alloc.vnpu_id);
     }
 
-    config_manager_delete_config(a->config_mgr, pod_uid, container_name);
-
-    int ret = allocation_registry_release(a->registry, pod_uid, container_name);
-    if (ret != ENPU_SUCCESS) {
-        LOG("Registry release failed but continuing: %d", ret);
+    int config_ret = config_manager_delete_config(a->config_mgr, allocation_id);
+    if (config_ret != ENPU_SUCCESS) {
+        LOG("Config delete failed but continuing: allocation_id=%s ret=%d", allocation_id, config_ret);
     }
 
     pthread_mutex_unlock(&a->lock);
-    LOG("Released vNPU for pod %s container %s", pod_uid, container_name);
+    LOG("Released vNPU: allocation_id=%s pod=%s container=%s", allocation_id, alloc.pod_uid, alloc.container_name);
     return ENPU_SUCCESS;
+}
+
+int npu_allocator_release(npu_allocator_t *a, const char *pod_uid, const char *container_name)
+{
+    CHECK(a, ENPU_INVALID_PARAM);
+    CHECK(pod_uid, ENPU_INVALID_PARAM);
+    CHECK(container_name, ENPU_INVALID_PARAM);
+
+    allocation_t allocation;
+    int ret = allocation_registry_get(a->registry, pod_uid, container_name, &allocation);
+    if (ret != ENPU_SUCCESS) {
+        ERR("Release by labels failed: pod=%s container=%s result=%d", pod_uid, container_name, ret);
+        return ret;
+    }
+    return npu_allocator_release_by_id(a, allocation.allocation_id);
 }
 
 int npu_allocator_release_by_vnpu(npu_allocator_t *a, int phy_id, int vnpu_id)
@@ -931,30 +926,9 @@ int npu_allocator_release_by_vnpu(npu_allocator_t *a, int phy_id, int vnpu_id)
         return ENPU_INVALID_PARAM;
     }
 
-    // 按 (phy_id, vnpu_id) 反查 registry 拿到 (pod_uid, container), 再走正常 release
-    pthread_mutex_lock(&a->lock);
-    allocation_t allocs[MAX_ALLOC_COUNT];
-    int count = 0;
-    int ret = allocation_registry_list(a->registry, allocs, &count);
-    char pod_uid[MAX_UUID_LEN] = {0};
-    char container_name[MAX_NAME_LEN] = {0};
-    bool found = false;
-    if (ret == ENPU_SUCCESS) {
-        for (int i = 0; i < count; i++) {
-            if (allocs[i].phy_id == phy_id && allocs[i].vnpu_id == vnpu_id) {
-                alloc_copy_str(pod_uid, MAX_UUID_LEN, allocs[i].pod_uid);
-                alloc_copy_str(container_name, MAX_NAME_LEN, allocs[i].container_name);
-                found = true;
-                break;
-            }
-        }
-    }
-    pthread_mutex_unlock(&a->lock);
-
-    if (!found) {
-        return ENPU_NOT_FOUND;
-    }
-    return npu_allocator_release(a, pod_uid, container_name);
+    allocation_t allocation;
+    int ret = allocation_registry_get_by_phy_id_vnpu_id(a->registry, phy_id, vnpu_id, &allocation);
+    return ret == ENPU_SUCCESS ? npu_allocator_release_by_id(a, allocation.allocation_id) : ret;
 }
 
 /* ==========================================================================
@@ -1032,7 +1006,7 @@ int npu_allocator_recover(npu_allocator_t *a)
             state->entries[alloc->vnpu_id].hbm_request = alloc->hbm_quota;
             state->entries[alloc->vnpu_id].hbm_limit = alloc->hbm_limit;
             state->entries[alloc->vnpu_id].sched_policy = alloc->sched_policy;
-            state->entries[alloc->vnpu_id].swap_priority = alloc->swap_priority;
+            state->entries[alloc->vnpu_id].swap_order = alloc->swap_order;
             state->entries[alloc->vnpu_id].swap_enabled = true;
             atomic_store(&state->entries[alloc->vnpu_id].hbm_used, 0);
         }
@@ -1047,14 +1021,12 @@ int npu_allocator_recover(npu_allocator_t *a)
             .scheduling_policy = alloc->sched_policy,
             .vnpu_priority = alloc->vnpu_priority,
         };
+        alloc_copy_str(config.allocation_id, ALLOCATION_ID_LEN, alloc->allocation_id);
         alloc_copy_str(config.shm_id, SHM_ID_LEN, alloc->shm_id);
-        if (config_manager_write_config(a->config_mgr, alloc->pod_uid, alloc->container_name, &config) !=
-            ENPU_SUCCESS) {
-            ERR("Recover: write npu_info.config failed for pod=%s container=%s, skip", alloc->pod_uid,
-                alloc->container_name);
+        if (config_manager_write_config(a->config_mgr, alloc->allocation_id, &config) != ENPU_SUCCESS) {
+            ERR("Recover: write npu_info.config failed for allocation_id=%s, skip", alloc->allocation_id);
             continue;
         }
-
         recovered_count++;
     }
 
@@ -1242,7 +1214,7 @@ int npu_allocator_get_last_kernel_time_ns(npu_allocator_t *a, int phy_id, int vn
 {
     CHECK(a, ENPU_INVALID_PARAM);
     CHECK(last_kernel_time_ns, ENPU_INVALID_PARAM);
-    if (vnpu_id < 0 || vnpu_id >= MAX_VNPU_PER_DIE) {
+    if (vnpu_id < 0 || vnpu_id >= MAX_VNPU_SCHED) {
         return ENPU_INVALID_PARAM;
     }
 

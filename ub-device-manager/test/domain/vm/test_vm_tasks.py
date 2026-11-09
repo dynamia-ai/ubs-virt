@@ -21,6 +21,8 @@ from ub_device_manager.constants import (
     BIND_RESULT_CONTEXT_KEY,
     CREATE_VM_REQUEST_CONTEXT_KEY,
     DELETE_VM_CONTEXT_KEY,
+    H2N_NIC_PAIRS_CONTEXT_KEY,
+    H2N_REQUIRED_CONTEXT_KEY,
     UNBIND_REQUEST_CONTEXT_KEY,
     VM_XML_CONTEXT_KEY,
     VM_SMBIOS_CONTEXT_KEY,
@@ -38,7 +40,7 @@ from ub_device_manager.domain.vm.vm_tasks import (
 )
 from ub_device_manager.domain.vm.vm_xml_builder import VmXmlBuilder
 from ub_device_manager.domain.vm.vm_smbios import SmbiosType131, VmSmbios
-from ub_device_manager.exceptions import InvalidCreateVmRequest, VmXmlBuildFailed, VmXmlTooLarge
+from ub_device_manager.exceptions import H2NCheckFailed, InvalidCreateVmRequest, VmXmlBuildFailed, VmXmlTooLarge
 
 VALID_XML = "<domain><devices/></domain>"
 
@@ -180,6 +182,94 @@ class TestPrepareVmXmlTaskExecute:
 
 
 class TestBuildAndStartVmTask:
+    @patch.object(NpuClient, "free_devices", new_callable=AsyncMock)
+    @patch.object(NpuClient, "configure_nics", new_callable=AsyncMock)
+    @patch("ub_device_manager.domain.vm.vm_tasks.wait_h2n_healthy", new_callable=AsyncMock)
+    @patch.object(VMClient, "define_and_start", new_callable=AsyncMock)
+    async def test_missing_prepared_smbios_fails_before_h2n_and_nic_configuration(
+            self, mock_define, mock_wait, mock_configure, mock_free):
+        with pytest.raises(VmXmlBuildFailed, match="prepared host SMBIOS"):
+            await run_task(BuildAndStartVmTask(), {
+                VM_XML_CONTEXT_KEY: VALID_XML,
+                BIND_RESULT_CONTEXT_KEY: make_bind_result(),
+                H2N_NIC_PAIRS_CONTEXT_KEY: [("pfe-guid", "7")],
+                H2N_REQUIRED_CONTEXT_KEY: True,
+            })
+
+        mock_wait.assert_not_awaited()
+        mock_configure.assert_not_awaited()
+        mock_define.assert_not_awaited()
+        mock_free.assert_awaited_once()
+
+    @patch.object(NpuClient, "free_devices", new_callable=AsyncMock)
+    @patch.object(NpuClient, "clear_nic_configs", new_callable=AsyncMock)
+    @patch.object(NpuClient, "configure_nics", new_callable=AsyncMock, return_value=[("eth0", "7")])
+    @patch("ub_device_manager.domain.vm.vm_tasks.wait_h2n_healthy", new_callable=AsyncMock)
+    @patch.object(VMClient, "define_and_start", new_callable=AsyncMock,
+           side_effect=RuntimeError("start failed"))
+    async def test_start_failure_clears_nic_config_and_frees_devices(
+            self, mock_define, mock_wait, mock_configure, mock_clear, mock_free):
+        with pytest.raises(RuntimeError, match="start failed"):
+            await run_task(BuildAndStartVmTask(), {
+                VM_XML_CONTEXT_KEY: "<domain><os><type>hvm</type></os><devices/></domain>",
+                BIND_RESULT_CONTEXT_KEY: make_bind_result(),
+                H2N_NIC_PAIRS_CONTEXT_KEY: [("pfe-guid", "7")],
+                H2N_REQUIRED_CONTEXT_KEY: True,
+                VM_SMBIOS_CONTEXT_KEY: SmbiosType131(0, 1, 2, 1, 3, 4),
+            })
+
+        mock_wait.assert_awaited_once_with(["pfe-guid"])
+        mock_define.assert_awaited_once()
+        mock_clear.assert_awaited_once_with([("eth0", "7")])
+        mock_free.assert_awaited_once()
+
+    @patch.object(NpuClient, "configure_nics", new_callable=AsyncMock, return_value=[("eth0", "7")])
+    @patch("ub_device_manager.domain.vm.vm_tasks.wait_h2n_healthy", new_callable=AsyncMock)
+    @patch.object(VMClient, "define_and_start", new_callable=AsyncMock)
+    async def test_h2n_runs_before_nic_configuration_and_start(self, mock_define, mock_wait, mock_configure):
+        events = []
+        mock_wait.side_effect = lambda guids: events.append("h2n")
+        mock_configure.side_effect = lambda pairs: events.append("configure") or [("eth0", "7")]
+        mock_define.side_effect = lambda xml: events.append("start")
+
+        await run_task(BuildAndStartVmTask(), {
+            VM_XML_CONTEXT_KEY: "<domain><os><type>hvm</type></os><devices/></domain>",
+            BIND_RESULT_CONTEXT_KEY: make_bind_result(),
+            H2N_NIC_PAIRS_CONTEXT_KEY: [("pfe-guid", "7")],
+            H2N_REQUIRED_CONTEXT_KEY: True,
+            VM_SMBIOS_CONTEXT_KEY: SmbiosType131(0, 1, 2, 1, 3, 4),
+        })
+
+        assert events == ["h2n", "configure", "start"]
+
+    @patch.object(NpuClient, "free_devices", new_callable=AsyncMock)
+    @patch.object(NpuClient, "configure_nics", new_callable=AsyncMock)
+    @patch("ub_device_manager.domain.vm.vm_tasks.wait_h2n_healthy", new_callable=AsyncMock,
+           side_effect=TimeoutError("unhealthy"))
+    @patch.object(VMClient, "define_and_start", new_callable=AsyncMock)
+    async def test_first_h2n_timeout_blocks_configuration(self, mock_define, mock_wait, mock_configure, mock_free):
+        events = []
+        mock_free.side_effect = lambda *args, **kwargs: events.append("free")
+        with patch("ub_device_manager.domain.vm.vm_tasks.logger.error") as mock_error:
+            mock_error.side_effect = lambda *args, **kwargs: events.append("log")
+            with pytest.raises(H2NCheckFailed):
+                await run_task(BuildAndStartVmTask(), {
+                    VM_XML_CONTEXT_KEY: VALID_XML,
+                    BIND_RESULT_CONTEXT_KEY: make_bind_result(),
+                    H2N_NIC_PAIRS_CONTEXT_KEY: [("pfe-guid", "7")],
+                    H2N_REQUIRED_CONTEXT_KEY: True,
+                    VM_SMBIOS_CONTEXT_KEY: SmbiosType131(0, 1, 2, 1, 3, 4),
+                })
+
+        assert events == ["log", "free"]
+        mock_error.assert_called_once()
+        assert "pfe_guids={}" in mock_error.call_args.args[0]
+        assert mock_error.call_args.args[1] == ["pfe-guid"]
+        assert "unhealthy" in mock_error.call_args.args[2]
+        mock_configure.assert_not_awaited()
+        mock_define.assert_not_awaited()
+        mock_free.assert_awaited_once()
+
     async def test_missing_xml_raises(self):
         with pytest.raises(VmXmlBuildFailed):
             await run_task(BuildAndStartVmTask())

@@ -48,13 +48,13 @@ typedef enum
     SCHED_POLICY_BEST_EFFORT = 3,
 } schedule_policy_t;
 
-/* swap_priority值越大越优先被换出 */
+/* 换出顺序：0 最先换出，1 默认，2 最后换出；值越小越先换出。 */
 typedef enum
 {
-    SWAP_PRIORITY_HIGH = 0,
-    SWAP_PRIORITY_MEDIUM = 1,
-    SWAP_PRIORITY_LOW = 2,
-} swap_priority_t;
+    SWAP_ORDER_MIN = 0,
+    SWAP_ORDER_DEFAULT = 1,
+    SWAP_ORDER_MAX = 2,
+} swap_order_t;
 
 typedef enum
 {
