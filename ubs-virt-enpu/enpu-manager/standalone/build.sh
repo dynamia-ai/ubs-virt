@@ -27,13 +27,13 @@ CFLAGS=(-Wall -O2 -fPIC)
 CANN_PATH=${ASCEND_HOME_PATH}
 DRIVER_PATH=${ENPU_ASCEND_DRIVER_PATH:-/usr/local/Ascend}
 
-INCLUDES=(-I"${CORE_DIR}/include" -I"${SCRIPT_DIR}/api" -I"${CANN_PATH}/include" -I"${CANN_PATH}/include/experiment")
+INCLUDES=(-I"${CORE_DIR}/../../common/include" -I"${CORE_DIR}/include" -I"${SCRIPT_DIR}/api" -I"${CANN_PATH}/include" -I"${CANN_PATH}/include/experiment")
 LDFLAGS=(-L"${CORE_DIR}/build/output"
     -L"${CANN_PATH}/lib64"
     -L"${DRIVER_PATH}/driver/lib64"
     -L"${DRIVER_PATH}/driver/lib64/driver"
     '-Wl,-rpath,$ORIGIN/../../../core/build/output'
-    -lenpu_manager -lascendcl -ldcmi -lc_sec -lpthread)
+    -lenpu_manager -lascendcl -ldcmi -lc_sec -lcjson -lpthread)
 
 if [[ ! -f "${CORE_LIB}" ]]; then
     echo "[ERROR] Core library not found: ${CORE_LIB}"
@@ -59,9 +59,9 @@ fi
 echo "[OK] enpu-manager -> ${OUTPUT_DIR}/enpu-manager"
 
 echo "[INFO] Building enpu-cli..."
-"${CC}" "${CFLAGS[@]}" -I"${SCRIPT_DIR}/cmd" -I"${CANN_PATH}/include" \
+"${CC}" "${CFLAGS[@]}" -I"${CORE_DIR}/../../common/include" -I"${SCRIPT_DIR}/cmd" -I"${CANN_PATH}/include" \
     "${SCRIPT_DIR}/cmd/cli.c" \
-    -L"${CANN_PATH}/lib64" -lc_sec \
+    -L"${CANN_PATH}/lib64" -lc_sec -luuid \
     -o "${OUTPUT_DIR}/enpu-cli"
 
 if [[ $? -ne 0 ]]; then

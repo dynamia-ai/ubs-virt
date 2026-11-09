@@ -14,15 +14,18 @@
 #define __CONFIG_MANAGER_H__
 
 #include <pthread.h>
+#include "allocation.h"
 #include "common.h"
 
 #define CONFIG_BASE_PATH "/etc/enpu/vcann-rt/"
 #define CONFIG_FILE_NAME "npu_info.config"
+#define CONFIG_ALLOCATIONS_DIR "allocations"
 
 #define OPTION_MEMORY_REQUEST "memory-request"
 #define OPTION_MEMORY_LIMIT "memory-limit"
 
 typedef struct vnpu_config {
+    char allocation_id[ALLOCATION_ID_LEN];
     int32_t phy_npu_id;
     int32_t vnpu_id;
     int32_t aicore_quota;
@@ -45,13 +48,11 @@ extern "C" {
 config_manager_t *config_manager_create(const char *base_path);
 int config_manager_destroy(config_manager_t *mgr);
 
-int config_manager_write_config(config_manager_t *mgr, const char *pod_uid, const char *container_name,
-                                vnpu_config_t *config);
+int config_manager_write_config(config_manager_t *mgr, const char *allocation_id, vnpu_config_t *config);
 
-int config_manager_delete_config(config_manager_t *mgr, const char *pod_uid, const char *container_name);
+int config_manager_delete_config(config_manager_t *mgr, const char *allocation_id);
 
-char *config_manager_get_config_path(config_manager_t *mgr, const char *pod_uid, const char *container_name,
-                                     char *path_buf, int buf_len);
+char *config_manager_get_config_path(config_manager_t *mgr, const char *allocation_id, char *path_buf, int buf_len);
 
 #if defined(__cplusplus)
 }

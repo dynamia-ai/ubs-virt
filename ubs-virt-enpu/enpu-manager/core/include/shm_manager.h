@@ -99,7 +99,7 @@ typedef struct vnpu_shm_entry {
     atomic_uint_fast64_t hbm_used; /* 该 vNPU 所有进程的 hbm_used 之和 (atomic_fetch_add/sub) */
     int32_t sched_policy;
     bool swap_enabled;
-    int32_t swap_priority;
+    int32_t swap_order;
     process_entry_t processes[MAX_PROCESSES_PER_VNPU]; /* 进程注册表（嵌套） */
 } vnpu_shm_entry_t;
 

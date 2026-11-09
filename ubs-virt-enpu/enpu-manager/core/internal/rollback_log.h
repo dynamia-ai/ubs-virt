@@ -39,8 +39,7 @@ typedef struct rollback_step {
     int32_t aicore_delta;
     int64_t hbm_delta;
     int32_t sched_policy;
-    char pod_uid[MAX_UUID_LEN];
-    char container_name[MAX_NAME_LEN];
+    char allocation_id[ALLOCATION_ID_LEN];
     char shm_id[SHM_ID_LEN];
 } rollback_step_t;
 
@@ -57,8 +56,8 @@ rollback_log_t *rollback_log_create(void);
 void rollback_log_destroy(rollback_log_t *log);
 
 int rollback_log_append(rollback_log_t *log, rollback_step_type_t type, int32_t phy_id, int vnpu_id,
-                        int32_t aicore_delta, int64_t hbm_delta, int32_t sched_policy, const char *pod_uid,
-                        const char *container_name, const char *shm_id);
+                        int32_t aicore_delta, int64_t hbm_delta, int32_t sched_policy, const char *allocation_id,
+                        const char *shm_id);
 
 int rollback_log_rollback(rollback_log_t *log, npu_allocator_t *alloc);
 

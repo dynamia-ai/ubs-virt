@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "allocation.h"
+#include "log.h"
 #include "securec.h"
 #include "storage_adapter.h"
 
@@ -19,6 +20,8 @@ struct allocation_registry {
     pthread_mutex_t lock;
     storage_adapter_t *adapter;
 };
+
+static int persist_to_adapter(allocation_registry_t *registry);
 
 allocation_registry_t *allocation_registry_create(void)
 {
@@ -59,15 +62,60 @@ int allocation_registry_destroy(allocation_registry_t *registry)
     return ENPU_SUCCESS;
 }
 
-static int find_entry_index(allocation_registry_t *registry, const char *pod_uid, const char *container_name)
+static int find_entry_index_by_id(allocation_registry_t *registry, const char *allocation_id)
 {
     for (int i = 0; i < registry->count; i++) {
-        if (strcmp(registry->entries[i].pod_uid, pod_uid) == 0 &&
-            strcmp(registry->entries[i].container_name, container_name) == 0) {
+        if (strcmp(registry->entries[i].allocation_id, allocation_id) == 0) {
             return i;
         }
     }
     return -1;
+}
+
+/* The caller must hold registry->lock. The index is valid only on success. */
+static int find_unique_entry_index_by_labels(allocation_registry_t *registry, const char *pod_uid,
+                                             const char *container_name, int *index)
+{
+    int first = -1;
+    for (int i = 0; i < registry->count; i++) {
+        if (strcmp(registry->entries[i].pod_uid, pod_uid) == 0 &&
+            strcmp(registry->entries[i].container_name, container_name) == 0) {
+            if (first >= 0) {
+                return ENPU_ALREADY_EXISTS;
+            }
+            first = i;
+        }
+    }
+    *index = first;
+    return first < 0 ? ENPU_NOT_FOUND : ENPU_SUCCESS;
+}
+
+static int remove_entry(allocation_registry_t *registry, int index)
+{
+    allocation_t removed = registry->entries[index];
+    if (index < registry->count - 1) {
+        size_t move_bytes = (size_t)(registry->count - index - 1) * sizeof(allocation_t);
+        if (memmove_s(&registry->entries[index], move_bytes, &registry->entries[index + 1], move_bytes) != 0) {
+            return ENPU_FAIL;
+        }
+    }
+    registry->count--;
+    int ret = persist_to_adapter(registry);
+    if (ret == ENPU_SUCCESS) {
+        return ENPU_SUCCESS;
+    }
+
+    if (index < registry->count) {
+        size_t move_bytes = (size_t)(registry->count - index) * sizeof(allocation_t);
+        size_t dest_bytes = (size_t)(registry->capacity - index - 1) * sizeof(allocation_t);
+        if (memmove_s(&registry->entries[index + 1], dest_bytes, &registry->entries[index], move_bytes) != 0) {
+            LOG_ERROR("Failed to restore allocation registry after persistence failure");
+            return ret;
+        }
+    }
+    registry->entries[index] = removed;
+    registry->count++;
+    return ret;
 }
 
 static int persist_to_adapter(allocation_registry_t *registry)
@@ -84,18 +132,40 @@ static int persist_to_adapter(allocation_registry_t *registry)
     return storage_adapter_save(registry->adapter, allocs, registry->count);
 }
 
+/* The caller must hold registry->lock. */
+static int update_shm_id_locked(allocation_registry_t *registry, int index, const char *new_shm_id)
+{
+    if (strnlen(new_shm_id, DIE_ID_LEN) >= DIE_ID_LEN) {
+        return ENPU_INVALID_PARAM;
+    }
+
+    allocation_t original = registry->entries[index];
+    if (strcpy_s(registry->entries[index].shm_id, sizeof(registry->entries[index].shm_id), new_shm_id) != 0) {
+        registry->entries[index] = original;
+        return ENPU_FAIL;
+    }
+
+    int ret = persist_to_adapter(registry);
+    if (ret != ENPU_SUCCESS) {
+        registry->entries[index] = original;
+        LOG_ERROR("Failed to persist shm_id update: allocation_id=%s ret=%d", registry->entries[index].allocation_id,
+                  ret);
+    }
+    return ret;
+}
+
 int allocation_registry_register(allocation_registry_t *registry, const allocation_t *allocation)
 {
     if (!registry || !allocation) {
         return ENPU_INVALID_PARAM;
     }
-    if (allocation->pod_uid[0] == '\0' || allocation->container_name[0] == '\0') {
+    if (!allocation_id_is_valid(allocation->allocation_id)) {
         return ENPU_INVALID_PARAM;
     }
 
     pthread_mutex_lock(&registry->lock);
 
-    int idx = find_entry_index(registry, allocation->pod_uid, allocation->container_name);
+    int idx = find_entry_index_by_id(registry, allocation->allocation_id);
     if (idx >= 0) {
         pthread_mutex_unlock(&registry->lock);
         return ENPU_ALREADY_EXISTS;
@@ -127,56 +197,36 @@ int allocation_registry_register(allocation_registry_t *registry, const allocati
     registry->count++;
 
     int ret = persist_to_adapter(registry);
+    if (ret != ENPU_SUCCESS) {
+        registry->count--;
+        (void)memset_s(&registry->entries[registry->count], sizeof(allocation_t), 0, sizeof(allocation_t));
+    }
 
     pthread_mutex_unlock(&registry->lock);
     return ret;
 }
 
-int allocation_registry_release(allocation_registry_t *registry, const char *pod_uid, const char *container_name)
+int allocation_registry_release_by_id(allocation_registry_t *registry, const char *allocation_id)
 {
-    if (!registry || !pod_uid || !container_name) {
+    if (!registry || !allocation_id_is_valid(allocation_id)) {
         return ENPU_INVALID_PARAM;
     }
-
     pthread_mutex_lock(&registry->lock);
-
-    int idx = find_entry_index(registry, pod_uid, container_name);
-    if (idx < 0) {
-        pthread_mutex_unlock(&registry->lock);
-        return ENPU_NOT_FOUND;
-    }
-
-    if (idx < registry->count - 1) {
-        size_t move_bytes = (size_t)(registry->count - idx - 1) * sizeof(allocation_t);
-        memmove_s(&registry->entries[idx], move_bytes, &registry->entries[idx + 1], move_bytes);
-    }
-    registry->count--;
-
-    int ret = persist_to_adapter(registry);
-
+    int idx = find_entry_index_by_id(registry, allocation_id);
+    int ret = idx < 0 ? ENPU_NOT_FOUND : remove_entry(registry, idx);
     pthread_mutex_unlock(&registry->lock);
     return ret;
 }
 
-int allocation_registry_update_shm_id(allocation_registry_t *registry, const char *pod_uid, const char *container_name,
-                                      const char *new_shm_id)
+int allocation_registry_update_shm_id_by_id(allocation_registry_t *registry, const char *allocation_id,
+                                            const char *new_shm_id)
 {
-    if (!registry || !pod_uid || !container_name || !new_shm_id) {
+    if (!registry || !allocation_id_is_valid(allocation_id) || !new_shm_id) {
         return ENPU_INVALID_PARAM;
     }
-
     pthread_mutex_lock(&registry->lock);
-
-    int idx = find_entry_index(registry, pod_uid, container_name);
-    if (idx < 0) {
-        pthread_mutex_unlock(&registry->lock);
-        return ENPU_NOT_FOUND;
-    }
-
-    strncpy_s(registry->entries[idx].shm_id, DIE_ID_LEN, new_shm_id, DIE_ID_LEN - 1);
-
-    int ret = persist_to_adapter(registry);
-
+    int idx = find_entry_index_by_id(registry, allocation_id);
+    int ret = idx < 0 ? ENPU_NOT_FOUND : update_shm_id_locked(registry, idx, new_shm_id);
     pthread_mutex_unlock(&registry->lock);
     return ret;
 }
@@ -190,16 +240,31 @@ int allocation_registry_get(allocation_registry_t *registry, const char *pod_uid
 
     pthread_mutex_lock(&registry->lock);
 
-    int idx = find_entry_index(registry, pod_uid, container_name);
-    if (idx < 0) {
+    int idx;
+    int ret = find_unique_entry_index_by_labels(registry, pod_uid, container_name, &idx);
+    if (ret != ENPU_SUCCESS) {
         pthread_mutex_unlock(&registry->lock);
-        return ENPU_NOT_FOUND;
+        return ret;
     }
 
     memcpy_s(allocation, sizeof(allocation_t), &registry->entries[idx], sizeof(allocation_t));
 
     pthread_mutex_unlock(&registry->lock);
     return ENPU_SUCCESS;
+}
+
+int allocation_registry_get_by_id(allocation_registry_t *registry, const char *allocation_id, allocation_t *allocation)
+{
+    if (!registry || !allocation_id_is_valid(allocation_id) || !allocation) {
+        return ENPU_INVALID_PARAM;
+    }
+    pthread_mutex_lock(&registry->lock);
+    int idx = find_entry_index_by_id(registry, allocation_id);
+    if (idx >= 0) {
+        *allocation = registry->entries[idx];
+    }
+    pthread_mutex_unlock(&registry->lock);
+    return idx < 0 ? ENPU_NOT_FOUND : ENPU_SUCCESS;
 }
 
 int allocation_registry_list(allocation_registry_t *registry, allocation_t *allocations, int *count)
@@ -291,6 +356,27 @@ int allocation_registry_recover(allocation_registry_t *registry)
         pthread_mutex_unlock(&registry->lock);
         return ret;
     }
+    if (count < 0 || count > MAX_ALLOC_COUNT) {
+        LOG_ERROR("Invalid allocation count in checkpoint: count=%d", count);
+        pthread_mutex_unlock(&registry->lock);
+        return ENPU_FAIL;
+    }
+
+    for (int i = 0; i < count; ++i) {
+        if (!allocation_id_is_valid(loaded[i].allocation_id)) {
+            LOG_ERROR("Invalid allocation_id in checkpoint: index=%d value=%s", i, loaded[i].allocation_id);
+            pthread_mutex_unlock(&registry->lock);
+            return ENPU_FAIL;
+        }
+        for (int j = 0; j < i; ++j) {
+            if (strcmp(loaded[i].allocation_id, loaded[j].allocation_id) == 0) {
+                LOG_ERROR("Duplicate allocation_id in checkpoint: index=%d previous=%d value=%s", i, j,
+                          loaded[i].allocation_id);
+                pthread_mutex_unlock(&registry->lock);
+                return ENPU_FAIL;
+            }
+        }
+    }
 
     if (count > registry->capacity) {
         int new_capacity = count;
@@ -306,8 +392,11 @@ int allocation_registry_recover(allocation_registry_t *registry)
         registry->capacity = new_capacity;
     }
 
-    memcpy_s(registry->entries, (size_t)registry->capacity * sizeof(allocation_t), loaded,
-             (size_t)count * sizeof(allocation_t));
+    if (count > 0 && memcpy_s(registry->entries, (size_t)registry->capacity * sizeof(allocation_t), loaded,
+                              (size_t)count * sizeof(allocation_t)) != 0) {
+        pthread_mutex_unlock(&registry->lock);
+        return ENPU_FAIL;
+    }
     registry->count = count;
 
     pthread_mutex_unlock(&registry->lock);

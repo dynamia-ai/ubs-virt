@@ -7,7 +7,8 @@ set(CMAKE_SKIP_RPATH TRUE)
 
 message(STATUS "Building enpu-manager")
 
-file(GLOB_RECURSE SRC_FILES src/*.c)
+file(GLOB_RECURSE SRC_FILES CONFIGURE_DEPENDS src/*.c)
+list(APPEND SRC_FILES ${CMAKE_CURRENT_SOURCE_DIR}/../../common/src/allocation_id.c)
 file(GLOB_RECURSE HEADER_FILES include/*.h)
 
 set(COMPILE_OPTIONS
@@ -19,7 +20,14 @@ set(COMPILE_OPTIONS
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/scripts/cmake/securec.cmake)
 
-set(LINK_LIBS pthread rt dl cjson ascendcl c_sec)
+find_path(UUID_INCLUDE_DIR NAMES uuid/uuid.h)
+find_library(UUID_LIBRARY NAMES uuid)
+if(NOT UUID_INCLUDE_DIR OR NOT UUID_LIBRARY)
+    message(FATAL_ERROR "libuuid development files not found; install libuuid-devel (RPM) or uuid-dev (Debian)")
+endif()
+message(STATUS "Found libuuid: ${UUID_LIBRARY}")
+
+set(LINK_LIBS pthread rt cjson ${UUID_LIBRARY} ascendcl c_sec)
 
 if(DEFINED ENV{ASCEND_HOME_PATH})
     message(STATUS "CANN environment detected: $ENV{ASCEND_HOME_PATH}")
@@ -62,8 +70,10 @@ target_include_directories(enpu_manager
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/internal>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../common/include>
         $<INSTALL_INTERFACE:include>
 )
+target_include_directories(enpu_manager SYSTEM PRIVATE ${UUID_INCLUDE_DIR})
 
 if(CANN_ENABLED)
     target_include_directories(enpu_manager SYSTEM PRIVATE ${INCLUDE_DIRS})
