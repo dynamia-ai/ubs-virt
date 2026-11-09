@@ -243,13 +243,16 @@ def test_http_creation_uses_fe_numa_but_passes_through_vfe_guids(environment):
         {'device_type': 'NIC_PFE', 'device_id': '1-11-3'},
         {'device_type': 'NIC_VFE', 'device_id': '1-11-3-49'},
         {'device_type': 'P_IDEV', 'device_id': '00020'},
-    ]), FakeUbseDevice('NIC_VFE', '1-11-3-49', nic_guid)]
+    ]), FakeUbseDevice('NIC_PFE', '1-11-3', 'pfe-guid'),
+        FakeUbseDevice('NIC_VFE', '1-11-3-49', nic_guid)]
     conn = FakeConnection(define_domain=FakeDomain())
     xml = memory_xml().replace('<domain>', '<domain><os><type>hvm</type></os>')
     with patch('libvirt.open', return_value=conn), \
          patch('ubse.ubs_engine_npu.get_host_ub_devices', return_value=inventory), \
          patch('ubse.ubs_engine_npu.alloc_devices', return_value=('bus-1', None)) as allocate, \
          patch('ubse.ubs_engine_npu.query_uba_tid_size', return_value=(1, 2, 3)), \
+         patch('ubse.ubs_engine_npu.get_product_type', return_value=1), \
+         patch('ub_device_manager.domain.npu.npu_client.NpuClient.configure_nics', new_callable=AsyncMock), \
          patch('ub_device_manager.domain.npu.npu_tasks.HostTopologyProvider', return_value=provider), \
          patch('ub_device_manager.domain.vm.vm_smbios.VmSmbios.get_type131',
                return_value=SmbiosType131(0, 65535, 255, 1, 16383, 3)):

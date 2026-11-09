@@ -82,7 +82,37 @@ async def test_load_settings_reads_the_resolved_toml_file(tmp_path):
     toml_file.write_text('[log]\nlevel = "DEBUG"\n', encoding="utf-8")
 
     with patch.object(config, "resolve_config_path", return_value=str(toml_file)):
-        assert config.load_settings() == {"log": {"level": "DEBUG"}}
+        loaded = config.load_settings()
+
+    assert loaded["log"] == {"level": "DEBUG"}
+    assert loaded["h2n"]["mode"] is config.H2NMode.SERVER_TYPE
+
+
+@pytest.mark.parametrize("mode", ["disabled", "all", "server_type"])
+def test_h2n_mode_is_normalized(mode):
+    assert config.validate_h2n_settings({"mode": mode})["mode"] is config.H2NMode(mode)
+
+
+@pytest.mark.parametrize("raw, message", [
+    ({"mode": "unknown"}, "h2n.mode"),
+    ({"wait_timeout": 0}, "h2n.wait_timeout"),
+    ({"poll_interval": True}, "h2n.poll_interval"),
+    ({"healthy_stable_duration": 11, "wait_timeout": 10}, "exceeds wait_timeout"),
+    ({"sysfs_root": ""}, "h2n.sysfs_root"),
+    ("invalid", "h2n must be a TOML table"),
+])
+def test_h2n_invalid_settings_fail(raw, message):
+    with pytest.raises(ValueError, match=message):
+        config.validate_h2n_settings(raw)
+
+
+def test_load_settings_rejects_invalid_h2n_before_requests(tmp_path):
+    toml_file = tmp_path / "settings.toml"
+    toml_file.write_text('[h2n]\nmode = "invalid"\n', encoding="utf-8")
+
+    with patch.object(config, "resolve_config_path", return_value=str(toml_file)):
+        with pytest.raises(ValueError, match="h2n.mode"):
+            config.load_settings()
 
 
 async def test_module_level_config_is_a_dict():

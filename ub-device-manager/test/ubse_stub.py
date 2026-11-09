@@ -54,7 +54,7 @@ def install():
 
     # ---- ubse.ubs_engine_npu -------------------------------------------------
     npu_mod = _new_module("ubse.ubs_engine_npu")
-    for name in ("get_host_ub_devices", "alloc_devices", "query_uba_tid_size", "free_devices"):
+    for name in ("get_host_ub_devices", "get_product_type", "alloc_devices", "query_uba_tid_size", "free_devices"):
         setattr(npu_mod, name, _not_implemented)
     ubse.ubs_engine_npu = npu_mod
 

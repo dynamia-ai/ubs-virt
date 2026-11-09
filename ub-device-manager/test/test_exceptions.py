@@ -46,6 +46,9 @@ class TestUbDmHttpException:
         (exc.UnbindDeviceFailed, 534, "call UBSE free_devices failed"),
         (exc.InvalidBindDeviceRequest, 400, "invalid bind ub device request"),
         (exc.ResolveNpuDevicesFailed, 545, "resolve npu devices failed"),
+        (exc.H2NRequirementFailed, 546, "failed to determine whether H2N check is required."),
+        (exc.H2NCheckFailed, 547, "H2N link did not become healthy."),
+        (exc.NicConfigurationFailed, 549, "NIC MAC/VFE configuration failed."),
         (exc.InvalidUnbindDeviceRequest, 400, "invalid unbind ub device request"),
         (exc.UnbindDeviceNotFound, 548, "no ub devices found for the bus instance"),
         (exc.SsuNotFound, 404, "ssu resource not found"),
@@ -64,3 +67,15 @@ async def test_detail_argument_overrides_default_message():
 
     assert error.status_code == 543
     assert error.detail == "custom detail"
+
+
+@pytest.mark.parametrize("detail", ["device unavailable", "device unavailable."])
+def test_ensure_terminal_period(detail):
+    assert exc.ensure_terminal_period(detail) == "device unavailable."
+
+
+@pytest.mark.parametrize("exception_cls", [
+    exc.H2NRequirementFailed, exc.H2NCheckFailed, exc.NicConfigurationFailed,
+])
+def test_h2n_exception_default_message_has_period(exception_cls):
+    assert exception_cls().detail.endswith(".")

@@ -82,6 +82,40 @@ class TestCountSelection:
 
 
 class TestNicAffinity:
+    async def test_resolves_selected_pfe_vfe_pair(self, selector):
+        inventory = [
+            make_device("0-1", affinity=[("2-1", "NIC_PFE"), ("1-7", "NIC_VFE")]),
+            make_device("2-1", device_type="NIC_PFE"),
+            make_device("1-7", device_type="NIC_VFE"),
+        ]
+        selected = selector.resolve_npu_devices(inventory, ids=["0-1"], need_nic=True)
+
+        assert selector.resolve_nic_pairs(inventory, selected) == [("guid-2-1", "7")]
+
+    async def test_rejects_missing_pfe(self, selector):
+        inventory = [
+            make_device("0-1", affinity=[("1-7", "NIC_VFE")]),
+            make_device("1-7", device_type="NIC_VFE"),
+        ]
+        selected = selector.resolve_npu_devices(inventory, ids=["0-1"], need_nic=True)
+
+        with pytest.raises(ValueError, match="H2N affinity"):
+            selector.resolve_nic_pairs(inventory, selected)
+
+    @pytest.mark.parametrize("duplicate_type", ["NIC_PFE", "NIC_VFE"])
+    async def test_rejects_duplicate_affinity_record(self, selector, duplicate_type):
+        affinity = [("2-1", "NIC_PFE"), ("1-7", "NIC_VFE")]
+        duplicate = next(item for item in affinity if item[1] == duplicate_type)
+        inventory = [
+            make_device("0-1", affinity=[*affinity, duplicate]),
+            make_device("2-1", device_type="NIC_PFE"),
+            make_device("1-7", device_type="NIC_VFE"),
+        ]
+        selected = selector.resolve_npu_devices(inventory, ids=["0-1"], need_nic=True)
+
+        with pytest.raises(ValueError, match="H2N affinity"):
+            selector.resolve_nic_pairs(inventory, selected)
+
     async def test_need_nic_appends_affinity_nic(self, selector):
         inventory = [
             make_device("0-1", affinity=[("1-1", "NIC_VFE")]),

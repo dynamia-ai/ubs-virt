@@ -20,3 +20,11 @@ stdout = false
 [vm]
 # Maximum allowed size of the input VM XML, either as xml_text or via xml_path.
 max_xml_size = "1 MB"
+
+[h2n]
+mode = "server_type"
+wait_timeout = 300
+poll_interval = 2
+probe_timeout = 3
+healthy_stable_duration = 10
+sysfs_root = "/sys/bus/ub/devices"

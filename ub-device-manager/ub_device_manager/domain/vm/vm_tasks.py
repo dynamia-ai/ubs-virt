@@ -21,11 +21,17 @@ from pydantic import BaseModel
 from ub_device_manager.app.models import BindNpuDeviceRequest, CreateVmRequest
 from ub_device_manager.common.async_task_framework import AsyncTask
 from ub_device_manager.common.config import CONFIG, parse_size
-from ub_device_manager.exceptions import InvalidCreateVmRequest, VmXmlBuildFailed, VmXmlTooLarge
+from ub_device_manager.exceptions import (
+    H2NCheckFailed, InvalidCreateVmRequest, NicConfigurationFailed, VmXmlBuildFailed, VmXmlTooLarge,
+    ensure_terminal_period,
+)
 from ub_device_manager.domain.npu.npu_client import NpuClient
+from ub_device_manager.domain.npu.h2n import wait_h2n_healthy
 from ub_device_manager.constants import (
     BIND_REQUEST_CONTEXT_KEY,
     BIND_RESULT_CONTEXT_KEY,
+    H2N_NIC_PAIRS_CONTEXT_KEY,
+    H2N_REQUIRED_CONTEXT_KEY,
     CREATE_VM_REQUEST_CONTEXT_KEY,
     DELETE_VM_CONTEXT_KEY,
     UNBIND_REQUEST_CONTEXT_KEY,
@@ -194,18 +200,31 @@ class BuildAndStartVmTask(AsyncTask):
             {"device_id": device.id, "device_type": device.type}
             for device in bind_result.devices
         ]
+        nic_pairs = self.context.get(H2N_NIC_PAIRS_CONTEXT_KEY) or []
+        h2n_required = self.context.get(H2N_REQUIRED_CONTEXT_KEY) is True
+        configured_nics = []
         try:
             smbios_type131 = self.context.get(VM_SMBIOS_CONTEXT_KEY)
             if not isinstance(smbios_type131, SmbiosType131):
                 raise VmXmlBuildFailed("prepared host SMBIOS Type 131 not found in task context")
+            if nic_pairs and h2n_required:
+                await self._check_h2n(nic_pairs)
+            if nic_pairs:
+                try:
+                    configured_nics = await self.npu_client.configure_nics(nic_pairs)
+                except Exception as exc:
+                    raise NicConfigurationFailed(ensure_terminal_period(str(exc))) from exc
             final_xml = self.xml_builder.build(xml, bind_result, smbios_type131=smbios_type131)
             await self.vm_client.define_and_start(final_xml)
-        except Exception:
+        except BaseException:
             # Preserve the original failure if rollback also fails.
+            if configured_nics:
+                await self.npu_client.clear_nic_configs(configured_nics)
             try:
                 await self.npu_client.free_devices(bind_result.bus_guid, device_list)
-            except Exception:
-                logger.error("Rollback allocated UB devices failed, bus_guid: {}", bind_result.bus_guid)
+            except Exception as exc:
+                logger.error("Rollback allocated UB devices failed, bus_guid: {}, error: {}.",
+                             bind_result.bus_guid, exc)
             raise
 
         logger.info(
@@ -213,6 +232,18 @@ class BuildAndStartVmTask(AsyncTask):
             device_list,
             bind_result.bus_guid,
         )
+
+    @staticmethod
+    async def _check_h2n(nic_pairs: list[tuple[str, str]]) -> None:
+        try:
+            await wait_h2n_healthy([guid for guid, _ in nic_pairs])
+        except TimeoutError as exc:
+            detail = ensure_terminal_period(f"H2N check failed before NIC configuration: {exc}")
+            logger.error(
+                "H2N check failed before NIC configuration: pfe_guids={}, reason={}",
+                [guid for guid, _ in nic_pairs], ensure_terminal_period(str(exc)),
+            )
+            raise H2NCheckFailed(detail) from exc
 
 
 class DeleteVmTask(AsyncTask):
