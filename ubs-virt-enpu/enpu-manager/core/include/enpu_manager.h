@@ -38,13 +38,14 @@ typedef struct swap_buffer_manager swap_buffer_manager_t;
 typedef struct swap_resolver swap_resolver_t;
 
 typedef struct alloc_request {
-    char pod_uid[MAX_UUID_LEN];        /* 可选；未指定时默认 pod-<phy_id> */
-    char container_name[MAX_NAME_LEN]; /* 可选；未指定时默认 container-<phy_id>-<vnpu_id> */
+    char allocation_id[ALLOCATION_ID_LEN]; /* Optional; generated when empty. */
+    char pod_uid[MAX_UUID_LEN];            /* Optional metadata. */
+    char container_name[MAX_NAME_LEN];     /* Optional metadata. */
     int32_t aicore_quota;
     uint64_t hbm_quota;
     uint64_t hbm_limit;
     int32_t sched_policy;
-    int32_t swap_priority;
+    int32_t swap_order;
     int32_t vnpu_priority;
     int32_t predicate_phy_id; /* -1=自动选择；>=0直接分配到指定物理卡 */
     char predicate_node[MAX_NAME_LEN];
@@ -53,10 +54,12 @@ typedef struct alloc_request {
 } alloc_request_t;
 
 typedef struct alloc_response {
+    char allocation_id[ALLOCATION_ID_LEN];
+    char config_path[MAX_PATH_LEN];
     int32_t phy_id;
     int32_t vnpu_id;
-    char pod_uid[MAX_UUID_LEN];        /* 回显实际使用的 pod_uid（含默认值） */
-    char container_name[MAX_NAME_LEN]; /* 回显实际使用的 container_name（含默认值） */
+    char pod_uid[MAX_UUID_LEN];
+    char container_name[MAX_NAME_LEN];
     char die_id[DIE_ID_LEN];
     char shm_id[SHM_ID_LEN];
     int32_t aicore_quota;
@@ -138,6 +141,7 @@ int enpu_manager_stop(enpu_manager_t *mgr);
 int enpu_manager_destroy(enpu_manager_t *mgr);
 
 int enpu_manager_allocate(enpu_manager_t *mgr, alloc_request_t *req, alloc_response_t *resp);
+int enpu_manager_release_by_id(enpu_manager_t *mgr, const char *allocation_id);
 int enpu_manager_release(enpu_manager_t *mgr, const char *pod_uid, const char *container_name);
 int enpu_manager_release_all(enpu_manager_t *mgr, int *released_count);
 

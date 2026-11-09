@@ -10,7 +10,9 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <unistd.h>
 #include "common.h"
+#include "log.h"
 #include "securec.h"
 #include "storage_adapter.h"
 
@@ -74,6 +76,7 @@ static int file_adapter_save(storage_adapter_t *adapter, allocation_t **allocs, 
             return ENPU_NO_RESOURCE;
         }
 
+        cJSON_AddStringToObject(item, "allocation_id", alloc->allocation_id);
         cJSON_AddStringToObject(item, "pod_uid", alloc->pod_uid);
         cJSON_AddStringToObject(item, "container_name", alloc->container_name);
         cJSON_AddNumberToObject(item, "phy_id", alloc->phy_id);
@@ -84,7 +87,7 @@ static int file_adapter_save(storage_adapter_t *adapter, allocation_t **allocs, 
         cJSON_AddNumberToObject(item, "hbm_quota", alloc->hbm_quota);
         cJSON_AddNumberToObject(item, "hbm_limit", alloc->hbm_limit);
         cJSON_AddNumberToObject(item, "sched_policy", alloc->sched_policy);
-        cJSON_AddNumberToObject(item, "swap_priority", alloc->swap_priority);
+        cJSON_AddNumberToObject(item, "swap_order", alloc->swap_order);
         cJSON_AddNumberToObject(item, "vnpu_priority", alloc->vnpu_priority);
         cJSON_AddNumberToObject(item, "create_time_ns", alloc->create_time_ns);
         cJSON_AddNumberToObject(item, "update_time_ns", alloc->update_time_ns);
@@ -107,18 +110,53 @@ static int file_adapter_save(storage_adapter_t *adapter, allocation_t **allocs, 
         return ENPU_FAIL;
     }
 
-    FILE *fp = fopen(data->path, "w");
-    if (!fp) {
+    char temp_path[MAX_PATH_LEN + 32];
+    if (snprintf_s(temp_path, sizeof(temp_path), sizeof(temp_path) - 1, "%s.tmp.XXXXXX", data->path) < 0) {
+        LOG_ERROR("Failed to build checkpoint temporary path: target=%s", data->path);
         free(json_str);
         return ENPU_FAIL;
     }
 
-    if (fprintf(fp, "%s\n", json_str) < 0) {
-        fclose(fp);
+    int temp_fd = mkstemp(temp_path);
+    if (temp_fd < 0) {
+        LOG_ERROR("Failed to create checkpoint temporary file: target=%s error=%s", data->path, strerror(errno));
         free(json_str);
         return ENPU_FAIL;
     }
+    FILE *fp = fdopen(temp_fd, "w");
+    if (fp == NULL) {
+        int saved_errno = errno;
+        close(temp_fd);
+        (void)unlink(temp_path);
+        LOG_ERROR("Failed to open checkpoint temporary stream: target=%s error=%s", data->path, strerror(saved_errno));
+        free(json_str);
+        return ENPU_FAIL;
+    }
+
+    int write_ret = ENPU_SUCCESS;
+    int write_errno = 0;
+    if (fprintf(fp, "%s\n", json_str) < 0 || fflush(fp) != 0 || fsync(temp_fd) != 0) {
+        write_ret = ENPU_FAIL;
+        write_errno = errno;
+    }
     if (fclose(fp) != 0) {
+        write_ret = ENPU_FAIL;
+        if (write_errno == 0) {
+            write_errno = errno;
+        }
+    }
+    if (write_ret != ENPU_SUCCESS) {
+        (void)unlink(temp_path);
+        LOG_ERROR("Failed to persist checkpoint temporary file: target=%s error=%s", data->path,
+                  write_errno == 0 ? "I/O error" : strerror(write_errno));
+        free(json_str);
+        return ENPU_FAIL;
+    }
+
+    if (rename(temp_path, data->path) != 0) {
+        int saved_errno = errno;
+        (void)unlink(temp_path);
+        LOG_ERROR("Failed to atomically replace checkpoint: target=%s error=%s", data->path, strerror(saved_errno));
         free(json_str);
         return ENPU_FAIL;
     }
@@ -201,12 +239,13 @@ static int file_adapter_load(storage_adapter_t *adapter, allocation_t *allocs, i
             continue;
         }
 
-        allocation_t *alloc = &allocs[i];
+        allocation_t *alloc = &allocs[*count];
         if (memset_s(alloc, sizeof(allocation_t), 0, sizeof(allocation_t)) != 0) {
             cJSON_Delete(root);
             return ENPU_FAIL;
         }
 
+        cJSON *allocation_id = cJSON_GetObjectItem(item, "allocation_id");
         cJSON *pod_uid = cJSON_GetObjectItem(item, "pod_uid");
         cJSON *container_name = cJSON_GetObjectItem(item, "container_name");
         cJSON *phy_id = cJSON_GetObjectItem(item, "phy_id");
@@ -217,7 +256,7 @@ static int file_adapter_load(storage_adapter_t *adapter, allocation_t *allocs, i
         cJSON *hbm_quota = cJSON_GetObjectItem(item, "hbm_quota");
         cJSON *hbm_limit = cJSON_GetObjectItem(item, "hbm_limit");
         cJSON *sched_policy = cJSON_GetObjectItem(item, "sched_policy");
-        cJSON *swap_priority = cJSON_GetObjectItem(item, "swap_priority");
+        cJSON *swap_order = cJSON_GetObjectItem(item, "swap_order");
         cJSON *vnpu_priority = cJSON_GetObjectItem(item, "vnpu_priority");
         cJSON *create_time_ns = cJSON_GetObjectItem(item, "create_time_ns");
         cJSON *update_time_ns = cJSON_GetObjectItem(item, "update_time_ns");
@@ -225,6 +264,12 @@ static int file_adapter_load(storage_adapter_t *adapter, allocation_t *allocs, i
         cJSON *swap_size = cJSON_GetObjectItem(item, "swap_size");
         cJSON *swapped = cJSON_GetObjectItem(item, "swapped");
 
+        if (!cJSON_IsString(allocation_id) || !allocation_id_is_valid(allocation_id->valuestring) ||
+            strcpy_s(alloc->allocation_id, sizeof(alloc->allocation_id), allocation_id->valuestring) != 0) {
+            cJSON_Delete(root);
+            *count = 0;
+            return ENPU_FAIL;
+        }
         if (pod_uid && pod_uid->valuestring) {
             if (strncpy_s(alloc->pod_uid, MAX_UUID_LEN, pod_uid->valuestring, MAX_UUID_LEN - 1) != 0) {
                 cJSON_Delete(root);
@@ -275,11 +320,15 @@ static int file_adapter_load(storage_adapter_t *adapter, allocation_t *allocs, i
         } else {
             alloc->vnpu_priority = VNPU_PRIORITY_NORMAL;
         }
-        if (swap_priority && swap_priority->valueint >= SWAP_PRIORITY_HIGH &&
-            swap_priority->valueint <= SWAP_PRIORITY_LOW) {
-            alloc->swap_priority = swap_priority->valueint;
-        } else {
-            alloc->swap_priority = SWAP_PRIORITY_MEDIUM;
+        alloc->swap_order = SWAP_ORDER_DEFAULT;
+        if (swap_order != NULL) {
+            if (!cJSON_IsNumber(swap_order) || swap_order->valuedouble != (double)swap_order->valueint ||
+                swap_order->valueint < SWAP_ORDER_MIN || swap_order->valueint > SWAP_ORDER_MAX) {
+                cJSON_Delete(root);
+                *count = 0;
+                return ENPU_FAIL;
+            }
+            alloc->swap_order = swap_order->valueint;
         }
         if (create_time_ns) {
             alloc->create_time_ns = (uint64_t)create_time_ns->valuedouble;

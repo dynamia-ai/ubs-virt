@@ -71,6 +71,7 @@ static int generate_config_content(vnpu_config_t *config, char *content, int max
     }
 
     written = snprintf_s(content, max_len, max_len - 1,
+                         "allocation-id=%s\n"
                          "physical-npu-id=%d\n"
                          "virtual-npu-id=%d\n"
                          "aicore-quota=%d\n"
@@ -79,8 +80,9 @@ static int generate_config_content(vnpu_config_t *config, char *content, int max
                          "shm-id=%s\n"
                          "scheduling-policy=%d\n"
                          "vnpu_priority=%d\n",
-                         config->phy_npu_id, config->vnpu_id, config->aicore_quota, config->memory_request,
-                         config->memory_limit, config->shm_id, config->scheduling_policy, config->vnpu_priority);
+                         config->allocation_id, config->phy_npu_id, config->vnpu_id, config->aicore_quota,
+                         config->memory_request, config->memory_limit, config->shm_id, config->scheduling_policy,
+                         config->vnpu_priority);
 
     if (written < 0) {
         return ENPU_FAIL;
@@ -119,6 +121,7 @@ static int write_file_content(const char *path, const char *content)
 config_manager_t *config_manager_create(const char *base_path)
 {
     config_manager_t *mgr = NULL;
+    char allocations_path[MAX_DIR_PATH_LEN];
     size_t len = 0;
 
     mgr = (config_manager_t *)malloc(sizeof(config_manager_t));
@@ -160,6 +163,14 @@ config_manager_t *config_manager_create(const char *base_path)
         return NULL;
     }
 
+    if (snprintf_s(allocations_path, sizeof(allocations_path), sizeof(allocations_path) - 1, "%s%s", mgr->base_path,
+                   CONFIG_ALLOCATIONS_DIR) < 0 ||
+        create_dir_recursive(allocations_path) != ENPU_SUCCESS) {
+        pthread_mutex_destroy(&mgr->lock);
+        free(mgr);
+        return NULL;
+    }
+
     return mgr;
 }
 
@@ -175,22 +186,22 @@ int config_manager_destroy(config_manager_t *mgr)
     return ENPU_SUCCESS;
 }
 
-int config_manager_write_config(config_manager_t *mgr, const char *pod_uid, const char *container_name,
-                                vnpu_config_t *config)
+int config_manager_write_config(config_manager_t *mgr, const char *allocation_id, vnpu_config_t *config)
 {
     char dir_path[MAX_DIR_PATH_LEN];
     char file_path[MAX_DIR_PATH_LEN];
     char content[MAX_CONFIG_CONTENT_LEN];
     int ret = ENPU_SUCCESS;
 
-    if (mgr == NULL || pod_uid == NULL || container_name == NULL || config == NULL) {
+    if (mgr == NULL || !allocation_id_is_valid(allocation_id) || config == NULL ||
+        strcmp(config->allocation_id, allocation_id) != 0) {
         return ENPU_INVALID_PARAM;
     }
 
     pthread_mutex_lock(&mgr->lock);
 
-    if (snprintf_s(dir_path, sizeof(dir_path), sizeof(dir_path) - 1, "%s%s/%s", mgr->base_path, pod_uid,
-                   container_name) < 0) {
+    if (snprintf_s(dir_path, sizeof(dir_path), sizeof(dir_path) - 1, "%s%s/%s", mgr->base_path, CONFIG_ALLOCATIONS_DIR,
+                   allocation_id) < 0) {
         pthread_mutex_unlock(&mgr->lock);
         return ENPU_FAIL;
     }
@@ -218,27 +229,27 @@ int config_manager_write_config(config_manager_t *mgr, const char *pod_uid, cons
         return ret;
     }
 
-    LOG_INFO("npu_info.config generated: %s (pod=%s, container=%s, vnpu_id=%d)", file_path, pod_uid, container_name,
+    LOG_INFO("npu_info.config generated: path=%s allocation_id=%s vnpu_id=%d", file_path, allocation_id,
              config->vnpu_id);
 
     pthread_mutex_unlock(&mgr->lock);
     return ENPU_SUCCESS;
 }
 
-int config_manager_delete_config(config_manager_t *mgr, const char *pod_uid, const char *container_name)
+int config_manager_delete_config(config_manager_t *mgr, const char *allocation_id)
 {
     char dir_path[MAX_DIR_PATH_LEN];
     char file_path[MAX_DIR_PATH_LEN];
     int ret = ENPU_SUCCESS;
 
-    if (mgr == NULL || pod_uid == NULL || container_name == NULL) {
+    if (mgr == NULL || !allocation_id_is_valid(allocation_id)) {
         return ENPU_INVALID_PARAM;
     }
 
     pthread_mutex_lock(&mgr->lock);
 
-    if (snprintf_s(dir_path, sizeof(dir_path), sizeof(dir_path) - 1, "%s%s/%s", mgr->base_path, pod_uid,
-                   container_name) < 0) {
+    if (snprintf_s(dir_path, sizeof(dir_path), sizeof(dir_path) - 1, "%s%s/%s", mgr->base_path, CONFIG_ALLOCATIONS_DIR,
+                   allocation_id) < 0) {
         pthread_mutex_unlock(&mgr->lock);
         return ENPU_FAIL;
     }
@@ -249,33 +260,29 @@ int config_manager_delete_config(config_manager_t *mgr, const char *pod_uid, con
     }
 
     if (unlink(file_path) != 0 && errno != ENOENT) {
+        LOG_ERROR("Failed to delete config file: path=%s errno=%d", file_path, errno);
         ret = ENPU_FAIL;
     }
 
-    if (rmdir(dir_path) != 0 && errno != ENOENT) {}
-
-    char parent_path[MAX_DIR_PATH_LEN];
-    ret = snprintf_s(parent_path, sizeof(parent_path), sizeof(parent_path) - 1, "%s%s", mgr->base_path, pod_uid);
-    if (ret < 0) {
-        pthread_mutex_unlock(&mgr->lock);
-        return ENPU_FAIL;
-    }
-    if (rmdir(parent_path) != 0 && errno != ENOENT && errno != ENOTEMPTY) {
-        // 真正异常（权限等）才记
+    if (rmdir(dir_path) != 0 && errno != ENOENT) {
+        LOG_ERROR("Failed to delete config directory: path=%s errno=%d", dir_path, errno);
+        ret = ENPU_FAIL;
     }
 
     pthread_mutex_unlock(&mgr->lock);
+    if (ret == ENPU_SUCCESS) {
+        LOG_INFO("npu_info.config deleted: allocation_id=%s", allocation_id);
+    }
     return ret;
 }
 
-char *config_manager_get_config_path(config_manager_t *mgr, const char *pod_uid, const char *container_name,
-                                     char *path_buf, int buf_len)
+char *config_manager_get_config_path(config_manager_t *mgr, const char *allocation_id, char *path_buf, int buf_len)
 {
-    if (mgr == NULL || pod_uid == NULL || container_name == NULL || path_buf == NULL || buf_len <= 0) {
+    if (mgr == NULL || !allocation_id_is_valid(allocation_id) || path_buf == NULL || buf_len <= 0) {
         return NULL;
     }
 
-    if (snprintf_s(path_buf, buf_len, buf_len - 1, "%s%s/%s/%s", mgr->base_path, pod_uid, container_name,
+    if (snprintf_s(path_buf, buf_len, buf_len - 1, "%s%s/%s/%s", mgr->base_path, CONFIG_ALLOCATIONS_DIR, allocation_id,
                    CONFIG_FILE_NAME) < 0) {
         return NULL;
     }

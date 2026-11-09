@@ -3,11 +3,11 @@ Section: admin
 Priority: optional
 Maintainer: enpu-manager maintainer <maintainer@enpu-manager>
 Build-Depends: debhelper-compat (= 13), cmake (>= 3.15), gcc (>= 9.3),
-               g++ (>= 9.3), libcjson-dev
+               g++ (>= 9.3), libcjson-dev, uuid-dev
 Standards-Version: 4.6.2
 
 Package: enpu-manager
 Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}, libcjson1
+Depends: ${shlibs:Depends}, ${misc:Depends}, libcjson1, libuuid1
 Description: Ascend NPU Management System
  ENPU Manager is a management system for Huawei Ascend NPU devices.

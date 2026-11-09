@@ -12,6 +12,7 @@
 
 #include "rest_api.h"
 #include <arpa/inet.h>
+#include <cjson/cJSON.h>
 #include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
@@ -39,6 +40,7 @@
 #define HTTP_STATUS_OK 200
 #define HTTP_STATUS_BAD_REQUEST 400
 #define HTTP_STATUS_NOT_FOUND 404
+#define HTTP_STATUS_CONFLICT 409
 #define HTTP_STATUS_INTERNAL_ERROR 500
 #define PARSE_ALLOC_INVALID_PRIORITY (-2)
 
@@ -179,6 +181,8 @@ static const char *http_reason_phrase(int status)
             return "Bad Request";
         case HTTP_STATUS_NOT_FOUND:
             return "Not Found";
+        case HTTP_STATUS_CONFLICT:
+            return "Conflict";
         case HTTP_STATUS_METHOD_NOT_ALLOWED:
             return "Method Not Allowed";
         case HTTP_STATUS_INTERNAL_ERROR:
@@ -350,7 +354,7 @@ static void *accept_thread_func(void *arg)
 static int handle_request(rest_api_server_t *server, int client_fd)
 {
     char buffer[REST_BUFFER_SIZE];
-    char method[16], path[256], body[REST_BUFFER_SIZE];
+    char method[16], path[1024], body[REST_BUFFER_SIZE];
     struct timeval recv_timeout = {REST_RECV_TIMEOUT_SEC, 0};
     int sock_ret = setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout, sizeof(recv_timeout));
     CHECK_COND_LOG_(sock_ret != 0, "setsockopt SO_RCVTIMEO failed.");
@@ -442,6 +446,50 @@ static int send_response(int client_fd, int status, const char *body)
 
     return 0;
 }
+static int parse_release_query(const char *query, char *pod, size_t pod_size, char *container, size_t container_size)
+{
+    pod[0] = container[0] = '\0';
+    while (query && *query) {
+        char *out;
+        size_t capacity;
+        if (strncmp(query, "pod_uid=", 8) == 0 && !pod[0]) {
+            out = pod;
+            capacity = pod_size;
+            query += 8;
+        } else if (strncmp(query, "container_name=", 15) == 0 && !container[0]) {
+            out = container;
+            capacity = container_size;
+            query += 15;
+        } else {
+            return -1;
+        }
+        size_t length = 0;
+        while (*query && *query != '&') {
+            unsigned char value = (unsigned char)*query++;
+            if (value == '%') {
+                unsigned int decoded;
+                if (!query[0] || !query[1] || strspn(query, "0123456789abcdefABCDEF") < 2 ||
+                    sscanf(query, "%2x", &decoded) != 1) {
+                    return -1;
+                }
+                value = (unsigned char)decoded;
+                query += 2;
+            } else if (value == '+') {
+                value = ' ';
+            }
+            if (value < 0x20 || value == 0x7f || length + 1 >= capacity) {
+                return -1;
+            }
+            out[length++] = (char)value;
+        }
+        out[length] = '\0';
+        if (!length || (*query == '&' && !*++query)) {
+            return -1;
+        }
+    }
+    return pod[0] && container[0] ? 0 : -1;
+}
+
 static int route_request(rest_api_server_t *server, const char *method, const char *path, const char *body,
                          char *response)
 {
@@ -520,40 +568,60 @@ static int route_request(rest_api_server_t *server, const char *method, const ch
             resp.result = result; /* 用返回值覆盖 resp.result，避免 rollback 后 resp.result 仍为 SUCCESS */
         }
         ret = snprintf_s(response, REST_RESPONSE_SIZE, REST_RESPONSE_SIZE - 1,
-                         "{\"phy_id\":%d,\"vnpu_id\":%d,\"pod_uid\":\"%s\",\"container_name\":\"%s\","
+                         "{\"allocation_id\":\"%s\",\"config_path\":\"%s\",\"phy_id\":%d,\"vnpu_id\":%d,\"pod_uid\":\"%"
+                         "s\",\"container_name\":\"%s\","
                          "\"die_id\":\"%s\",\"shm_id\":\"%s\","
                          "\"aicore_quota\":%d,\"hbm_quota\":%lu,\"hbm_limit\":%lu,\"sched_policy\":%d,"
                          "\"vnpu_priority\":%d,"
                          "\"minor_name\":\"%s\",\"result\":%d,\"error_msg\":\"%s\"%s}",
-                         resp.phy_id, resp.vnpu_id, resp.pod_uid, resp.container_name, resp.die_id, resp.shm_id,
-                         resp.aicore_quota, resp.hbm_quota, resp.hbm_limit, resp.sched_policy, resp.vnpu_priority,
-                         resp.minor_name, resp.result, resp.error_msg, result == ENPU_SUCCESS ? warnings : "");
+                         resp.allocation_id, resp.config_path, resp.phy_id, resp.vnpu_id, resp.pod_uid,
+                         resp.container_name, resp.die_id, resp.shm_id, resp.aicore_quota, resp.hbm_quota,
+                         resp.hbm_limit, resp.sched_policy, resp.vnpu_priority, resp.minor_name, resp.result,
+                         resp.error_msg, result == ENPU_SUCCESS ? warnings : "");
         CHECK_COND_LOG_(ret < 0, "snprintf_s response failed.");
-        return result == ENPU_SUCCESS ? HTTP_STATUS_OK : HTTP_STATUS_BAD_REQUEST;
+        return result == ENPU_SUCCESS        ? HTTP_STATUS_OK :
+               result == ENPU_ALREADY_EXISTS ? HTTP_STATUS_CONFLICT :
+                                               HTTP_STATUS_BAD_REQUEST;
     }
 
     if (strcmp(method, "DELETE") == 0 && strncmp(path, "/api/v1/allocations/", 20) == 0) {
-        char *slash = strchr(path + 20, '/');
-        if (!slash) {
-            ret = snprintf_s(response, REST_RESPONSE_SIZE, REST_RESPONSE_SIZE - 1,
-                             "{\"error\":\"Invalid path\",\"result\":%d}", ENPU_INVALID_PARAM);
-            CHECK_COND_LOG_(ret < 0, "snprintf_s response failed.");
+        if (!strchr(path + 20, '/')) {
+            const char *id = path + 20;
+            if (!allocation_id_is_valid(id)) {
+                snprintf_s(response, REST_RESPONSE_SIZE, REST_RESPONSE_SIZE - 1,
+                           "{\"error\":\"Invalid allocation_id\",\"result\":%d}", ENPU_INVALID_PARAM);
+                return HTTP_STATUS_BAD_REQUEST;
+            }
+            int result = enpu_manager_release_by_id(mgr, id);
+            snprintf_s(response, REST_RESPONSE_SIZE, REST_RESPONSE_SIZE - 1, "{\"result\":%d,\"error_msg\":\"\"}",
+                       result);
+            return result == ENPU_SUCCESS   ? HTTP_STATUS_OK :
+                   result == ENPU_NOT_FOUND ? HTTP_STATUS_NOT_FOUND :
+                                              HTTP_STATUS_INTERNAL_ERROR;
+        }
+    }
+
+    if (strcmp(method, "DELETE") == 0 &&
+        (strcmp(path, "/api/v1/allocations") == 0 || strncmp(path, "/api/v1/allocations?", 20) == 0)) {
+        char pod_uid[MAX_UUID_LEN], container[MAX_NAME_LEN];
+        if (parse_release_query(strchr(path, '?') ? path + 20 : NULL, pod_uid, sizeof(pod_uid), container,
+                                sizeof(container)) != 0) {
+            snprintf_s(
+                response, REST_RESPONSE_SIZE, REST_RESPONSE_SIZE - 1,
+                "{\"error\":\"Require unique, nonempty pod_uid and container_name query parameters\",\"result\":%d}",
+                ENPU_INVALID_PARAM);
             return HTTP_STATUS_BAD_REQUEST;
         }
-        char pod_uid[MAX_UUID_LEN] = {0}, container[MAX_NAME_LEN] = {0};
-        size_t uid_len = (size_t)(slash - (path + 20));
-        if (uid_len >= sizeof(pod_uid)) {
-            uid_len = sizeof(pod_uid) - 1;
-        }
-        int copy_ret = strncpy_s(pod_uid, sizeof(pod_uid), path + 20, uid_len);
-        CHECK_COND_RETURN_ERROR_CODE_LOG(copy_ret != 0, "strncpy_s pod_uid failed.");
-        copy_ret = strncpy_s(container, sizeof(container), slash + 1, sizeof(container) - 1);
-        CHECK_COND_RETURN_ERROR_CODE_LOG(copy_ret != 0, "strncpy_s container failed.");
         int result = enpu_manager_release(mgr, pod_uid, container);
+        LOG_INFO("[REST] Release by labels: pod=%s container=%s result=%d", pod_uid, container, result);
         ret = snprintf_s(response, REST_RESPONSE_SIZE, REST_RESPONSE_SIZE - 1, "{\"result\":%d,\"error_msg\":\"\"}",
                          result);
         CHECK_COND_LOG_(ret < 0, "snprintf_s response failed.");
-        return result == ENPU_SUCCESS ? HTTP_STATUS_OK : HTTP_STATUS_NOT_FOUND;
+        return result == ENPU_SUCCESS        ? HTTP_STATUS_OK :
+               result == ENPU_NOT_FOUND      ? HTTP_STATUS_NOT_FOUND :
+               result == ENPU_ALREADY_EXISTS ? HTTP_STATUS_CONFLICT :
+               result == ENPU_INVALID_PARAM  ? HTTP_STATUS_BAD_REQUEST :
+                                               HTTP_STATUS_INTERNAL_ERROR;
     }
 
     if (strcmp(method, "GET") == 0 && strcmp(path, "/api/v1/allocations") == 0) {
@@ -724,7 +792,18 @@ static int parse_json_alloc_request(const char *body, alloc_request_t *req)
     int ret = memset_s(req, sizeof(alloc_request_t), 0, sizeof(alloc_request_t));
     CHECK_COND_RETURN_ERROR_CODE_LOG(ret != 0, "memset_s req failed.");
     req->predicate_phy_id = -1;
-    req->swap_priority = SWAP_PRIORITY_MEDIUM;
+    req->swap_order = SWAP_ORDER_DEFAULT;
+
+    cJSON *json = cJSON_Parse(body);
+    cJSON *id = cJSON_GetObjectItemCaseSensitive(json, "allocation_id");
+    int valid_id = cJSON_IsObject(json) &&
+                   (id == NULL || (cJSON_IsString(id) && allocation_id_is_valid(id->valuestring) &&
+                                   strcpy_s(req->allocation_id, sizeof(req->allocation_id), id->valuestring) == 0));
+    cJSON_Delete(json);
+    if (!valid_id) {
+        LOG_ERROR("[REST] Invalid JSON object or allocation_id");
+        return -1;
+    }
 
     char *p = strstr(body, "\"pod_uid\"");
     if (p) {
@@ -777,9 +856,9 @@ static int parse_json_alloc_request(const char *body, alloc_request_t *req)
     if (num != NULL) {
         req->sched_policy = (int)strtol(num, NULL, 10);
     }
-    num = json_number_value(body, "\"swap_priority\"");
+    num = json_number_value(body, "\"swap_order\"");
     if (num != NULL) {
-        req->swap_priority = (int)strtol(num, NULL, 10);
+        req->swap_order = (int)strtol(num, NULL, 10);
     }
     if (parse_vnpu_priority(body, &req->vnpu_priority) != 0) {
         LOG_ERROR("Invalid vnpu_priority: expected integer 0 or 1");
@@ -973,14 +1052,14 @@ static char *format_allocations_json(enpu_manager_t *mgr)
         }
 
         fmt_ret = snprintf_s(json + offset, JSON_BUF_SIZE - offset, JSON_BUF_SIZE - offset - 1,
-                             "{\"pod_uid\":\"%s\",\"container_name\":\"%s\","
+                             "{\"allocation_id\":\"%s\",\"pod_uid\":\"%s\",\"container_name\":\"%s\","
                              "\"phy_id\":%d,\"vnpu_id\":%d,"
                              "\"die_id\":\"%s\",\"aicore_quota\":%d,"
                              "\"hbm_quota\":%lu,\"hbm_limit\":%lu,\"sched_policy\":%d,"
-                             "\"swap_priority\":%d,\"vnpu_priority\":%d}",
-                             alloc->pod_uid, alloc->container_name, alloc->phy_id, alloc->vnpu_id, alloc->die_id,
-                             alloc->aicore_quota, alloc->hbm_quota, alloc->hbm_limit, alloc->sched_policy,
-                             alloc->swap_priority, alloc->vnpu_priority);
+                             "\"swap_order\":%d,\"vnpu_priority\":%d}",
+                             alloc->allocation_id, alloc->pod_uid, alloc->container_name, alloc->phy_id, alloc->vnpu_id,
+                             alloc->die_id, alloc->aicore_quota, alloc->hbm_quota, alloc->hbm_limit,
+                             alloc->sched_policy, alloc->swap_order, alloc->vnpu_priority);
         if (fmt_ret < 0) {
             goto overflow;
         }

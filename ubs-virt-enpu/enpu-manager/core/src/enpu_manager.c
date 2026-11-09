@@ -415,6 +415,19 @@ int enpu_manager_release(enpu_manager_t *mgr, const char *pod_uid, const char *c
     return npu_allocator_release(mgr->allocator, pod_uid, container_name);
 }
 
+int enpu_manager_release_by_id(enpu_manager_t *mgr, const char *allocation_id)
+{
+    CHECK_NULL_RET(mgr, ENPU_INVALID_PARAM);
+    CHECK_NULL_RET(allocation_id, ENPU_INVALID_PARAM);
+
+    if (mgr->allocator == NULL) {
+        LOG_ERROR("[ENPU-MGR] Allocator not initialized");
+        return ENPU_FAIL;
+    }
+
+    return npu_allocator_release_by_id(mgr->allocator, allocation_id);
+}
+
 int enpu_manager_release_all(enpu_manager_t *mgr, int *released_count)
 {
     CHECK_NULL_RET(mgr, ENPU_INVALID_PARAM);
@@ -437,12 +450,11 @@ int enpu_manager_release_all(enpu_manager_t *mgr, int *released_count)
 
     int released = 0;
     for (int i = 0; i < count; i++) {
-        int r = npu_allocator_release(mgr->allocator, allocs[i].pod_uid, allocs[i].container_name);
+        int r = npu_allocator_release_by_id(mgr->allocator, allocs[i].allocation_id);
         if (r == ENPU_SUCCESS) {
             released++;
         } else {
-            LOG_WARN("[ENPU-MGR] release_all: release %s/%s failed: %d", allocs[i].pod_uid, allocs[i].container_name,
-                     r);
+            LOG_WARN("[ENPU-MGR] release_all: release allocation_id=%s failed: %d", allocs[i].allocation_id, r);
         }
     }
 
