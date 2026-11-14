@@ -195,16 +195,15 @@ int enpu_dcmi_get_card_info(uint32_t phy_id, int *card_id, int *device_id, int *
             LOG_ERROR("[DCMI] Invalid v2 device count=%d", device_cnt);
             return ENPU_FAIL;
         }
-        int selected = -1;
-        for (int i = 0; i < device_cnt; ++i) {
-            if (device_list[i] >= 0 && (uint32_t)device_list[i] == phy_id) {
-                selected = device_list[i];
-                break;
-            }
-        }
+        /*
+         * DCMI v2 IDs are container-local and cannot be matched numerically
+         * with the host physical-npu-id (for example, host phy 3 may appear
+         * as local device 0). Each workload container exposes one NPU here,
+         * so DCMI calls must use the first visible local device ID.
+         */
+        int selected = device_list[0];
         if (selected < 0) {
-            LOG_ERROR("[DCMI] Configured device=%u absent from v2 logical IDs (count=%d); verify container mapping.",
-                      phy_id, device_cnt);
+            LOG_ERROR("[DCMI] Invalid v2 logical device ID=%d", selected);
             return ENPU_FAIL;
         }
         *logic_id = selected;

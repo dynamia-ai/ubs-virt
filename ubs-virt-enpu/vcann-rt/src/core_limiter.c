@@ -838,12 +838,15 @@ int vnpu_scheduler_start(void)
 
     if (get_sched_policy() == SCHED_POLICY_BEST_EFFORT) {
         LOG_INFO("[VNPU-STATS] Best-effort statistics publisher started: vnpu=%u shm=%s; "
-                 "no scheduling heartbeat, time-slice rotation or scheduler stream synchronization.",
+                 "no time-slice rotation or scheduler stream synchronization.",
                  get_vnpu_id(), get_vnpu_shm_id());
-        if (get_vnpu_priority() == VNPU_PRIORITY_NORMAL) {
-            return ENPU_SUCCESS;
-        }
     }
+    /*
+     * Best-effort skips owner rotation and stream drain, but it must still
+     * publish the vNPU/process heartbeat. Priority admission uses the vNPU
+     * heartbeat, while process liveness and HBM sampler takeover use the
+     * process heartbeat. Do not return before creating this thread.
+     */
     pthread_t vnpu_alive_tid;
     rc = pthread_create(&vnpu_alive_tid, NULL, vnpu_scheduler_flush_thread, NULL);
     if (rc != 0) {

@@ -156,7 +156,7 @@ int stub_dcmi_threaded_memory(int cardId, int deviceId, struct dcmi_proc_mem_inf
 int stub_dcmiv2_device_list(int *devices, int *count, int capacity)
 {
     EXPECT_GE(capacity, 2);
-    devices[0] = 1;
+    devices[0] = 0;
     devices[1] = 3;
     *count = 2;
     return 0;
@@ -875,13 +875,14 @@ TEST_F(SwapModuleTest, DcmiV2CardAndMetricCallbacks)
     int logicId = 0;
     EXPECT_EQ(enpu_dcmi_get_card_info(3, &cardId, &deviceId, &logicId, SOC_VERSION_ASCEND_950), ENPU_SUCCESS);
     EXPECT_EQ(cardId, -1);
-    EXPECT_EQ(deviceId, 3);
-    EXPECT_EQ(logicId, 3);
+    EXPECT_EQ(deviceId, 0);
+    EXPECT_EQ(logicId, 0);
 
     unsigned int value = 0;
-    EXPECT_EQ(enpu_dcmi_get_utilization_rate(3, cardId, deviceId, SOC_VERSION_ASCEND_950, ENPU_DCMI_UTIL_NPU, &value),
-              ENPU_SUCCESS);
-    EXPECT_EQ(enpu_dcmi_get_aicore_num(3, cardId, deviceId, &value), ENPU_SUCCESS);
+    EXPECT_EQ(
+        enpu_dcmi_get_utilization_rate(logicId, cardId, deviceId, SOC_VERSION_ASCEND_950, ENPU_DCMI_UTIL_NPU, &value),
+        ENPU_SUCCESS);
+    EXPECT_EQ(enpu_dcmi_get_aicore_num(logicId, cardId, deviceId, &value), ENPU_SUCCESS);
     EXPECT_EQ(value, 24U);
     EXPECT_EQ(enpu_dcmi_get_utilization_rate(3, cardId, deviceId, SOC_VERSION_ASCEND_950, -1, &value), ENPU_FAIL);
     EXPECT_EQ(enpu_dcmi_get_utilization_rate(3, cardId, deviceId, SOC_VERSION_ASCEND_950, ENPU_DCMI_UTIL_NPU, nullptr),
