@@ -520,6 +520,14 @@ int enpu_manager_query_allocations(enpu_manager_t *mgr, const allocation_query_t
     return npu_allocator_query_allocations(mgr->allocator, query, allocations, count);
 }
 
+char *enpu_manager_get_config_path(enpu_manager_t *mgr, const char *allocation_id, char *path, int path_size)
+{
+    if (mgr == NULL || mgr->allocator == NULL) {
+        return NULL;
+    }
+    return config_manager_get_config_path(mgr->allocator->config_mgr, allocation_id, path, path_size);
+}
+
 int enpu_manager_swap_control(enpu_manager_t *mgr, const char *pod_uid, swap_action_t action)
 {
     CHECK_NULL_RET(mgr, ENPU_INVALID_PARAM);

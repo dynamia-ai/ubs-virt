@@ -19,12 +19,14 @@ struct Config config = {0};
 
 void reset_config()
 {
+    (void)memset_s(config.allocation_id, sizeof(config.allocation_id), 0, sizeof(config.allocation_id));
     config.phy_npu_id = INVALID_VALUE;
     config.vnpu_id = INVALID_VALUE;
     config.aicore_quota = INVALID_VALUE;
     config.memory_quota = INVALID_VALUE;
     config.memory_request = 0;
     config.memory_limit = 0;
+    config.resource_generation = 0;
     config.scheduling_policy = INVALID_VALUE;
     config.vnpu_priority = VNPU_PRIORITY_NORMAL;
     (void)memset_s(config.shm_id, sizeof(config.shm_id), 0, sizeof(config.shm_id));
@@ -108,6 +110,11 @@ int check_config()
         return 0;
     }
 
+    if (config.allocation_id[0] != '\0' && !allocation_id_is_valid(config.allocation_id)) {
+        LOG_ERROR("Invalid allocation-id: expected canonical UUID text");
+        return 0;
+    }
+
     return check_int32(config.phy_npu_id, OPTION_NPU_ID) == ENPU_SUCCESS &&
            check_int32(config.vnpu_id, OPTION_VNPU_ID) == ENPU_SUCCESS &&
            check_int32(config.aicore_quota, OPTION_AICORE_QUOTA) == ENPU_SUCCESS &&
@@ -172,7 +179,9 @@ int load_uint64(const char *key, const char *value, uint64_t *ret_value)
 int save2config(const char *key, const char *value)
 {
     int rc = ENPU_SUCCESS;
-    if (strcmp(key, OPTION_NPU_ID) == 0) {
+    if (strcmp(key, OPTION_ALLOCATION_ID) == 0) {
+        rc = load_str(key, value, config.allocation_id, ALLOCATION_ID_LEN);
+    } else if (strcmp(key, OPTION_NPU_ID) == 0) {
         rc = load_int32(key, value, &config.phy_npu_id);
     } else if (strcmp(key, OPTION_VNPU_ID) == 0) {
         rc = load_int32(key, value, &config.vnpu_id);
@@ -190,6 +199,11 @@ int save2config(const char *key, const char *value)
         rc = load_int32(key, value, &config.vnpu_priority);
     } else if (strcmp(key, OPTION_SHM_ID) == 0) {
         rc = load_str(key, value, config.shm_id, SHM_ID_LEN);
+    } else if (strcmp(key, OPTION_ALLOCATION_GENERATION) == 0) {
+        if (value[0] < '0' || value[0] > '9') {
+            return ENPU_FAIL;
+        }
+        rc = load_uint64(key, value, &config.resource_generation);
     } else {
         LOG_WARN("Undefined config key: %s", key);
         rc = ENPU_FAIL;

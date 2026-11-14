@@ -16,6 +16,7 @@ extern "C" {
 #endif
 
 bool allocation_id_is_valid(const char *allocation_id);
+bool allocation_id_normalize(const char *allocation_id, char output[ALLOCATION_ID_LEN]);
 
 #if defined(__cplusplus)
 }

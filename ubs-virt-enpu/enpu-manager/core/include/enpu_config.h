@@ -12,7 +12,7 @@
 
 #define ENPU_CONFIG_DEFAULT_PATH "/etc/enpu/enpu-manager.conf"
 
-#define ENPU_CONFIG_DEFAULT_REST_PORT 8080
+#define ENPU_CONFIG_DEFAULT_SOCKET_PATH "/run/enpu/enpu-manager.sock"
 
 #define ENPU_CONFIG_DEFAULT_SWAP_PRE_WATERMARK 80
 
@@ -24,7 +24,7 @@
 #define ENPU_CONFIG_DEFAULT_SHARE_STRATEGY "compact"
 
 typedef struct enpu_config {
-    int rest_port;
+    char socket_path[MAX_PATH_LEN];
 
     char config_dir[MAX_PATH_LEN];
     char state_dir[MAX_PATH_LEN];

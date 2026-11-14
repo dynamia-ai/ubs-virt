@@ -19,14 +19,9 @@
 #include "common.h"
 #include "enpu_manager.h"
 #include "log.h"
+#include "vnpu_sched_shm_abi.h"
 
 #define SHM_ID_FORMAT "/die-%d-%d"
-
-#define MAGIC_UNINITIALIZED 0x0U
-#define MAGIC_INITIALIZING 0x5A494E47U
-#define MAGIC_INITIALIZED 0x495A4547U
-
-#define MAX_VNPU_SCHED 100
 
 #define SWAP_ACTION_NONE 0
 #define SWAP_ACTION_OUT 1
@@ -70,27 +65,6 @@ typedef struct swap_out_cmd {
     atomic_int action;
     atomic_bool completed;
 } swap_out_cmd_t;
-
-typedef struct vnpu_time_slice_sched {
-    pthread_mutex_t vnpu_schedule_mutex[MAX_VNPU_SCHED];
-    atomic_uint_fast64_t last_alive_time_ns[MAX_VNPU_SCHED];
-    atomic_uint_fast64_t last_kernel_time_ns[MAX_VNPU_SCHED];
-    atomic_uint_fast8_t vnpu_schedule_turn[MAX_VNPU_SCHED];
-    atomic_uint_fast8_t vnpu_core_limit_quota[MAX_VNPU_SCHED];
-    atomic_uint_fast8_t vnpu_priority[MAX_VNPU_SCHED];
-    atomic_int owner;
-    atomic_uint_fast32_t magic_number;
-    atomic_int slide_window_len;
-    atomic_uint_fast64_t last_slide_window_time_ns;
-    pthread_mutex_t npu_utilization_monitor_mutex;
-    atomic_uint_fast64_t vnpu_quota_timeslice[MAX_VNPU_SCHED];
-    atomic_uint_fast64_t vnpu_cur_timeslice[MAX_VNPU_SCHED];
-    atomic_uint_fast8_t vnpu_quota_injected_for_turn[MAX_VNPU_SCHED];
-    atomic_int vnpu_sync_expected[MAX_VNPU_SCHED];
-    atomic_int vnpu_sync_completed[MAX_VNPU_SCHED];
-    atomic_uint_fast64_t vnpu_turn_max_sync[MAX_VNPU_SCHED];
-    atomic_uint_fast64_t vnpu_timeslice_for_turn[MAX_VNPU_SCHED];
-} vnpu_time_slice_sched_t;
 
 typedef struct vnpu_shm_entry {
     int32_t vnpu_id;

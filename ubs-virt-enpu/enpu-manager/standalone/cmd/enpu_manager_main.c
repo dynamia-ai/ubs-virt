@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/un.h>
 #include <unistd.h>
 #include "enpu_config.h"
 #include "enpu_manager.h"
@@ -35,7 +36,7 @@ static int print_usage(const char *prog_name)
     if (fprintf(stderr, "Options:\n") < 0) {
         return ENPU_FAIL;
     }
-    if (fprintf(stderr, "  --port <port>   REST API port (default: %d)\n", ENPU_CONFIG_DEFAULT_REST_PORT) < 0) {
+    if (fprintf(stderr, "  --socket <path> HTTP over UDS path (default: %s)\n", ENPU_CONFIG_DEFAULT_SOCKET_PATH) < 0) {
         return ENPU_FAIL;
     }
     if (fprintf(stderr, "  --help          Show this help message\n") < 0) {
@@ -91,7 +92,7 @@ static int setup_signal_handlers(void)
 
 #define PARSE_ARG_HELP 1
 
-static int parse_arguments(int argc, char *argv[], int *port)
+static int parse_arguments(int argc, char *argv[], char *socket_path, size_t socket_path_size)
 {
     int i = 1;
     while (i < argc) {
@@ -99,21 +100,21 @@ static int parse_arguments(int argc, char *argv[], int *port)
             int usage_ret = print_usage(argv[0]);
             CHECK_COND_RETURN_(usage_ret != ENPU_SUCCESS, -1, "print usage failed.");
             return PARSE_ARG_HELP;
-        } else if (strcmp(argv[i], "--port") == 0) {
+        } else if (strcmp(argv[i], "--socket") == 0) {
             if (i + 1 >= argc) {
-                CHECK_COND_LOG_PRINT(fprintf(stderr, "Error: --port requires a port argument\n") < 0,
+                CHECK_COND_LOG_PRINT(fprintf(stderr, "Error: --socket requires a path argument\n") < 0,
                                      "print error message failed.");
                 return -1;
             }
             i++;
-            char *port_end = NULL;
-            long port_val = strtol(argv[i], &port_end, 10);
-            if (port_end == argv[i] || *port_end != '\0' || port_val <= 0 || port_val > 65535) {
-                CHECK_COND_LOG_PRINT(fprintf(stderr, "Error: Invalid port number\n") < 0,
+            if (argv[i][0] != '/' || strnlen(argv[i], sizeof(((struct sockaddr_un *)0)->sun_path)) >=
+                                         sizeof(((struct sockaddr_un *)0)->sun_path)) {
+                CHECK_COND_LOG_PRINT(fprintf(stderr, "Error: Invalid Unix socket path\n") < 0,
                                      "print error message failed.");
                 return -1;
             }
-            *port = (int)port_val;
+            int copy_ret = strncpy_s(socket_path, socket_path_size, argv[i], socket_path_size - 1);
+            CHECK_COND_RETURN_(copy_ret != 0, -1, "copy socket path failed.");
         } else {
             CHECK_COND_LOG_PRINT(fprintf(stderr, "Error: Unknown option: %s\n", argv[i]) < 0,
                                  "print error message failed.");
@@ -171,8 +172,7 @@ static int build_enpu_manager_config(enpu_config_t *enpu_cfg, enpu_manager_confi
 
 int main(int argc, char *argv[])
 {
-    int port = ENPU_CONFIG_DEFAULT_REST_PORT;
-    char bind_addr[32];
+    char socket_path[MAX_PATH_LEN] = {0};
     int ret;
     int msg_ret = 0;
     enpu_config_t *enpu_cfg = NULL;
@@ -195,9 +195,13 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    port = enpu_cfg->rest_port;
+    ret = strncpy_s(socket_path, sizeof(socket_path), enpu_cfg->socket_path, sizeof(socket_path) - 1);
+    if (ret != 0) {
+        enpu_config_destroy(enpu_cfg);
+        return EXIT_FAILURE;
+    }
 
-    ret = parse_arguments(argc, argv, &port);
+    ret = parse_arguments(argc, argv, socket_path, sizeof(socket_path));
     if (ret == PARSE_ARG_HELP) {
         enpu_config_destroy(enpu_cfg);
         return EXIT_SUCCESS;
@@ -214,7 +218,7 @@ int main(int argc, char *argv[])
     }
 
     LOG_INFO("Starting enpu-manager...");
-    LOG_INFO("REST API port: %d", port);
+    LOG_INFO("REST API Unix socket: %s", socket_path);
     {
         bool any_swap = false;
         for (int i = 0; i < MAX_NPU_PER_NODE; i++) {
@@ -252,13 +256,7 @@ int main(int argc, char *argv[])
     }
     g_manager_started = true;
 
-    int fmt_ret = snprintf_s(bind_addr, sizeof(bind_addr), sizeof(bind_addr) - 1, "0.0.0.0:%d", port);
-    if (fmt_ret < 0) {
-        LOG_ERROR("Failed to format bind address");
-        cleanup();
-        return EXIT_FAILURE;
-    }
-    g_rest_server = rest_api_create(bind_addr);
+    g_rest_server = rest_api_create(socket_path);
     if (g_rest_server == NULL) {
         LOG_ERROR("Failed to create REST API server");
         cleanup();
@@ -275,7 +273,7 @@ int main(int argc, char *argv[])
     }
 
     LOG_INFO("enpu-manager started successfully");
-    LOG_INFO("REST API listening on %s", bind_addr);
+    LOG_INFO("REST API listening on Unix socket %s", socket_path);
 
     while (atomic_load(&g_running)) {
         if (atomic_exchange(&g_reload_requested, false)) {

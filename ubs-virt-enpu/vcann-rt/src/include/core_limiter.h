@@ -23,14 +23,15 @@ using atomic_int = std::atomic<int>;
 #include <inttypes.h>
 #include <pthread.h>
 #include <runtime/rt.h>
+#include "vnpu_sched_shm_abi.h"
 
 #if defined(__cplusplus)
 extern "C" {
 #endif
 
-#define MAGIC_INITIALIZED 0x495A4547U  // IZEG (v3: priority array added)
-#define MAGIC_INITIALIZING 0x5A494E47U // ZING
-#define MAGIC_UNINITIALIZED 0x0
+#define MAGIC_INITIALIZED VNPU_SCHED_MAGIC_INITIALIZED
+#define MAGIC_INITIALIZING VNPU_SCHED_MAGIC_INITIALIZING
+#define MAGIC_UNINITIALIZED VNPU_SCHED_MAGIC_UNINITIALIZED
 #define MAX_STREAMS_PER_PROCESS 128
 #define MAX_EVENT_PER_PROCESS 65000
 #define HUNDRED_PERCENT 100
@@ -90,7 +91,7 @@ extern void launch_stats_dispatch(rtStream_t stm, uint32_t block_dim);
 uint64_t ns_now(void);
 void update_last_kernel_time_now(void);
 void ns_sleep(uint64_t ns);
-extern void synchronize_and_clear_streams(void);
+uint64_t scheduler_drain_turn(uint8_t turn, bool *complete);
 
 #if defined(__cplusplus)
 }

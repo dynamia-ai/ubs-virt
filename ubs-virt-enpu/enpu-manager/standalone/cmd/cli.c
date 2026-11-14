@@ -10,15 +10,16 @@
  * See the Mulan PSL v2 for more details.
  */
 
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <netinet/in.h>
+#include <errno.h>
+#include <limits.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
-#include <uuid/uuid.h>
 
 #include "allocation_id.h"
 #include "cli.h"
@@ -26,7 +27,7 @@
 
 #define RECV_BUF_SIZE 65536
 #define REQ_BUF_SIZE 4096
-#define MAX_URL_LEN 256
+#define MAX_URL_LEN 1024
 
 static char *skip_whitespace(char *p)
 {
@@ -92,41 +93,34 @@ static int parse_uint64(char *json, const char *key, uint64_t *value)
     return 0;
 }
 
-static int http_request(const char *host, const char *port, const char *method, const char *path, const char *body,
-                        char *response, int resp_len)
+static int http_request(const char *socket_path, const char *method, const char *path, const char *body, char *response,
+                        int resp_len)
 {
     int sockfd = -1;
-    struct addrinfo hints, *res = NULL, *rp = NULL;
-    int ret = -1;
-
-    ret = memset_s(&hints, sizeof(hints), 0, sizeof(hints));
-    if (ret != 0) {
-        fprintf(stderr, "Error: Failed to memset hints\n");
-        return ret;
-    }
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-
-    if (getaddrinfo(host, port, &hints, &res) != 0) {
-        fprintf(stderr, "Error: Failed to resolve host %s\n", host);
+    if (socket_path == NULL || socket_path[0] != '/' ||
+        strnlen(socket_path, sizeof(((struct sockaddr_un *)0)->sun_path)) >=
+            sizeof(((struct sockaddr_un *)0)->sun_path)) {
+        fprintf(stderr, "Error: Invalid Unix socket path\n");
         return -1;
     }
-
-    for (rp = res; rp != NULL; rp = rp->ai_next) {
-        sockfd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (sockfd == -1) {
-            continue;
-        }
-        if (connect(sockfd, rp->ai_addr, rp->ai_addrlen) == 0) {
-            break;
-        }
-        close(sockfd);
-        sockfd = -1;
+    struct sockaddr_un addr;
+    int ret = memset_s(&addr, sizeof(addr), 0, sizeof(addr));
+    if (ret != 0) {
+        fprintf(stderr, "Error: Failed to initialize Unix socket address\n");
+        return -1;
     }
-    freeaddrinfo(res);
-
-    if (sockfd == -1) {
-        fprintf(stderr, "Error: Failed to connect to %s:%s\n", host, port);
+    addr.sun_family = AF_UNIX;
+    ret = strncpy_s(addr.sun_path, sizeof(addr.sun_path), socket_path, sizeof(addr.sun_path) - 1);
+    if (ret != 0) {
+        fprintf(stderr, "Error: Failed to copy Unix socket path\n");
+        return -1;
+    }
+    sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sockfd < 0 || connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        fprintf(stderr, "Error: Failed to connect to Unix socket %s: %s\n", socket_path, strerror(errno));
+        if (sockfd >= 0) {
+            close(sockfd);
+        }
         return -1;
     }
 
@@ -135,20 +129,20 @@ static int http_request(const char *host, const char *port, const char *method, 
     if (body && strlen(body) > 0) {
         req_len = snprintf_s(request, sizeof(request), sizeof(request) - 1,
                              "%s %s HTTP/1.1\r\n"
-                             "Host: %s:%s\r\n"
+                             "Host: localhost\r\n"
                              "Content-Type: application/json\r\n"
                              "Content-Length: %zu\r\n"
                              "Connection: close\r\n"
                              "\r\n"
                              "%s",
-                             method, path, host, port, strlen(body), body);
+                             method, path, strlen(body), body);
     } else {
         req_len = snprintf_s(request, sizeof(request), sizeof(request) - 1,
                              "%s %s HTTP/1.1\r\n"
-                             "Host: %s:%s\r\n"
+                             "Host: localhost\r\n"
                              "Connection: close\r\n"
                              "\r\n",
-                             method, path, host, port);
+                             method, path);
     }
 
     if (req_len < 0 || req_len >= (int)sizeof(request)) {
@@ -157,22 +151,59 @@ static int http_request(const char *host, const char *port, const char *method, 
         return -1;
     }
 
-    if (send(sockfd, request, req_len, 0) < 0) {
-        fprintf(stderr, "Error: Failed to send request\n");
-        close(sockfd);
-        return -1;
+    for (int sent = 0; sent < req_len;) {
+        ssize_t n = send(sockfd, request + sent, (size_t)(req_len - sent), MSG_NOSIGNAL);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            fprintf(stderr, "Error: Failed to send request\n");
+            close(sockfd);
+            return -1;
+        }
+        sent += (int)n;
     }
 
     int total = 0;
     int n;
-    while ((n = recv(sockfd, response + total, resp_len - total - 1, 0)) > 0) {
-        total += n;
-        if (total >= resp_len - 1) {
+    while (total < resp_len - 1) {
+        n = recv(sockfd, response + total, (size_t)(resp_len - total - 1), 0);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n < 0) {
+            fprintf(stderr, "Error: Failed to receive complete response\n");
+            close(sockfd);
+            return -1;
+        }
+        if (n == 0) {
             break;
         }
+        total += n;
+    }
+    if (total == resp_len - 1) {
+        fprintf(stderr, "Error: HTTP response exceeds client capacity\n");
+        close(sockfd);
+        return -1;
     }
     response[total] = '\0';
     close(sockfd);
+
+    char *header_end = strstr(response, "\r\n\r\n");
+    char *length_header = strstr(response, "\r\nContent-Length:");
+    if (header_end == NULL) {
+        return -1;
+    }
+    if (length_header != NULL && length_header < header_end) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long long expected = strtoull(length_header + strlen("\r\nContent-Length:"), &end, 10);
+        if (errno || end == NULL || strncmp(end, "\r\n", 2) != 0 ||
+            expected != (unsigned long long)(response + total - header_end - 4)) {
+            fprintf(stderr, "Error: Incomplete or invalid HTTP response length\n");
+            return -1;
+        }
+    }
 
     return total;
 }
@@ -208,11 +239,16 @@ static void print_usage(const char *prog)
     printf("                           -l/--limit:   hbm limit (硬边界上限)\n");
     printf("                           -m:           hbm quota (向后兼容，等同于 -r -l 相同)\n");
     printf("                           -d:           specify physical card ID (>=0 直接分配到该卡；-1 自动选择)\n");
-    printf("                           -u:           pod_uid (可选；未指定时默认 pod-<phy>)\n");
-    printf("                           -c:           container_name (可选；未指定时默认 container-<phy>-<vnpu>)\n");
-    printf("  release -u <pod_uid> -c <container>\n");
+    printf("                           -u:           pod_uid (optional metadata)\n");
+    printf("                           -c:           container_name (optional metadata)\n");
+    printf("                           --swap-order: 0 first, 1 default, 2 last\n");
+    printf("  release -a <allocation_id> | -u <pod_uid> -c <container>\n");
     printf("                           Release vNPU\n");
     printf("  status                   Show allocation status\n");
+    printf("  resources [--allocation-id UUID | --phy-id N [--vnpu-id N] | "
+           "[--pod-uid UID] [--container-name NAME]] [--detail]\n");
+    printf("                           Show complete resource JSON\n");
+    printf("                           --detail: include stats and calculation diagnostics\n");
     printf("  checkpoint               Trigger checkpoint\n");
     printf("  recover                  Trigger recovery\n");
     printf("  swap status              Show swap buffer status\n");
@@ -220,13 +256,13 @@ static void print_usage(const char *prog)
     printf("  swap out <pod_uid>       Force swap out\n");
     printf("  swap in <pod_uid>        Force swap in\n");
     printf("\nOptions:\n");
-    printf("  --server <host:port>     Server address (default: localhost:8080)\n");
+    printf("  --socket <path>          Unix socket path (default: %s)\n", CLI_DEFAULT_SOCKET_PATH);
 }
 
-static int cmd_list(int argc, char *argv[], const char *host, const char *port)
+static int cmd_list(int argc, char *argv[], const char *socket_path)
 {
     char response[RECV_BUF_SIZE];
-    int ret = http_request(host, port, "GET", "/api/v1/devices", NULL, response, sizeof(response));
+    int ret = http_request(socket_path, "GET", "/api/v1/devices", NULL, response, sizeof(response));
     if (ret < 0) {
         return 1;
     }
@@ -242,7 +278,191 @@ static int cmd_list(int argc, char *argv[], const char *host, const char *port)
     return 0;
 }
 
-static int cmd_alloc(int argc, char *argv[], const char *host, const char *port)
+static int resource_cli_id(const char *value, int *id)
+{
+    if (*value == '\0') {
+        return -1;
+    }
+    for (const char *p = value; *p; ++p) {
+        if (*p < '0' || *p > '9') {
+            return -1;
+        }
+    }
+    char *end = NULL;
+    errno = 0;
+    long n = strtol(value, &end, 10);
+    if (errno || *end || n > INT_MAX) {
+        return -1;
+    }
+    *id = (int)n;
+    return 0;
+}
+
+static int resource_url_encode(const char *value, char *output, size_t capacity)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    size_t used = 0;
+    if (value == NULL || *value == '\0') {
+        return -1;
+    }
+    for (const unsigned char *p = (const unsigned char *)value; *p != '\0'; ++p) {
+        bool plain = (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || *p == '-' ||
+                     *p == '_' || *p == '.' || *p == '~';
+        size_t needed = plain ? 1 : 3;
+        if (*p < 0x20 || used + needed >= capacity) {
+            return -1;
+        }
+        if (plain) {
+            output[used++] = (char)*p;
+        } else {
+            output[used++] = '%';
+            output[used++] = hex[*p >> 4];
+            output[used++] = hex[*p & 0x0f];
+        }
+    }
+    output[used] = '\0';
+    return 0;
+}
+
+/* Pretty-print without parsing numbers through double (HBM counters are uint64).
+ * String escape sequences are copied unchanged, including escaped quotes. */
+static void print_resource_json(const char *body)
+{
+    int indent = 0;
+    int quoted = 0, escaped = 0;
+    for (const char *p = body; *p; ++p) {
+        char c = *p;
+        if (quoted) {
+            putchar(c);
+            if (escaped) {
+                escaped = 0;
+            } else if (c == '\\') {
+                escaped = 1;
+            } else if (c == '"') {
+                quoted = 0;
+            }
+            continue;
+        }
+        if (c == ' ' || c == '\n' || c == '\r' || c == '\t') {
+            continue;
+        }
+        if (c == '"') {
+            quoted = 1;
+            putchar(c);
+        } else if (c == '{' || c == '[') {
+            putchar(c);
+            putchar('\n');
+            indent++;
+            printf("%*s", indent * 2, "");
+        } else if (c == '}' || c == ']') {
+            indent--;
+            putchar('\n');
+            printf("%*s%c", indent * 2, "", c);
+        } else if (c == ',') {
+            putchar(c);
+            putchar('\n');
+            printf("%*s", indent * 2, "");
+        } else if (c == ':') {
+            printf(": ");
+        } else {
+            putchar(c);
+        }
+    }
+    putchar('\n');
+}
+
+static int cmd_resources(int argc, char *argv[], const char *socket_path)
+{
+    int phy = -1, vnpu = -1, detail = 0;
+    char allocation_id[128] = {0};
+    char pod_uid[384] = {0};
+    char container_name[192] = {0};
+    for (int i = 2; i < argc; ++i) {
+        if (strcmp(argv[i], "--socket") == 0 && i + 1 < argc) {
+            ++i;
+            continue;
+        }
+        if (strcmp(argv[i], "--detail") == 0 && !detail) {
+            detail = 1;
+            continue;
+        }
+        char *text = strcmp(argv[i], "--allocation-id") == 0  ? allocation_id :
+                     strcmp(argv[i], "--pod-uid") == 0        ? pod_uid :
+                     strcmp(argv[i], "--container-name") == 0 ? container_name :
+                                                                NULL;
+        size_t text_capacity = text == allocation_id ? sizeof(allocation_id) :
+                               text == pod_uid       ? sizeof(pod_uid) :
+                                                       sizeof(container_name);
+        if (text != NULL) {
+            if (*text != '\0' || i + 1 >= argc || resource_url_encode(argv[++i], text, text_capacity) != 0) {
+                fprintf(stderr, "Error: Invalid or duplicate resources option\n");
+                return 1;
+            }
+            continue;
+        }
+        int *id = strcmp(argv[i], "--phy-id") == 0 ? &phy : strcmp(argv[i], "--vnpu-id") == 0 ? &vnpu : NULL;
+        if (id == NULL || *id != -1 || i + 1 >= argc || resource_cli_id(argv[++i], id) != 0) {
+            fprintf(stderr, "Error: Invalid or duplicate resources option\n");
+            return 1;
+        }
+    }
+    if (vnpu >= 0 && phy < 0) {
+        fprintf(stderr, "Error: --vnpu-id requires --phy-id\n");
+        return 1;
+    }
+    int selector_count = allocation_id[0] != '\0';
+    selector_count += phy >= 0;
+    selector_count += pod_uid[0] != '\0' || container_name[0] != '\0';
+    if (selector_count > 1) {
+        fprintf(stderr, "Error: allocation, resource and metadata selectors are mutually exclusive\n");
+        return 1;
+    }
+    char path[MAX_URL_LEN];
+    int n;
+    if (allocation_id[0] != '\0') {
+        n = snprintf_s(path, sizeof(path), sizeof(path) - 1, "/api/v1/resources?allocation_id=%s&detail=%s",
+                       allocation_id, detail ? "true" : "false");
+    } else if (pod_uid[0] != '\0' && container_name[0] != '\0') {
+        n = snprintf_s(path, sizeof(path), sizeof(path) - 1, "/api/v1/resources?pod_uid=%s&container_name=%s&detail=%s",
+                       pod_uid, container_name, detail ? "true" : "false");
+    } else if (pod_uid[0] != '\0' || container_name[0] != '\0') {
+        n = snprintf_s(path, sizeof(path), sizeof(path) - 1, "/api/v1/resources?%s=%s&detail=%s",
+                       pod_uid[0] != '\0' ? "pod_uid" : "container_name", pod_uid[0] != '\0' ? pod_uid : container_name,
+                       detail ? "true" : "false");
+    } else if (vnpu >= 0) {
+        n = snprintf_s(path, sizeof(path), sizeof(path) - 1, "/api/v1/resources?phy_id=%d&vnpu_id=%d&detail=%s", phy,
+                       vnpu, detail ? "true" : "false");
+    } else if (phy >= 0) {
+        n = snprintf_s(path, sizeof(path), sizeof(path) - 1, "/api/v1/resources?phy_id=%d&detail=%s", phy,
+                       detail ? "true" : "false");
+    } else {
+        n = snprintf_s(path, sizeof(path), sizeof(path) - 1, "/api/v1/resources?detail=%s", detail ? "true" : "false");
+    }
+    if (n < 0) {
+        return 1;
+    }
+    /* Match the server body limit plus room for headers; never silently truncate. */
+    const int capacity = 8 * 1024 * 1024 + 4096;
+    char *response = malloc((size_t)capacity);
+    if (response == NULL) {
+        fprintf(stderr, "Error: Out of memory\n");
+        return 1;
+    }
+    int ret = http_request(socket_path, "GET", path, NULL, response, capacity);
+    if (ret >= 0 && get_status_code(response) == 200) {
+        print_resource_json(get_body(response));
+        ret = 0;
+    } else {
+        if (ret >= 0) {
+            fprintf(stderr, "Error: HTTP %d - %s\n", get_status_code(response), get_body(response));
+        }
+        ret = 1;
+    }
+    free(response);
+    return ret;
+}
+
+static int cmd_alloc(int argc, char *argv[], const char *socket_path)
 {
     int aicore = -1;
     uint64_t hbm = 0;
@@ -261,12 +481,10 @@ static int cmd_alloc(int argc, char *argv[], const char *host, const char *port)
         int has_val = (val != NULL);
 
         if (strcmp(argv[i], "--allocation-id") == 0) {
-            uuid_t id;
-            if (!has_val || uuid_parse(val, id) != 0) {
+            if (!has_val || !allocation_id_normalize(val, allocation_id)) {
                 fprintf(stderr, "Error: --allocation-id requires a UUID\n");
                 return 1;
             }
-            uuid_unparse_lower(id, allocation_id);
         } else if (strcmp(argv[i], "-n") == 0 && has_val) {
             aicore = atoi(val);
         } else if (strcmp(argv[i], "-m") == 0 && has_val) {
@@ -343,7 +561,7 @@ static int cmd_alloc(int argc, char *argv[], const char *host, const char *port)
         }
 
         char response[RECV_BUF_SIZE];
-        int ret = http_request(host, port, "POST", "/api/v1/allocate", body, response, sizeof(response));
+        int ret = http_request(socket_path, "POST", "/api/v1/allocate", body, response, sizeof(response));
         if (ret < 0) {
             return 1;
         }
@@ -358,10 +576,13 @@ static int cmd_alloc(int argc, char *argv[], const char *host, const char *port)
 
         int resp_phy_id = 0, resp_vnpu_id = 0, resp_aicore = 0, resp_sched_policy = 0;
         uint64_t resp_hbm_request = 0, resp_hbm_limit = 0;
+        char allocation_id[64] = "", config_path[512] = "";
         char shm_id[128] = "", minor_name[64] = "";
         char resp_pod_uid[128] = "", resp_container[128] = "";
         char resp_die_id[64] = "";
 
+        parse_string(resp_body, "allocation_id", allocation_id, sizeof(allocation_id));
+        parse_string(resp_body, "config_path", config_path, sizeof(config_path));
         parse_int(resp_body, "phy_id", &resp_phy_id);
         parse_int(resp_body, "vnpu_id", &resp_vnpu_id);
         parse_string(resp_body, "pod_uid", resp_pod_uid, sizeof(resp_pod_uid));
@@ -375,6 +596,8 @@ static int cmd_alloc(int argc, char *argv[], const char *host, const char *port)
         parse_string(resp_body, "minor_name", minor_name, sizeof(minor_name));
 
         printf("vNPU Allocated:\n");
+        printf("  Allocation:   %s\n", allocation_id);
+        printf("  Config:       %s\n", config_path);
         printf("  Physical ID:  %d\n", resp_phy_id);
         printf("  Virtual ID:   %d\n", resp_vnpu_id);
         printf("  Pod UID:      %s\n", resp_pod_uid);
@@ -405,7 +628,7 @@ static int cmd_alloc(int argc, char *argv[], const char *host, const char *port)
     }
 
     char response[RECV_BUF_SIZE];
-    int ret = http_request(host, port, "POST", "/api/v1/allocate", body, response, sizeof(response));
+    int ret = http_request(socket_path, "POST", "/api/v1/allocate", body, response, sizeof(response));
     if (ret < 0) {
         return 1;
     }
@@ -419,10 +642,13 @@ static int cmd_alloc(int argc, char *argv[], const char *host, const char *port)
     }
 
     int phy_id_resp = 0, vnpu_id = 0, aicore_quota = 0, sched_policy = 0;
+    char config_path[512] = "";
     char shm_id[128] = "", minor_name[64] = "";
     char resp_pod_uid[128] = "", resp_container[128] = "";
     char die_id[64] = "";
 
+    parse_string(resp_body, "allocation_id", allocation_id, sizeof(allocation_id));
+    parse_string(resp_body, "config_path", config_path, sizeof(config_path));
     parse_int(resp_body, "phy_id", &phy_id_resp);
     parse_int(resp_body, "vnpu_id", &vnpu_id);
     parse_string(resp_body, "pod_uid", resp_pod_uid, sizeof(resp_pod_uid));
@@ -434,6 +660,8 @@ static int cmd_alloc(int argc, char *argv[], const char *host, const char *port)
     parse_string(resp_body, "minor_name", minor_name, sizeof(minor_name));
 
     printf("vNPU Allocated:\n");
+    printf("  Allocation:   %s\n", allocation_id);
+    printf("  Config:       %s\n", config_path);
     printf("  Physical ID:  %d\n", phy_id_resp);
     printf("  Virtual ID:   %d\n", vnpu_id);
     printf("  Pod UID:      %s\n", resp_pod_uid);
@@ -461,8 +689,9 @@ static void encode_query_value(const char *value, char *out)
     *out = '\0';
 }
 
-static int cmd_release(int argc, char *argv[], const char *host, const char *port)
+static int cmd_release(int argc, char *argv[], const char *socket_path)
 {
+    char allocation_id[64] = "";
     char pod_uid[128] = "";
     char container[64] = "";
 
@@ -471,7 +700,13 @@ static int cmd_release(int argc, char *argv[], const char *host, const char *por
         const char *val = (i + 1 < argc) ? argv[i + 1] : NULL;
         int has_val = (val != NULL);
 
-        if (strcmp(argv[i], "-u") == 0 && has_val) {
+        if ((strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--allocation-id") == 0) && has_val) {
+            if (strlen(val) >= sizeof(allocation_id) ||
+                strncpy_s(allocation_id, sizeof(allocation_id), val, strlen(val)) != 0) {
+                fprintf(stderr, "Error: Failed to copy allocation_id\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "-u") == 0 && has_val) {
             if (strlen(val) >= sizeof(pod_uid) || strncpy_s(pod_uid, sizeof(pod_uid), val, strlen(val)) != 0) {
                 fprintf(stderr, "Error: Failed to copy pod_uid\n");
                 return 1;
@@ -488,8 +723,9 @@ static int cmd_release(int argc, char *argv[], const char *host, const char *por
         i += has_val ? 2 : 1;
     }
 
-    if (strlen(pod_uid) == 0 || strlen(container) == 0) {
-        fprintf(stderr, "Error: -u <pod_uid> and -c <container> are required\n");
+    int by_id = allocation_id[0] != '\0';
+    if (!by_id && (pod_uid[0] == '\0' || container[0] == '\0')) {
+        fprintf(stderr, "Error: -a <allocation_id> or both -u <pod_uid> and -c <container> are required\n");
         return 1;
     }
 
@@ -497,15 +733,17 @@ static int cmd_release(int argc, char *argv[], const char *host, const char *por
     encode_query_value(pod_uid, encoded_pod);
     encode_query_value(container, encoded_container);
     char path[sizeof(encoded_pod) + sizeof(encoded_container) + 64];
-    int path_len = snprintf_s(path, sizeof(path), sizeof(path) - 1, "/api/v1/allocations?pod_uid=%s&container_name=%s",
-                              encoded_pod, encoded_container);
+    int path_len = by_id ?
+                       snprintf_s(path, sizeof(path), sizeof(path) - 1, "/api/v1/allocations/%s", allocation_id) :
+                       snprintf_s(path, sizeof(path), sizeof(path) - 1,
+                                  "/api/v1/allocations?pod_uid=%s&container_name=%s", encoded_pod, encoded_container);
     if (path_len < 0 || path_len >= (int)sizeof(path)) {
         fprintf(stderr, "Error: Failed to build request path\n");
         return 1;
     }
 
     char response[RECV_BUF_SIZE];
-    int ret = http_request(host, port, "DELETE", path, NULL, response, sizeof(response));
+    int ret = http_request(socket_path, "DELETE", path, NULL, response, sizeof(response));
     if (ret < 0) {
         return 1;
     }
@@ -520,10 +758,10 @@ static int cmd_release(int argc, char *argv[], const char *host, const char *por
     return 0;
 }
 
-static int cmd_status(int argc, char *argv[], const char *host, const char *port)
+static int cmd_status(int argc, char *argv[], const char *socket_path)
 {
     char response[RECV_BUF_SIZE];
-    int ret = http_request(host, port, "GET", "/api/v1/allocations", NULL, response, sizeof(response));
+    int ret = http_request(socket_path, "GET", "/api/v1/allocations", NULL, response, sizeof(response));
     if (ret < 0) {
         return 1;
     }
@@ -539,10 +777,10 @@ static int cmd_status(int argc, char *argv[], const char *host, const char *port
     return 0;
 }
 
-static int cmd_checkpoint(int argc, char *argv[], const char *host, const char *port)
+static int cmd_checkpoint(int argc, char *argv[], const char *socket_path)
 {
     char response[RECV_BUF_SIZE];
-    int ret = http_request(host, port, "POST", "/api/v1/checkpoint", "{}", response, sizeof(response));
+    int ret = http_request(socket_path, "POST", "/api/v1/checkpoint", "{}", response, sizeof(response));
     if (ret < 0) {
         return 1;
     }
@@ -557,10 +795,10 @@ static int cmd_checkpoint(int argc, char *argv[], const char *host, const char *
     return 0;
 }
 
-static int cmd_recover(int argc, char *argv[], const char *host, const char *port)
+static int cmd_recover(int argc, char *argv[], const char *socket_path)
 {
     char response[RECV_BUF_SIZE];
-    int ret = http_request(host, port, "POST", "/api/v1/recover", "{}", response, sizeof(response));
+    int ret = http_request(socket_path, "POST", "/api/v1/recover", "{}", response, sizeof(response));
     if (ret < 0) {
         return 1;
     }
@@ -575,10 +813,10 @@ static int cmd_recover(int argc, char *argv[], const char *host, const char *por
     return 0;
 }
 
-static int cmd_swap_status(int argc, char *argv[], const char *host, const char *port)
+static int cmd_swap_status(int argc, char *argv[], const char *socket_path)
 {
     char response[RECV_BUF_SIZE];
-    int ret = http_request(host, port, "GET", "/api/v1/swap/status", NULL, response, sizeof(response));
+    int ret = http_request(socket_path, "GET", "/api/v1/swap/status", NULL, response, sizeof(response));
     if (ret < 0) {
         return 1;
     }
@@ -604,7 +842,7 @@ static int cmd_swap_status(int argc, char *argv[], const char *host, const char 
     return 0;
 }
 
-static int cmd_swap_clean(int argc, char *argv[], const char *host, const char *port)
+static int cmd_swap_clean(int argc, char *argv[], const char *socket_path)
 {
     if (argc < 4) {
         fprintf(stderr, "Error: pod_uid required\n");
@@ -625,7 +863,7 @@ static int cmd_swap_clean(int argc, char *argv[], const char *host, const char *
     }
 
     char response[RECV_BUF_SIZE];
-    int ret = http_request(host, port, "POST", "/api/v1/swap/clean", body, response, sizeof(response));
+    int ret = http_request(socket_path, "POST", "/api/v1/swap/clean", body, response, sizeof(response));
     if (ret < 0) {
         return 1;
     }
@@ -640,7 +878,7 @@ static int cmd_swap_clean(int argc, char *argv[], const char *host, const char *
     return 0;
 }
 
-static int cmd_swap_out(int argc, char *argv[], const char *host, const char *port)
+static int cmd_swap_out(int argc, char *argv[], const char *socket_path)
 {
     if (argc < 4) {
         fprintf(stderr, "Error: pod_uid required\n");
@@ -661,7 +899,7 @@ static int cmd_swap_out(int argc, char *argv[], const char *host, const char *po
     }
 
     char response[RECV_BUF_SIZE];
-    int ret = http_request(host, port, "POST", "/api/v1/swap/force-out", body, response, sizeof(response));
+    int ret = http_request(socket_path, "POST", "/api/v1/swap/force-out", body, response, sizeof(response));
     if (ret < 0) {
         return 1;
     }
@@ -676,7 +914,7 @@ static int cmd_swap_out(int argc, char *argv[], const char *host, const char *po
     return 0;
 }
 
-static int cmd_swap_in(int argc, char *argv[], const char *host, const char *port)
+static int cmd_swap_in(int argc, char *argv[], const char *socket_path)
 {
     if (argc < 4) {
         fprintf(stderr, "Error: pod_uid required\n");
@@ -697,7 +935,7 @@ static int cmd_swap_in(int argc, char *argv[], const char *host, const char *por
     }
 
     char response[RECV_BUF_SIZE];
-    int ret = http_request(host, port, "POST", "/api/v1/swap/force-in", body, response, sizeof(response));
+    int ret = http_request(socket_path, "POST", "/api/v1/swap/force-in", body, response, sizeof(response));
     if (ret < 0) {
         return 1;
     }
@@ -719,41 +957,53 @@ int cli_main(int argc, char *argv[])
         return 1;
     }
 
-    const char *host = CLI_DEFAULT_HOST;
-    const char *port = CLI_DEFAULT_PORT;
+    const char *socket_path = CLI_DEFAULT_SOCKET_PATH;
 
     int i = 1;
     while (i < argc) {
-        if (strcmp(argv[i], "--server") == 0 && i + 1 < argc) {
-            char *server = argv[i + 1];
-            char *colon = strchr(server, ':');
-            if (colon) {
-                *colon = '\0';
-                host = server;
-                port = colon + 1;
-            } else {
-                host = server;
+        if (strcmp(argv[i], "--socket") == 0) {
+            if (i + 1 >= argc || argv[i + 1][0] != '/' ||
+                strnlen(argv[i + 1], sizeof(((struct sockaddr_un *)0)->sun_path)) >=
+                    sizeof(((struct sockaddr_un *)0)->sun_path)) {
+                fprintf(stderr, "Error: --socket requires a valid absolute Unix socket path\n");
+                return 1;
             }
+            socket_path = argv[i + 1];
             i += 2;
         } else {
             i++;
         }
     }
 
+    /* Also accept the conventional global-option form:
+     * enpu-cli --socket /path/to/socket <command> ... */
+    if (argc >= 3 && strcmp(argv[1], "--socket") == 0) {
+        for (int j = 1; j + 2 < argc; ++j) {
+            argv[j] = argv[j + 2];
+        }
+        argc -= 2;
+        if (argc < 2) {
+            fprintf(stderr, "Error: command is required\n");
+            return 1;
+        }
+    }
+
     const char *cmd = argv[1];
 
     if (strcmp(cmd, "list") == 0) {
-        return cmd_list(argc, argv, host, port);
+        return cmd_list(argc, argv, socket_path);
+    } else if (strcmp(cmd, "resources") == 0) {
+        return cmd_resources(argc, argv, socket_path);
     } else if (strcmp(cmd, "alloc") == 0) {
-        return cmd_alloc(argc, argv, host, port);
+        return cmd_alloc(argc, argv, socket_path);
     } else if (strcmp(cmd, "release") == 0) {
-        return cmd_release(argc, argv, host, port);
+        return cmd_release(argc, argv, socket_path);
     } else if (strcmp(cmd, "status") == 0) {
-        return cmd_status(argc, argv, host, port);
+        return cmd_status(argc, argv, socket_path);
     } else if (strcmp(cmd, "checkpoint") == 0) {
-        return cmd_checkpoint(argc, argv, host, port);
+        return cmd_checkpoint(argc, argv, socket_path);
     } else if (strcmp(cmd, "recover") == 0) {
-        return cmd_recover(argc, argv, host, port);
+        return cmd_recover(argc, argv, socket_path);
     } else if (strcmp(cmd, "swap") == 0) {
         if (argc < 3) {
             fprintf(stderr, "Error: swap subcommand required (status|clean|out|in)\n");
@@ -761,13 +1011,13 @@ int cli_main(int argc, char *argv[])
         }
         const char *subcmd = argv[2];
         if (strcmp(subcmd, "status") == 0) {
-            return cmd_swap_status(argc, argv, host, port);
+            return cmd_swap_status(argc, argv, socket_path);
         } else if (strcmp(subcmd, "clean") == 0) {
-            return cmd_swap_clean(argc, argv, host, port);
+            return cmd_swap_clean(argc, argv, socket_path);
         } else if (strcmp(subcmd, "out") == 0) {
-            return cmd_swap_out(argc, argv, host, port);
+            return cmd_swap_out(argc, argv, socket_path);
         } else if (strcmp(subcmd, "in") == 0) {
-            return cmd_swap_in(argc, argv, host, port);
+            return cmd_swap_in(argc, argv, socket_path);
         } else {
             fprintf(stderr, "Error: Unknown swap subcommand '%s'\n", subcmd);
             return 1;

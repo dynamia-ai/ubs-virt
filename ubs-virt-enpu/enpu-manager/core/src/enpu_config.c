@@ -26,7 +26,7 @@ static void copy_config_str(char *dest, size_t dest_size, const char *src)
 
 static void init_defaults(enpu_config_t *config)
 {
-    config->rest_port = ENPU_CONFIG_DEFAULT_REST_PORT;
+    copy_config_str(config->socket_path, MAX_PATH_LEN, ENPU_CONFIG_DEFAULT_SOCKET_PATH);
 
     copy_config_str(config->config_dir, MAX_PATH_LEN, "/etc/enpu");
     copy_config_str(config->state_dir, MAX_PATH_LEN, "/var/lib/enpu-manager");
@@ -100,8 +100,8 @@ static void parse_oversub_ratio_csv(const char *val, enpu_config_t *config)
 
 static void parse_key_value(const char *key, const char *val, enpu_config_t *config)
 {
-    if (strcmp(key, "rest_port") == 0) {
-        config->rest_port = atoi(val);
+    if (strcmp(key, "socket_path") == 0) {
+        copy_config_str(config->socket_path, MAX_PATH_LEN, val);
     } else if (strcmp(key, "config_dir") == 0) {
         copy_config_str(config->config_dir, MAX_PATH_LEN, val);
     } else if (strcmp(key, "state_dir") == 0) {
@@ -194,9 +194,9 @@ static void load_from_file(const char *path, enpu_config_t *config)
 
 static void load_from_env(enpu_config_t *config)
 {
-    char *val = getenv("ENPU_REST_PORT");
+    char *val = getenv("ENPU_SOCKET_PATH");
     if (val) {
-        config->rest_port = atoi(val);
+        copy_config_str(config->socket_path, MAX_PATH_LEN, val);
     }
 
     val = getenv("ENPU_CONFIG_DIR");

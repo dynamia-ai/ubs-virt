@@ -10,6 +10,7 @@
  * See the Mulan PSL v2 for more details.
  */
 
+#include <errno.h>
 #include <gtest/gtest.h>
 #include <mockcpp/mockcpp.hpp>
 
@@ -54,6 +55,30 @@ int stub_enpu_dcmi_get_device_resource_info(int logic_id, int card_id, int devic
     (void)device_id;
     *used = 512 * MB_TO_B;
     return ENPU_SUCCESS;
+}
+
+int stub_dcmi_process_memory(int device_id, int sub_device_id, struct dcmi_proc_mem_info *processes, int *count)
+{
+    (void)device_id;
+    (void)sub_device_id;
+    processes[0].proc_mem_usage = 1024;
+    processes[1].proc_mem_usage = 2048;
+    *count = 2;
+    return 0;
+}
+
+int stub_dcmiv2_process_memory(int device_id, struct dcmi_proc_mem_info *processes, int *count)
+{
+    return stub_dcmi_process_memory(device_id, 0, processes, count);
+}
+
+int stub_dcmi_full_process_list(int device_id, int sub_device_id, struct dcmi_proc_mem_info *processes, int *count)
+{
+    (void)device_id;
+    (void)sub_device_id;
+    (void)processes;
+    *count = MAX_PIDS;
+    return 0;
 }
 
 int stub_memory_limiter_init(void)
@@ -204,4 +229,32 @@ TEST_F(NpuManagerTest, RegisterToShmStateAssignsRegistrySlot)
     unregister_from_shm_state(&state, 0, slot);
     EXPECT_EQ(get_registry_slot(), -1);
     EXPECT_FALSE(state.entries[0].processes[slot].active.load());
+}
+
+TEST_F(NpuManagerTest, DcmiQueryHbmUsageValidatesInput)
+{
+    uint64_t used = 123;
+    EXPECT_EQ(enpu_dcmi_query_hbm_usage(0, 0, 0, SOC_VERSION_ASCEND_910, nullptr), -EINVAL);
+    EXPECT_EQ(enpu_dcmi_query_hbm_usage(0, 0, 0, SOC_VERSION_ASCEND_310 + 1, &used), -EINVAL);
+    EXPECT_EQ(used, 123U);
+}
+
+TEST_F(NpuManagerTest, DcmiQueryHbmUsageSumsBothApis)
+{
+    uint64_t used = 0;
+    MOCKER(dcmi_get_device_resource_info).stubs().will(invoke(stub_dcmi_process_memory));
+    EXPECT_EQ(enpu_dcmi_query_hbm_usage(0, 1, 2, SOC_VERSION_ASCEND_910, &used), 0);
+    EXPECT_EQ(used, 3072U);
+
+    MOCKER(dcmiv2_get_device_proc_mem_info).stubs().will(invoke(stub_dcmiv2_process_memory));
+    EXPECT_EQ(enpu_dcmi_query_hbm_usage(3, 0, 0, SOC_VERSION_ASCEND_950, &used), 0);
+    EXPECT_EQ(used, 3072U);
+}
+
+TEST_F(NpuManagerTest, DcmiQueryHbmUsageRejectsPossiblyTruncatedList)
+{
+    uint64_t used = 123;
+    MOCKER(dcmi_get_device_resource_info).stubs().will(invoke(stub_dcmi_full_process_list));
+    EXPECT_EQ(enpu_dcmi_query_hbm_usage(0, 1, 2, SOC_VERSION_ASCEND_910, &used), -EMSGSIZE);
+    EXPECT_EQ(used, 0U);
 }

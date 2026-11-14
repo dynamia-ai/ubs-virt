@@ -48,10 +48,10 @@ static void *swap_resolver_thread_func(void *arg)
         if (level == WATERMARK_PRE_SWAP || to_swap_out != SWAP_OUT_NONE) {
             LOG_INFO("swap_resolver_thread: watermark level=%d detected", level);
 
-            swap_candidate_t candidates[MAX_VNPU_SCHED];
+            swap_candidate_t candidates[VNPU_SCHED_MAX_VNPU];
             int actual_count = 0;
 
-            ret = swap_resolver_get_idle_models(thread->resolver, thread->phy_id, candidates, MAX_VNPU_SCHED,
+            ret = swap_resolver_get_idle_models(thread->resolver, thread->phy_id, candidates, VNPU_SCHED_MAX_VNPU,
                                                 &actual_count, to_swap_out);
             if (ret != ENPU_SUCCESS || actual_count <= 0) {
                 LOG_ERROR("swap_resolver_thread: get_idle_models failed or no idle models, "

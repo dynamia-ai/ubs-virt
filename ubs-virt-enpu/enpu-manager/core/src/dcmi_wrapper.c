@@ -6,11 +6,13 @@
 #include <securec.h>
 
 #include <acl/acl.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "dcmi_interface_api.h"
 #include "dcmi_wrapper.h"
 #include "log.h"
@@ -19,6 +21,9 @@
 #define NPU_UTILIZATION_TYPE_TOTAL (13)
 #define NPU_UTILIZATION_TYPE_AICORE (2)
 #define NPU_UTILIZATION_TYPE_AICPU (3)
+#define NPU_UTILIZATION_TYPE_CTRLCPU (4)
+#define NPU_UTILIZATION_TYPE_VECTOR (12)
+#define NPU_UTILIZATION_TYPE_CUBE (14)
 
 static pthread_mutex_t g_dcmi_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int g_dcmi_initialized = 0;
@@ -57,6 +62,28 @@ static void detect_soc_version(void)
         }                                                     \
     } while (0)
 
+static bool dcmi_v2_symbols_available(void)
+{
+    bool available = true;
+#define CHECK_DCMI_V2_SYMBOL(symbol)                                                    \
+    do {                                                                                \
+        if ((symbol) == NULL) {                                                         \
+            LOG_ERROR("[DCMI] Ascend950 requires missing DCMI v2 symbol: %s", #symbol); \
+            available = false;                                                          \
+        }                                                                               \
+    } while (0)
+
+    CHECK_DCMI_V2_SYMBOL(dcmiv2_init);
+    CHECK_DCMI_V2_SYMBOL(dcmiv2_get_all_device_count);
+    CHECK_DCMI_V2_SYMBOL(dcmiv2_get_device_list);
+    CHECK_DCMI_V2_SYMBOL(dcmiv2_get_device_hbm_info);
+    CHECK_DCMI_V2_SYMBOL(dcmiv2_get_device_chip_info);
+    CHECK_DCMI_V2_SYMBOL(dcmiv2_get_device_die_id);
+    CHECK_DCMI_V2_SYMBOL(dcmiv2_get_device_proc_mem_info);
+#undef CHECK_DCMI_V2_SYMBOL
+    return available;
+}
+
 int dcmi_wrapper_init(void)
 {
     pthread_mutex_lock(&g_dcmi_mutex);
@@ -70,6 +97,13 @@ int dcmi_wrapper_init(void)
 
     int ret;
     if (g_soc_version == SOC_VERSION_ASCEND_950) {
+        /* Validate required v2 operations before publishing initialized=true.
+         * Utilization is optional and guarded at its call sites. Never fall
+         * back to legacy IDs on 950. */
+        if (!dcmi_v2_symbols_available()) {
+            pthread_mutex_unlock(&g_dcmi_mutex);
+            return ENPU_FAIL;
+        }
         ret = dcmiv2_init();
     } else {
         ret = dcmi_init();
@@ -342,10 +376,96 @@ int dcmi_get_shm_id_by_logic_id(int logic_id, char *shm_id, size_t shm_id_size)
     return ENPU_SUCCESS;
 }
 
+static uint64_t dcmi_sample_time_ns(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        LOG_WARN("[DCMI] Failed to read sample clock: errno=%d", errno);
+        return 0;
+    }
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+int dcmi_query_resource_metrics(int logic_id, dcmi_resource_metrics_t *metrics)
+{
+    CHECK_PARAM_NULL(metrics, ENPU_INVALID_PARAM);
+    *metrics = (dcmi_resource_metrics_t){0};
+    dcmi_metric_t *fields[] = {&metrics->npu,     &metrics->aicore, &metrics->aicpu,
+                               &metrics->ctrlcpu, &metrics->cube,   &metrics->vector};
+    const int types[] = {NPU_UTILIZATION_TYPE_TOTAL,   NPU_UTILIZATION_TYPE_AICORE, NPU_UTILIZATION_TYPE_AICPU,
+                         NPU_UTILIZATION_TYPE_CTRLCPU, NPU_UTILIZATION_TYPE_CUBE,   NPU_UTILIZATION_TYPE_VECTOR};
+    const char *names[] = {"npu", "aicore", "aicpu", "ctrlcpu", "cube", "vector"};
+    const size_t count = sizeof(fields) / sizeof(fields[0]);
+    for (size_t i = 0; i < count; ++i) {
+        fields[i]->status = DCMI_METRIC_UNAVAILABLE;
+        fields[i]->source_result = ENPU_FAIL;
+    }
+    if (logic_id < 0) {
+        LOG_WARN("[DCMI] Invalid resource metrics logic_id=%d", logic_id);
+        return ENPU_INVALID_PARAM;
+    }
+    CHECK_INIT();
+    bool v2 = g_soc_version == SOC_VERSION_ASCEND_950;
+    if (v2 && dcmiv2_get_device_utilization_rate == NULL) {
+        LOG_WARN("[DCMI] Resource metrics unavailable: logic=%d optional v2 utilization symbol missing", logic_id);
+        return ENPU_FAIL;
+    }
+    int card_id = DCMI_INVALID_CARD_ID;
+    int device_id = logic_id;
+    if (!v2) {
+        int ret = dcmi_get_card_id_device_id_from_logicid(&card_id, &device_id, (unsigned int)logic_id);
+        if (ret != DCMI_OK) {
+            for (size_t i = 0; i < count; ++i) {
+                fields[i]->source_result = ret;
+            }
+            LOG_WARN("[DCMI] Resource metrics mapping failed: logic=%d ret=%d", logic_id, ret);
+            return ENPU_FAIL;
+        }
+    }
+    LOG_DEBUG("[DCMI] Resource metrics address: logic=%d api=%s card=%d device=%d", logic_id, v2 ? "v2" : "legacy",
+              card_id, device_id);
+    for (size_t i = 0; i < count; ++i) {
+        unsigned int value = 0;
+        int ret = v2 ? dcmiv2_get_device_utilization_rate(logic_id, types[i], &value) :
+                       dcmi_get_device_utilization_rate(card_id, device_id, types[i], &value);
+        dcmi_metric_t *metric = fields[i];
+        metric->source_result = ret;
+        if (ret == DCMI_OK) {
+            metric->sampled_at_monotonic_ns = dcmi_sample_time_ns();
+            if (value <= HUNDRED_CORE) {
+                metric->value = value;
+                metric->status = DCMI_METRIC_OK;
+            } else {
+                metric->status = DCMI_METRIC_INCONSISTENT;
+                LOG_WARN("[DCMI] Invalid utilization: logic=%d metric=%s type=%d value=%u", logic_id, names[i],
+                         types[i], value);
+            }
+        } else if (ret == DCMI_ERR_CODE_NOT_SUPPORT || ret == DCMI_ERR_CODE_NOT_SUPPORT_IN_CONTAINER) {
+            metric->status = DCMI_METRIC_UNSUPPORTED;
+            LOG_DEBUG("[DCMI] Unsupported utilization: logic=%d metric=%s type=%d ret=%d", logic_id, names[i], types[i],
+                      ret);
+        } else {
+            LOG_WARN("[DCMI] Utilization query failed: logic=%d api=%s card=%d device=%d metric=%s type=%d ret=%d",
+                     logic_id, v2 ? "v2" : "legacy", card_id, device_id, names[i], types[i], ret);
+        }
+        LOG_DEBUG("[DCMI] Resource metric: logic=%d metric=%s type=%d status=%d ret=%d value=%u sampled_ns=%llu",
+                  logic_id, names[i], types[i], metric->status, ret, value,
+                  (unsigned long long)metric->sampled_at_monotonic_ns);
+    }
+    return ENPU_SUCCESS;
+}
+
 int dcmi_get_utilization(int logic_id, dcmi_utilization_t *utilization)
 {
     CHECK_PARAM_NULL(utilization, ENPU_INVALID_PARAM);
     CHECK_INIT();
+
+    if (logic_id < 0) {
+        return ENPU_INVALID_PARAM;
+    }
+    if (g_soc_version == SOC_VERSION_ASCEND_950) {
+        return dcmi_get_utilization_by_card(DCMI_INVALID_CARD_ID, logic_id, utilization);
+    }
 
     int card_id = 0, device_id = 0;
     int ret = dcmi_get_card_id_device_id_from_logicid(&card_id, &device_id, (unsigned int)logic_id);
@@ -363,6 +483,10 @@ int dcmi_get_utilization_by_card(int card_id, int device_id, dcmi_utilization_t 
 
     int ret = 0;
     if (g_soc_version == SOC_VERSION_ASCEND_950) {
+        if (dcmiv2_get_device_utilization_rate == NULL) {
+            LOG_WARN("[DCMI] Optional DCMI v2 utilization symbol is missing: device=%d", device_id);
+            return ENPU_FAIL;
+        }
         int dev_id = device_id;
         ret |=
             dcmiv2_get_device_utilization_rate(dev_id, NPU_UTILIZATION_TYPE_AICORE, &utilization->aicore_utilization);

@@ -19,6 +19,8 @@
 
 #include "common.h"
 #include "core_limiter.h"
+#include "dcmi_wrapper.h"
+#include "hbm_sampler.h"
 #include "log.h"
 #include "mem_limiter.h"
 #include "npu_manager.h"
@@ -27,6 +29,7 @@
 #include "securec.h"
 #include "utils.h"
 #include "vnpu_stats.h"
+#include "vnpu_stats_hbm.h"
 
 extern "C" {
 // Non-static globals defined in vnpu_stats.c needed for state inspection.
@@ -161,6 +164,16 @@ static rtError_t StubEventElapsed1ms(float *timeInterval, rtEvent_t startEvent, 
         *timeInterval = 1.0f;
     }
     return RT_ERROR_NONE;
+}
+
+static int StubHbmUsage(int logicId, int cardId, int deviceId, uint8_t socVersion, uint64_t *usedBytes)
+{
+    (void)logicId;
+    (void)cardId;
+    (void)deviceId;
+    (void)socVersion;
+    *usedBytes = 4096;
+    return 0;
 }
 
 static rtError_t StubStreamSyncOk(rtStream_t stm)
@@ -316,6 +329,7 @@ protected:
 
     void TearDown() override
     {
+        hbm_sampler_stop();
         // Free any nodes left behind by list-based cases (same-process heap).
         if (sample_record_head != NULL) {
             while (sample_record_head->next != NULL) {
@@ -382,6 +396,53 @@ TEST_F(VnpuStatsTest, vnpu_stats_query_invalid_vnpu_id_fails)
     vnpu_stats_aggregate_t agg;
     EXPECT_EQ(vnpu_stats_query(MAX_VNPU, &agg), ENPU_FAIL);
     EXPECT_EQ(vnpu_stats_query(MAX_VNPU + 1, &agg), ENPU_FAIL);
+}
+
+TEST_F(VnpuStatsTest, hbm_sampler_publishes_and_stops)
+{
+    uint64_t savedGeneration = config.resource_generation;
+    config.resource_generation = 17;
+    uint8_t id = get_vnpu_id();
+    if (vnpu_stats_shared() == nullptr) {
+        ASSERT_EQ(vnpu_stats_init(get_vnpu_shm_id()), ENPU_SUCCESS);
+    }
+    ASSERT_NE(vnpu_stats_shared(), nullptr);
+    ASSERT_GE(vnpu_stats_shared_fd(), 0);
+    atomic_store(&shm_->hbm[id].requested_generation, 0);
+    MOCKER(enpu_dcmi_query_hbm_usage).stubs().will(invoke(StubHbmUsage));
+
+    ASSERT_EQ(hbm_sampler_start(), ENPU_SUCCESS);
+    EXPECT_EQ(hbm_sampler_start(), ENPU_SUCCESS);
+    vnpu_hbm_snapshot_t snapshot = {0};
+    for (int i = 0; i < 100; ++i) {
+        snapshot = vnpu_hbm_read(&shm_->hbm[id]);
+        if (snapshot.status == VNPU_STATS_HBM_OK && snapshot.generation == config.resource_generation) {
+            break;
+        }
+        usleep(1000);
+    }
+    EXPECT_EQ(snapshot.status, (uint32_t)VNPU_STATS_HBM_OK);
+    EXPECT_EQ(snapshot.generation, config.resource_generation);
+    EXPECT_EQ(snapshot.used_bytes, 4096U);
+    EXPECT_GT(snapshot.sampled_at_ns, 0U);
+
+    hbm_sampler_stop();
+    hbm_sampler_stop();
+    config.resource_generation = savedGeneration;
+}
+
+TEST_F(VnpuStatsTest, hbm_sampler_rejects_invalid_generation)
+{
+    uint64_t savedGeneration = config.resource_generation;
+    uint8_t id = get_vnpu_id();
+    config.resource_generation = 0;
+    EXPECT_EQ(hbm_sampler_start(), ENPU_FAIL);
+
+    config.resource_generation = 17;
+    atomic_store(&shm_->hbm[id].requested_generation, 18);
+    EXPECT_EQ(hbm_sampler_start(), ENPU_FAIL);
+    atomic_store(&shm_->hbm[id].requested_generation, 0);
+    config.resource_generation = savedGeneration;
 }
 
 // vnpu_stats_query on a vnpu with no records returns zeros with success.
@@ -640,7 +701,7 @@ TEST_F(VnpuStatsTest, vnpu_stats_init_input_and_map_failure_paths)
 
     // Mapping failure: the freshly allocated record head is released.
     FreeSampleRecords();
-    MOCKER(map_share_mem).stubs().will(returnValue((void *)NULL));
+    MOCKER(vnpu_stats_map_shared).stubs().will(returnValue((vnpu_stats_shm_t *)nullptr));
     EXPECT_EQ(vnpu_stats_init(get_vnpu_shm_id()), ENPU_FAIL);
     GlobalMockObject::reset();
     EXPECT_EQ(sample_record_head, nullptr);
@@ -651,23 +712,25 @@ TEST_F(VnpuStatsTest, vnpu_stats_init_input_and_map_failure_paths)
     EXPECT_TRUE(g_vnpu_stats_inited);
 }
 
-// do_init keeps data on the INITIALIZED fast path, and reclaims garbage or
-// stuck INITIALIZING magic by re-zeroing the whole shm.
+// do_init rejects incompatible magic, preserves initialized data, and recovers
+// interrupted initialization while holding the shared-memory file lock.
 TEST_F(VnpuStatsTest, vnpu_stats_do_init_magic_paths)
 {
     uint8_t id = get_vnpu_id();
 
-    // Garbage magic: full (re-)initialization zeroes previous stats.
+    // Unknown magic: reject the object without modifying existing data.
     atomic_store(&shm_->buckets[id][0].bucket_start_ns, ns_now());
     atomic_store(&shm_->buckets[id][0].sum_block_dim, 77);
     atomic_store(&shm_->magic_number, 0x12345678U);
     FreeSampleRecords();
     g_vnpu_stats_inited = false;
-    EXPECT_EQ(vnpu_stats_init(get_vnpu_shm_id()), ENPU_SUCCESS);
-    EXPECT_EQ(atomic_load(&shm_->buckets[id][0].sum_block_dim), 0U);
-    EXPECT_EQ(atomic_load(&shm_->magic_number), (uint_fast32_t)VNPU_STATS_MAGIC_INITIALIZED);
+    EXPECT_EQ(vnpu_stats_init(get_vnpu_shm_id()), ENPU_FAIL);
+    EXPECT_EQ(atomic_load(&shm_->buckets[id][0].sum_block_dim), 77U);
+    EXPECT_EQ(atomic_load(&shm_->magic_number), (uint_fast32_t)0x12345678U);
+    EXPECT_EQ(sample_record_head, nullptr);
 
     // INITIALIZED magic: fast path keeps existing data untouched.
+    atomic_store(&shm_->magic_number, VNPU_STATS_MAGIC_INITIALIZED);
     atomic_store(&shm_->buckets[id][1].bucket_start_ns, ns_now());
     atomic_store(&shm_->buckets[id][1].sum_block_dim, 55);
     FreeSampleRecords();
@@ -675,7 +738,7 @@ TEST_F(VnpuStatsTest, vnpu_stats_do_init_magic_paths)
     EXPECT_EQ(vnpu_stats_init(get_vnpu_shm_id()), ENPU_SUCCESS);
     EXPECT_EQ(atomic_load(&shm_->buckets[id][1].sum_block_dim), 55U);
 
-    // Stuck INITIALIZING magic (no concurrent finisher): timeout (~3ms) reclaims and re-zeroes.
+    // Interrupted INITIALIZING magic: the exclusive file lock permits recovery.
     atomic_store(&shm_->buckets[id][2].bucket_start_ns, ns_now());
     atomic_store(&shm_->buckets[id][2].sum_block_dim, 99);
     atomic_store(&shm_->magic_number, VNPU_STATS_MAGIC_INITIALIZING);

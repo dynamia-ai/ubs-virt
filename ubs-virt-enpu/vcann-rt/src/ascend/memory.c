@@ -23,7 +23,7 @@ RUNTIME_HOOK_DEFINE(rtMalloc, void **devPtr, uint64_t size, rtMemType_t type, co
 {
     LOG_DEBUG("Hook mem rtMalloc size:%" PRIu64 ".", size);
     swap_hook_t *swap_hook = swap_hook_get_global();
-    int ret = guard_memory(size, get_swap_enabled());
+    int ret = guard_memory(size, swap_hook != NULL);
     if (ret != ENPU_SUCCESS) {
         return ret;
     }
@@ -45,7 +45,7 @@ RUNTIME_HOOK_DEFINE(aclrtMallocImpl, void **devPtr, size_t size, aclrtMemMallocP
         return RUNTIME_HOOK_CALL(rt_library_entry, aclrtMallocImpl, devPtr, size, policy);
     }
     LOG_DEBUG("Hook mem aclrtMallocImpl size:%" PRIu64 ".", size);
-    int ret = guard_memory(size, get_swap_enabled());
+    int ret = guard_memory(size, swap_hook_get_global() != NULL);
     if (ret != ENPU_SUCCESS) {
         return ret;
     }
@@ -58,7 +58,7 @@ RUNTIME_HOOK_DEFINE(aclrtMallocAlign32Impl, void **devPtr, size_t size, aclrtMem
         return RUNTIME_HOOK_CALL(rt_library_entry, aclrtMallocAlign32Impl, devPtr, size, policy);
     }
     LOG_DEBUG("Hook mem aclrtMallocAlign32Impl size:%" PRIu64 ".", size);
-    int ret = guard_memory(size, get_swap_enabled());
+    int ret = guard_memory(size, swap_hook_get_global() != NULL);
     if (ret != ENPU_SUCCESS) {
         return ret;
     }
@@ -68,7 +68,7 @@ RUNTIME_HOOK_DEFINE(aclrtMallocAlign32Impl, void **devPtr, size_t size, aclrtMem
 RUNTIME_HOOK_DEFINE(rtMallocCached, void **devPtr, uint64_t size, rtMemType_t type, const uint16_t moduleId)
 {
     LOG_DEBUG("Hook mem rtMallocCached size:%" PRIu64 ".", size);
-    int ret = guard_memory(size, get_swap_enabled());
+    int ret = guard_memory(size, swap_hook_get_global() != NULL);
     if (ret != ENPU_SUCCESS) {
         return ret;
     }
@@ -81,7 +81,7 @@ RUNTIME_HOOK_DEFINE(aclrtMallocCachedImpl, void **devPtr, size_t size, aclrtMemM
         return RUNTIME_HOOK_CALL(rt_library_entry, aclrtMallocCachedImpl, devPtr, size, policy);
     }
     LOG_DEBUG("Hook mem aclrtMallocCachedImpl size:%" PRIu64 ".", size);
-    int ret = guard_memory(size, get_swap_enabled());
+    int ret = guard_memory(size, swap_hook_get_global() != NULL);
     if (ret != ENPU_SUCCESS) {
         return ret;
     }
@@ -91,7 +91,7 @@ RUNTIME_HOOK_DEFINE(aclrtMallocCachedImpl, void **devPtr, size_t size, aclrtMemM
 RUNTIME_HOOK_DEFINE(rtDvppMalloc, void **devPtr, uint64_t size, uint16_t moduleId)
 {
     LOG_DEBUG("Hook mem rtDvppMalloc size:%" PRIu64 ".", size);
-    int ret = guard_memory(size, get_swap_enabled());
+    int ret = guard_memory(size, swap_hook_get_global() != NULL);
     if (ret != ENPU_SUCCESS) {
         return ret;
     }
@@ -101,7 +101,7 @@ RUNTIME_HOOK_DEFINE(rtDvppMalloc, void **devPtr, uint64_t size, uint16_t moduleI
 RUNTIME_HOOK_DEFINE(rtDvppMallocWithFlag, void **devPtr, uint64_t size, uint32_t flag, const uint16_t moduleId)
 {
     LOG_DEBUG("Hook mem rtDvppMallocWithFlag size:%" PRIu64 ".", size);
-    int ret = guard_memory(size, get_swap_enabled());
+    int ret = guard_memory(size, swap_hook_get_global() != NULL);
     if (ret != ENPU_SUCCESS) {
         return ret;
     }
@@ -112,7 +112,7 @@ RUNTIME_HOOK_DEFINE(rtMemAlloc, void **devPtr, uint64_t size, rtMallocPolicy pol
                     rtMallocConfig_t *cfg)
 {
     LOG_DEBUG("Hook mem rtMemAlloc size:%" PRIu64 ".", size);
-    int ret = guard_memory(size, get_swap_enabled());
+    int ret = guard_memory(size, swap_hook_get_global() != NULL);
     if (ret != ENPU_SUCCESS) {
         return ret;
     }
@@ -122,7 +122,7 @@ RUNTIME_HOOK_DEFINE(rtMemAlloc, void **devPtr, uint64_t size, rtMallocPolicy pol
 RUNTIME_HOOK_DEFINE(rtMemAllocManaged, void **ptr, uint64_t size, uint32_t flag, const uint16_t moduleId)
 {
     LOG_DEBUG("Hook mem rtMemAllocManaged size:%" PRIu64 ".", size);
-    int ret = guard_memory(size, get_swap_enabled());
+    int ret = guard_memory(size, swap_hook_get_global() != NULL);
     if (ret != ENPU_SUCCESS) {
         return ret;
     }
@@ -135,7 +135,7 @@ RUNTIME_HOOK_DEFINE(aclrtMemAllocManagedImpl, void **ptr, uint64_t size, uint32_
         return RUNTIME_HOOK_CALL(rt_library_entry, aclrtMemAllocManagedImpl, ptr, size, flag);
     }
     LOG_DEBUG("Hook mem aclrtMemAllocManagedImpl size:%" PRIu64 ".", size);
-    int ret = guard_memory(size, get_swap_enabled());
+    int ret = guard_memory(size, swap_hook_get_global() != NULL);
     if (ret != ENPU_SUCCESS) {
         return ret;
     }
@@ -150,7 +150,7 @@ RUNTIME_HOOK_DEFINE(rtMallocPhysical, rtDrvMemHandle *handle, size_t size, rtDrv
     }
 
     swap_hook_t *swap_hook = swap_hook_get_global();
-    int ret = guard_memory(size, get_swap_enabled());
+    int ret = guard_memory(size, swap_hook != NULL);
     if (ret != ENPU_SUCCESS) {
         return ret;
     }
@@ -177,7 +177,7 @@ RUNTIME_HOOK_DEFINE(aclrtMallocPhysicalImpl, aclrtDrvMemHandle *handle, size_t s
         return RUNTIME_HOOK_CALL(rt_library_entry, aclrtMallocPhysicalImpl, handle, size, prop, flags);
     }
     LOG_DEBUG("Hook mem aclrtMallocPhysicalImpl size:%zd.", size);
-    int ret = guard_memory(size, get_swap_enabled());
+    int ret = guard_memory(size, swap_hook_get_global() != NULL);
     if (ret != ENPU_SUCCESS) {
         return ret;
     }
@@ -277,6 +277,9 @@ RUNTIME_HOOK_DEFINE(rtFree, void *devPtr)
     }
 
     swap_hook_t *swap_hook = swap_hook_get_global();
+    if (swap_hook == NULL) {
+        return RUNTIME_HOOK_CALL(rt_library_entry, rtFree, devPtr);
+    }
     int ret = swap_hook_check_and_swap_in(swap_hook);
     CHECK_RETURN_ERROR_CODE(ret, "Swap hook check and swap in failed when rtFree.");
     ret = swap_hook_free_mem(swap_hook, devPtr);
@@ -299,6 +302,9 @@ RUNTIME_HOOK_DEFINE(rtFreePhysical, rtDrvMemHandle handle)
     }
 
     swap_hook_t *swap_hook = swap_hook_get_global();
+    if (swap_hook == NULL) {
+        return RUNTIME_HOOK_CALL(rt_library_entry, rtFreePhysical, handle);
+    }
     int ret = swap_hook_check_and_swap_in(swap_hook);
     CHECK_RETURN_ERROR_CODE(ret, "Swap hook check and swap in failed when rtFreePhysical.");
     ret = swap_hook_free_physical_mem(swap_hook, handle);
@@ -321,6 +327,9 @@ RUNTIME_HOOK_DEFINE(rtMapMem, void *devPtr, size_t size, size_t offset, rtDrvMem
     }
 
     swap_hook_t *swap_hook = swap_hook_get_global();
+    if (swap_hook == NULL) {
+        return RUNTIME_HOOK_CALL(rt_library_entry, rtMapMem, devPtr, size, offset, handle, flags);
+    }
     int ret = swap_hook_check_and_swap_in(swap_hook);
     CHECK_RETURN_ERROR_CODE(ret, "Swap hook check and swap in failed when rtMapMem.");
     ret = swap_hook_map_mem(swap_hook, devPtr, size, offset, &handle, flags);
@@ -342,6 +351,9 @@ RUNTIME_HOOK_DEFINE(rtUnmapMem, void *devPtr)
     }
 
     swap_hook_t *swap_hook = swap_hook_get_global();
+    if (swap_hook == NULL) {
+        return RUNTIME_HOOK_CALL(rt_library_entry, rtUnmapMem, devPtr);
+    }
     int ret = swap_hook_check_and_swap_in(swap_hook);
     CHECK_RETURN_ERROR_CODE(ret, "Swap hook check and swap in failed when rtUnmapMem.");
     ret = swap_hook_unmap_mem(swap_hook, devPtr);

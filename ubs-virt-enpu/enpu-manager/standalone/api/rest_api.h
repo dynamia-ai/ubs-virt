@@ -21,7 +21,7 @@ typedef struct rest_api_server rest_api_server_t;
 extern "C" {
 #endif
 
-rest_api_server_t *rest_api_create(const char *bind_addr);
+rest_api_server_t *rest_api_create(const char *socket_path);
 int rest_api_destroy(rest_api_server_t *server);
 int rest_api_start(rest_api_server_t *server);
 int rest_api_stop(rest_api_server_t *server);

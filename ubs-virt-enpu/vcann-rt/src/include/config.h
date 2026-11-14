@@ -12,6 +12,7 @@
 #ifndef __CONFIG_H__
 #define __CONFIG_H__
 
+#include "allocation_id.h"
 #include "common.h"
 
 #if defined(__cplusplus)
@@ -19,6 +20,7 @@ extern "C" {
 #endif
 
 #define SHM_ID_LEN 128
+#define OPTION_ALLOCATION_ID "allocation-id"
 #define OPTION_NPU_ID "physical-npu-id"
 #define OPTION_VNPU_ID "virtual-npu-id"
 #define OPTION_AICORE_QUOTA "aicore-quota"
@@ -26,6 +28,7 @@ extern "C" {
 #define OPTION_MEMORY_REQUEST "memory-request"
 #define OPTION_MEMORY_LIMIT "memory-limit"
 #define OPTION_SHM_ID "shm-id"
+#define OPTION_ALLOCATION_GENERATION "allocation-generation"
 #define OPTION_SCHEDULING_POLICY "scheduling-policy"
 #define OPTION_VNPU_PRIORITY "vnpu_priority"
 #define VNPU_PRIORITY_NORMAL 0
@@ -33,6 +36,7 @@ extern "C" {
 #define INVALID_VALUE (-1)
 
 struct Config {
+    char allocation_id[ALLOCATION_ID_LEN];
     int32_t phy_npu_id;
     int32_t vnpu_id;
     int32_t aicore_quota;
@@ -40,6 +44,7 @@ struct Config {
     uint64_t memory_request;
     uint64_t memory_limit;
     int32_t scheduling_policy;
+    uint64_t resource_generation;
     int32_t vnpu_priority;
     char shm_id[SHM_ID_LEN];
 };

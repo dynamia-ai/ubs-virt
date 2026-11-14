@@ -22,12 +22,14 @@ typedef struct {
     int logic_id;
     int card_id;
     int device_id;
-    struct dcmi_proc_mem_info *proc_info;
-    int *proc_num;
+    uint8_t soc_version;
+    uint64_t used_bytes;
     int result;
+    atomic_uint references;
 } mem_info_args;
 
 static dcmi_operations g_dcmi_ops = {NULL};
+static uint8_t g_dcmi_soc_version = SOC_VERSION_ASCEND_910;
 
 int __attribute__((weak)) dcmiv2_init(void);
 
@@ -162,6 +164,7 @@ int register_callback(uint8_t soc_version)
         g_dcmi_ops.get_device_resource_info_callback == NULL || g_dcmi_ops.get_device_aicore_num_callback == NULL) {
         return ENPU_FAIL;
     }
+    g_dcmi_soc_version = soc_version;
     return ENPU_SUCCESS;
 }
 
@@ -188,13 +191,54 @@ int enpu_dcmi_get_card_info(uint32_t phy_id, int *card_id, int *device_id, int *
 
         ret = dcmiv2_get_device_list(device_list, &device_cnt, sizeof(device_list) / sizeof(device_list[0]));
         CHECK_RETURN_ERROR_CODE(ret, "get device list failed.");
-        LOG_DEBUG("device_cnt = %d, device_list[0] = %d", device_cnt, device_list[0]);
-        *logic_id = device_list[0];
+        if (device_cnt <= 0 || device_cnt > MAX_DEVICE_LIST_NUM) {
+            LOG_ERROR("[DCMI] Invalid v2 device count=%d", device_cnt);
+            return ENPU_FAIL;
+        }
+        int selected = -1;
+        for (int i = 0; i < device_cnt; ++i) {
+            if (device_list[i] >= 0 && (uint32_t)device_list[i] == phy_id) {
+                selected = device_list[i];
+                break;
+            }
+        }
+        if (selected < 0) {
+            LOG_ERROR("[DCMI] Configured device=%u absent from v2 logical IDs (count=%d); verify container mapping.",
+                      phy_id, device_cnt);
+            return ENPU_FAIL;
+        }
+        *logic_id = selected;
         *card_id = -1;
-        *device_id = device_list[0]; // The deviceID of the ascend950 chip is exactly the same as the logicID.
+        *device_id = selected;
     }
     LOG_DEBUG("enpu_dcmi_get_card_info success");
     return ENPU_SUCCESS;
+}
+
+int enpu_dcmi_get_utilization_rate(int logic_id, int card_id, int device_id, uint8_t soc_version, int input_type,
+                                   unsigned int *utilization_rate)
+{
+    if (utilization_rate == NULL || soc_version > SOC_VERSION_ASCEND_310) {
+        return ENPU_FAIL;
+    }
+    *utilization_rate = 0;
+    if (input_type != ENPU_DCMI_UTIL_AICORE && input_type != ENPU_DCMI_UTIL_AICPU &&
+        input_type != ENPU_DCMI_UTIL_CTRLCPU && input_type != ENPU_DCMI_UTIL_VECTOR &&
+        input_type != ENPU_DCMI_UTIL_NPU && input_type != ENPU_DCMI_UTIL_CUBE) {
+        return ENPU_FAIL;
+    }
+    if (soc_version == SOC_VERSION_ASCEND_950) {
+        if (dcmiv2_get_device_utilization_rate == NULL) {
+            LOG_WARN("[VNPU-METRICS] DCMI v2 utilization symbol is unavailable, type=%d.", input_type);
+            return ENPU_FAIL;
+        }
+        return _dcmiv2_get_device_utilization_rate_callback(logic_id, card_id, device_id, input_type, utilization_rate);
+    }
+    if (dcmi_get_device_utilization_rate == NULL) {
+        LOG_WARN("[VNPU-METRICS] DCMI utilization symbol is unavailable, type=%d.", input_type);
+        return ENPU_FAIL;
+    }
+    return _dcmi_get_device_utilization_rate_callback(logic_id, card_id, device_id, input_type, utilization_rate);
 }
 
 // Get NPU Utilization
@@ -229,75 +273,112 @@ int enpu_dcmi_get_aicore_num(int logic_id, int card_id, int device_id, unsigned 
     return g_dcmi_ops.get_device_aicore_num_callback(logic_id, card_id, device_id, aicore_num);
 }
 
+int enpu_dcmi_query_hbm_usage(int logic_id, int card_id, int device_id, uint8_t soc_version, uint64_t *used_bytes)
+{
+    if (used_bytes == NULL || soc_version > SOC_VERSION_ASCEND_310) {
+        return -EINVAL;
+    }
+    *used_bytes = 0;
+    struct dcmi_proc_mem_info processes[MAX_PIDS];
+    if (memset_s(processes, sizeof(processes), 0, sizeof(processes)) != 0) {
+        return -EIO;
+    }
+    int count = MAX_PIDS;
+    int ret;
+    if (soc_version == SOC_VERSION_ASCEND_950) {
+        if (logic_id < 0 || dcmiv2_get_device_proc_mem_info == NULL) {
+            return -ENOSYS;
+        }
+        ret = dcmiv2_get_device_proc_mem_info(logic_id, processes, &count);
+    } else {
+        if (card_id < 0 || device_id < 0 || dcmi_get_device_resource_info == NULL) {
+            return -ENOSYS;
+        }
+        ret = dcmi_get_device_resource_info(card_id, device_id, processes, &count);
+    }
+    if (ret != 0) {
+        return ret;
+    }
+    /* Full capacity cannot prove that this fixed-size API returned a complete list. */
+    if (count < 0 || count >= MAX_PIDS) {
+        return -EMSGSIZE;
+    }
+    uint64_t sum = 0;
+    for (int i = 0; i < count; ++i) {
+        uint64_t bytes = (uint64_t)processes[i].proc_mem_usage;
+        if (bytes > UINT64_MAX - sum) {
+            return -EOVERFLOW;
+        }
+        sum += bytes;
+    }
+    *used_bytes = sum;
+    return 0;
+}
+
+static void release_mem_info_args(mem_info_args *args)
+{
+    if (atomic_fetch_sub_explicit(&args->references, 1, memory_order_acq_rel) == 1) {
+        free(args);
+    }
+}
+
 static void *enpu_get_resource_info_thread(void *arg)
 {
     mem_info_args *args = (mem_info_args *)arg;
-    int proc_num_temp = 0;
-
-    args->result = g_dcmi_ops.get_device_resource_info_callback(args->logic_id, args->card_id, args->device_id,
-                                                                args->proc_info, &proc_num_temp);
-
-    if (args->proc_num != NULL) {
-        *(args->proc_num) = proc_num_temp;
-    }
+    args->result =
+        enpu_dcmi_query_hbm_usage(args->logic_id, args->card_id, args->device_id, args->soc_version, &args->used_bytes);
+    release_mem_info_args(args);
     return NULL;
 }
 
-static int enpu_get_mem_used(struct dcmi_proc_mem_info *proc_info, int proc_num, size_t *used)
-{
-    if (proc_info == NULL || used == NULL) {
-        LOG_ERROR("Invalid parameters");
-        return ENPU_FAIL;
-    }
-
-    if (proc_num > MAX_PIDS) {
-        LOG_ERROR("dcmi get device resource too many processes, count is %d", proc_num);
-        return DCMI_ERR_CODE_INNER_ERR;
-    }
-
-    *used = 0;
-
-    for (int i = 0; i < proc_num; i++) {
-        *used += proc_info[i].proc_mem_usage;
-        LOG_DEBUG("Contain PID %d, mem usage:%zd", proc_info[i].proc_id, proc_info[i].proc_mem_usage);
-    }
-    LOG_DEBUG("dcmi get mem used as %zd", *used);
-    return ENPU_SUCCESS;
-}
-
+/* Compatibility entry for limiter/swap callers: retain the temporary-thread
+ * behavior and generic failure result, but share the actual query/validation. */
 int enpu_dcmi_get_device_resource_info(int logic_id, int card_id, int device_id, size_t *used)
 {
-    int proc_num = 0;
-    struct dcmi_proc_mem_info proc_info[MAX_PIDS];
-
     if (used == NULL) {
-        LOG_ERROR("Invalid parameters");
+        LOG_ERROR("[DCMI] HBM output is NULL");
         return ENPU_FAIL;
     }
-
-    (void)memset_s(proc_info, sizeof(proc_info), 0, sizeof(proc_info));
-    mem_info_args args = {.logic_id = logic_id,
-                          .card_id = card_id,
-                          .device_id = device_id,
-                          .proc_info = proc_info,
-                          .proc_num = &proc_num,
-                          .result = ENPU_FAIL};
-
+    *used = 0;
+    if (g_dcmi_ops.get_device_resource_info_callback == NULL) {
+        LOG_ERROR("[DCMI] HBM query callbacks are not registered");
+        return ENPU_FAIL;
+    }
+    mem_info_args *args = calloc(1, sizeof(*args));
+    if (args == NULL) {
+        LOG_ERROR("[DCMI] Failed to allocate threaded HBM query context");
+        return ENPU_FAIL;
+    }
+    args->logic_id = logic_id;
+    args->card_id = card_id;
+    args->device_id = device_id;
+    args->soc_version = g_dcmi_soc_version;
+    args->result = ENPU_FAIL;
+    /* Caller and worker each own one reference. A join failure must not leave
+     * a live worker accessing a returned caller's stack or freed context. */
+    atomic_init(&args->references, 2);
     pthread_t thread;
-
-    int ret = pthread_create(&thread, NULL, enpu_get_resource_info_thread, &args);
-    CHECK_COND_RETURN_ERROR_CODE(ret != 0, "create thread failed.");
-
-    ret = pthread_join(thread, NULL);
-    CHECK_COND_RETURN_ERROR_CODE(ret != 0, "join thread failed.");
-
-    if (args.result != 0) {
-        LOG_ERROR("get info failed card:%d device:%d result:%d", card_id, device_id, args.result);
+    int ret = pthread_create(&thread, NULL, enpu_get_resource_info_thread, args);
+    if (ret != 0) {
+        LOG_ERROR("[DCMI] Failed to create HBM query thread: ret=%d", ret);
+        free(args); /* No worker was started. */
         return ENPU_FAIL;
     }
-
-    ret = enpu_get_mem_used(proc_info, proc_num, used);
-    CHECK_RETURN_ERROR_CODE(ret, "get device mem info failed card-id:%d device_id:%d.", card_id, device_id);
-
-    return ENPU_SUCCESS;
+    ret = pthread_join(thread, NULL);
+    if (ret != 0) {
+        LOG_ERROR("[DCMI] Failed to join HBM query thread: ret=%d", ret);
+        (void)pthread_detach(thread);
+        release_mem_info_args(args);
+        return ENPU_FAIL;
+    }
+    int result = ENPU_SUCCESS;
+    if (args->result != 0 || args->used_bytes > SIZE_MAX) {
+        LOG_ERROR("[DCMI] HBM query failed: logic=%d card=%d device=%d ret=%d used_bytes=%llu", logic_id, card_id,
+                  device_id, args->result, (unsigned long long)args->used_bytes);
+        result = ENPU_FAIL;
+    } else {
+        *used = (size_t)args->used_bytes;
+    }
+    release_mem_info_args(args);
+    return result;
 }

@@ -19,6 +19,7 @@
 #include "config.h"
 #include "core_limiter.h"
 #include "dcmi_wrapper.h"
+#include "hbm_sampler.h"
 #include "include/common.h"
 #include "mem_limiter.h"
 #include "runtime_hook.h"
@@ -342,14 +343,16 @@ static void __enpu_global_init(void)
     CHECK_COND_RETURN(rc != ENPU_SUCCESS, "Failed to initialize enpu device.");
 
     shm_state_t *state = get_shm_state();
-    if (state != NULL) {
+    if (state != NULL && get_swap_enabled()) {
         rc = register_to_shm_state(state, g_npu_info.vnpu_id);
         if (rc != ENPU_SUCCESS) {
             /* 注册失败（如槽位耗尽）不阻断原有软切分流程，仅降级为本进程不参与换入换出 */
             LOG_WARN("Failed to register to shm_state (ret=%d), swap disabled for this process.", rc);
         }
 
-        rc = swap_hook_global_init(g_npu_info.vnpu_id);
+        if (rc == ENPU_SUCCESS) {
+            rc = swap_hook_global_init(g_npu_info.vnpu_id);
+        }
         if (rc != ENPU_SUCCESS) {
             /* swap 是附加能力: 初始化失败(如 swap buffer 尚未就绪)不阻断原有软切分流程,
              * 仅告警并降级为本进程不参与换入换出 */
@@ -362,6 +365,8 @@ static void __enpu_global_init(void)
                 unregister_from_shm_state(state, g_npu_info.vnpu_id, slot);
             }
         }
+    } else if (state != NULL) {
+        LOG_INFO("HBM request equals limit; swap is disabled and swap hook initialization is skipped.");
     }
 
     rc = memory_limiter_init();
@@ -377,6 +382,17 @@ static void __enpu_global_init(void)
     CHECK_COND_RETURN(rc != ENPU_SUCCESS, "Failed to set environment variable");
 
     g_npu_info.initialization = true;
+    /* Independent of core-limit policy and duration sampling. Do not make a
+     * telemetry failure block allocation/runtime initialization. */
+    if (rc == ENPU_SUCCESS && hbm_sampler_start() != ENPU_SUCCESS) {
+        LOG_WARN("[HBM-STATS] Periodic container HBM collection unavailable for this process.");
+    }
+    LOG_INFO("[VNPU-STATS] Workload initialized: phy=%u logic=%d card=%d device=%d vnpu=%u shm=%s "
+             "policy=%d core_limit=%d duration_sampling=%d core_quota=%d. "
+             "Statistics remain enabled independently of core limiting.",
+             g_npu_info.pnpu_id, get_logic_id(), get_card_id(), get_device_id(), get_vnpu_id(), get_vnpu_shm_id(),
+             get_sched_policy(), is_core_limit(), get_vnpu_stats_enable(), get_core_limit_quota());
+    LOG_INFO("[VNPU-STATS] Workload configuration source: %s.", NPU_CONFIG_PATH);
     LOG_INFO("Successfully to initialize all module.");
 }
 

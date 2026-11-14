@@ -33,12 +33,16 @@ void load_rt_libraries(void)
             }
             if (strcmp(rt_library_entry[i].name, "rtModelGetStreams") == 0) {
                 set_vnpu_stats_enable(false);
+                LOG_WARN("[VNPU-STATS] Duration sampling disabled for all launch types: "
+                         "rtModelGetStreams is unavailable; block counters remain enabled.");
             }
             LOG_WARN("Can not find function %s, because the runtime version you are using is different "
                      "from our preset version.",
                      rt_library_entry[i].name);
         }
     }
+    LOG_INFO("[VNPU-STATS] Runtime capabilities: duration_sampling=%d aclrt_impl_hook=%d.", get_vnpu_stats_enable(),
+             get_aclrt_impl_hook_enable());
     return;
 }
 

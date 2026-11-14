@@ -63,7 +63,7 @@ echo "[INFO] ENPU_ASCEND_DRIVER_PATH=${ENPU_ASCEND_DRIVER_PATH}"
 for cmd in dpkg-buildpackage dh cmake gcc; do
     if ! command -v "$cmd" &>/dev/null; then
         echo "[ERROR] $cmd not found! Install build dependencies:"
-        echo "  sudo apt-get install build-essential cmake debhelper libcjson-dev uuid-dev"
+        echo "  sudo apt-get install build-essential cmake debhelper libcjson-dev"
         exit 1
     fi
 done
@@ -72,11 +72,6 @@ done
 if ! dpkg -l libcjson-dev &>/dev/null 2>&1; then
     echo "[WARNING] libcjson-dev not found."
     echo "  Install it: sudo apt-get install libcjson-dev"
-fi
-
-if ! dpkg -l uuid-dev &>/dev/null 2>&1; then
-    echo "[WARNING] uuid-dev not found."
-    echo "  Install it: sudo apt-get install uuid-dev"
 fi
 
 echo ""

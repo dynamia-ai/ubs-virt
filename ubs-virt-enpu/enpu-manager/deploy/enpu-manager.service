@@ -8,6 +8,8 @@ Wants=network-online.target
 Type=simple
 User=root
 Group=root
+RuntimeDirectory=enpu
+RuntimeDirectoryMode=0750
 
 # Environment
 Environment=LD_LIBRARY_PATH=/usr/local/Ascend/cann/lib64:/usr/local/Ascend/driver/lib64/driver

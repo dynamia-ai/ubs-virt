@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <mockcpp/mockcpp.hpp>
 #include "dcmi_wrapper.h"
 #include "log.h"
 #include "memory_tracker.h"
@@ -140,6 +141,25 @@ rtError_t stub_swap_rt_memcpy(void *dst, uint64_t destMax, const void *src, uint
     (void)cnt;
     (void)kind;
     return RT_ERROR_NONE;
+}
+
+int stub_dcmi_threaded_memory(int cardId, int deviceId, struct dcmi_proc_mem_info *processes, int *count)
+{
+    (void)cardId;
+    (void)deviceId;
+    processes[0].proc_mem_usage = 1024;
+    processes[1].proc_mem_usage = 2048;
+    *count = 2;
+    return 0;
+}
+
+int stub_dcmiv2_device_list(int *devices, int *count, int capacity)
+{
+    EXPECT_GE(capacity, 2);
+    devices[0] = 1;
+    devices[1] = 3;
+    *count = 2;
+    return 0;
 }
 
 void fill_swap_rt_entries()
@@ -835,6 +855,41 @@ TEST_F(SwapModuleTest, DcmiWrapperRegisterAndInvalidParams)
     EXPECT_EQ(enpu_dcmi_get_device_resource_info(0, 0, 0, nullptr), ENPU_FAIL);
 }
 
+TEST_F(SwapModuleTest, DcmiThreadedHbmQuery)
+{
+    ASSERT_EQ(register_callback(SOC_VERSION_ASCEND_910), ENPU_SUCCESS);
+    MOCKER(dcmi_get_device_resource_info).stubs().will(invoke(stub_dcmi_threaded_memory));
+    size_t used = 0;
+    EXPECT_EQ(enpu_dcmi_get_device_resource_info(0, 1, 2, &used), ENPU_SUCCESS);
+    EXPECT_EQ(used, 3072U);
+    GlobalMockObject::verify();
+    GlobalMockObject::reset();
+}
+
+TEST_F(SwapModuleTest, DcmiV2CardAndMetricCallbacks)
+{
+    MOCKER(dcmiv2_get_device_list).stubs().will(invoke(stub_dcmiv2_device_list));
+    ASSERT_EQ(register_callback(SOC_VERSION_ASCEND_950), ENPU_SUCCESS);
+    int cardId = 0;
+    int deviceId = 0;
+    int logicId = 0;
+    EXPECT_EQ(enpu_dcmi_get_card_info(3, &cardId, &deviceId, &logicId, SOC_VERSION_ASCEND_950), ENPU_SUCCESS);
+    EXPECT_EQ(cardId, -1);
+    EXPECT_EQ(deviceId, 3);
+    EXPECT_EQ(logicId, 3);
+
+    unsigned int value = 0;
+    EXPECT_EQ(enpu_dcmi_get_utilization_rate(3, cardId, deviceId, SOC_VERSION_ASCEND_950, ENPU_DCMI_UTIL_NPU, &value),
+              ENPU_SUCCESS);
+    EXPECT_EQ(enpu_dcmi_get_aicore_num(3, cardId, deviceId, &value), ENPU_SUCCESS);
+    EXPECT_EQ(value, 24U);
+    EXPECT_EQ(enpu_dcmi_get_utilization_rate(3, cardId, deviceId, SOC_VERSION_ASCEND_950, -1, &value), ENPU_FAIL);
+    EXPECT_EQ(enpu_dcmi_get_utilization_rate(3, cardId, deviceId, SOC_VERSION_ASCEND_950, ENPU_DCMI_UTIL_NPU, nullptr),
+              ENPU_FAIL);
+    GlobalMockObject::verify();
+    GlobalMockObject::reset();
+}
+
 TEST_F(SwapModuleTest, SwapHookGlobalDestroy)
 {
     swap_hook_global_destroy();
@@ -842,7 +897,14 @@ TEST_F(SwapModuleTest, SwapHookGlobalDestroy)
     /* 销毁后拦截接口降级: 换入检查透传, memcpy 族直接透传成功 */
     uint8_t hostBuf[8] = {0};
     EXPECT_EQ(rtMemcpy(hostBuf, sizeof(hostBuf), hostBuf, 4, RT_MEMCPY_DEVICE_TO_HOST), RT_ERROR_NONE);
-    EXPECT_NE(rtFree((void *)(intptr_t)0x6666), RT_ERROR_NONE);
+    EXPECT_EQ(rtFree((void *)(intptr_t)0x6666), RT_ERROR_NONE);
+    // Swap disabled must also preserve errors returned by the real Runtime.
+    void *saved = rt_library_entry[HOOK_rtFree].func_ptr;
+    rt_library_entry[HOOK_rtFree].func_ptr = (void *)+[](void *) -> rtError_t {
+        return ACL_ERROR_INVALID_PARAM;
+    };
+    EXPECT_EQ(rtFree((void *)(intptr_t)0x6666), ACL_ERROR_INVALID_PARAM);
+    rt_library_entry[HOOK_rtFree].func_ptr = saved;
     /* 再次销毁不崩溃 */
     swap_hook_global_destroy();
 }

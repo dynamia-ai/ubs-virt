@@ -16,6 +16,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include "allocation.h"
 #include "common.h"
 #include "dcmi_stub_adapter.h"
@@ -131,6 +132,142 @@ typedef struct device_info {
     double oversub_ratio;
 } device_info_t;
 
+/* Structured resource-query API. */
+typedef enum enpu_resource_query_type
+{
+    ENPU_RESOURCE_QUERY_ALL = 0,
+    ENPU_RESOURCE_QUERY_BY_PHY,
+    ENPU_RESOURCE_QUERY_BY_RESOURCE,
+    ENPU_RESOURCE_QUERY_BY_ALLOCATION,
+    ENPU_RESOURCE_QUERY_BY_METADATA,
+} enpu_resource_query_type_t;
+
+typedef struct enpu_resource_query {
+    enpu_resource_query_type_t type;
+    union {
+        int32_t phy_id;
+        struct {
+            int32_t phy_id;
+            int32_t vnpu_id;
+        } resource;
+        char allocation_id[ALLOCATION_ID_LEN];
+        struct {
+            char pod_uid[MAX_UUID_LEN];
+            char container_name[MAX_NAME_LEN];
+        } metadata;
+    } selector;
+    bool detail;
+} enpu_resource_query_t;
+
+typedef enum enpu_resource_metric_status
+{
+    ENPU_RESOURCE_METRIC_OK = 0,
+    ENPU_RESOURCE_METRIC_IDLE,
+    ENPU_RESOURCE_METRIC_UNSUPPORTED,
+    ENPU_RESOURCE_METRIC_UNAVAILABLE,
+    ENPU_RESOURCE_METRIC_STALE,
+    ENPU_RESOURCE_METRIC_INCONSISTENT,
+    ENPU_RESOURCE_METRIC_STATS_SHM_MISSING,
+    ENPU_RESOURCE_METRIC_STATS_VERSION_MISMATCH,
+    ENPU_RESOURCE_METRIC_STATS_UNAVAILABLE,
+    ENPU_RESOURCE_METRIC_AVG_DURATION_MISSING,
+    ENPU_RESOURCE_METRIC_DCMI_UNAVAILABLE,
+    ENPU_RESOURCE_METRIC_VNPU_ID_OUT_OF_RANGE,
+} enpu_resource_metric_status_t;
+
+typedef struct enpu_resource_metric {
+    double value; /* 百分数，0～100；仅 OK/IDLE 有效 */
+    enpu_resource_metric_status_t status;
+} enpu_resource_metric_t;
+
+typedef struct enpu_resource_quota {
+    int32_t aicore_percent; /* 仅 core_limit_enabled=true 时表示限额 */
+    schedule_policy_t scheduling_policy;
+    bool core_limit_enabled; /* best-effort 为 false，不把 quota=0 解释为零算力 */
+} enpu_resource_quota_t;
+
+typedef struct enpu_resource_hbm_usage {
+    uint64_t used_bytes; /* 仅 status=OK/IDLE 时有效，合法用量可以为 0 */
+    enpu_resource_metric_status_t status;
+} enpu_resource_hbm_usage_t;
+
+typedef struct enpu_resource_hbm {
+    uint64_t request_bytes; /* allocation 配额，不依赖 usage 采集状态 */
+    uint64_t limit_bytes;
+    enpu_resource_hbm_usage_t usage;
+} enpu_resource_hbm_t;
+
+typedef struct enpu_resource_physical {
+    enpu_resource_metric_t npu_utilization;
+    enpu_resource_metric_t aicore_utilization;
+    enpu_resource_metric_t aicpu_utilization;
+    enpu_resource_metric_t ctrlcpu_utilization;
+    enpu_resource_metric_t cube_utilization;
+    enpu_resource_metric_t vector_utilization;
+} enpu_resource_physical_t;
+
+typedef struct enpu_resource_vnpu {
+    enpu_resource_metric_t utilization;
+    enpu_resource_metric_t aicore_utilization;
+} enpu_resource_vnpu_t;
+
+typedef struct enpu_resource_metadata {
+    char pod_uid[MAX_UUID_LEN];
+    char container_name[MAX_NAME_LEN];
+} enpu_resource_metadata_t;
+
+typedef struct enpu_resource_metric_detail {
+    int source_result;                /* 数据源返回码或本地诊断码；不能代替业务 status */
+    uint64_t sampled_at_monotonic_ns; /* 对应数据源的采样/快照时间，无样本为 0 */
+} enpu_resource_metric_detail_t;
+
+typedef struct enpu_resource_physical_detail {
+    enpu_resource_metric_detail_t npu_utilization;
+    enpu_resource_metric_detail_t aicore_utilization;
+    enpu_resource_metric_detail_t aicpu_utilization;
+    enpu_resource_metric_detail_t ctrlcpu_utilization;
+    enpu_resource_metric_detail_t cube_utilization;
+    enpu_resource_metric_detail_t vector_utilization;
+} enpu_resource_physical_detail_t;
+
+typedef struct enpu_resource_vnpu_detail {
+    enpu_resource_metric_detail_t utilization;
+    enpu_resource_metric_detail_t aicore_utilization;
+} enpu_resource_vnpu_detail_t;
+
+typedef struct enpu_resource_detail {
+    uint32_t window_ms;       /* vNPU block 统计窗口，不代表其他指标采样周期 */
+    uint64_t collected_at_ns; /* 查询采集时间，CLOCK_MONOTONIC */
+    char die_id[DIE_ID_LEN];
+    char shm_id[SHM_ID_LEN];
+    uint64_t sum_block_dim;
+    uint64_t launch_count;
+    uint64_t avg_kernel_duration_ns;
+    double work;
+    double weight;
+    int hbm_source_result;                /* HBM 原始 DCMI 返回码或负 errno，不能代替 usage.status */
+    uint64_t hbm_sampled_at_monotonic_ns; /* HBM 最近一次成功采集时间，无样本为 0 */
+    enpu_resource_physical_detail_t physical;
+    enpu_resource_vnpu_detail_t vnpu;
+} enpu_resource_detail_t;
+
+typedef struct enpu_resource_info {
+    char allocation_id[ALLOCATION_ID_LEN];
+    int32_t phy_id;
+    int32_t vnpu_id;
+    enpu_resource_metadata_t metadata;
+    enpu_resource_quota_t quota;
+    enpu_resource_hbm_t hbm;
+    enpu_resource_physical_t physical;
+    enpu_resource_vnpu_t vnpu;
+    enpu_resource_detail_t *detail; /* 未请求 detail 时为 NULL */
+} enpu_resource_info_t;
+
+typedef struct enpu_resource_response {
+    enpu_resource_info_t *items;
+    size_t count;
+} enpu_resource_response_t;
+
 #if defined(__cplusplus)
 extern "C" {
 #endif
@@ -148,6 +285,17 @@ int enpu_manager_release_all(enpu_manager_t *mgr, int *released_count);
 int enpu_manager_query_devices(enpu_manager_t *mgr, const device_query_t *query, device_info_t *devices, int *count);
 int enpu_manager_query_allocations(enpu_manager_t *mgr, const allocation_query_t *query, allocation_t *allocations,
                                    int *count);
+char *enpu_manager_get_config_path(enpu_manager_t *mgr, const char *allocation_id, char *path, int path_size);
+/* In-process, synchronous query. query=NULL selects all allocated resources without detail.
+ * response must be zero-initialized or previously freed. On failure it is reset to empty.
+ * ENPU_SUCCESS does not imply that every metric is available; check each metric status.
+ * The manager must remain alive for the call; callers own separate response objects.
+ */
+int enpu_query_resources(enpu_manager_t *mgr, const enpu_resource_query_t *query, enpu_resource_response_t *response);
+/* Frees all nested allocations, clears response, accepts NULL and repeated calls. */
+void enpu_free_resource_response(enpu_resource_response_t *response);
+/* Returns a static string; unknown enum values map to "unknown". Do not free it. */
+const char *enpu_resource_metric_status_string(enpu_resource_metric_status_t status);
 
 int enpu_manager_swap_status(enpu_manager_t *mgr, swap_status_response_t *resp);
 int enpu_manager_swap_control(enpu_manager_t *mgr, const char *pod_uid, swap_action_t action);

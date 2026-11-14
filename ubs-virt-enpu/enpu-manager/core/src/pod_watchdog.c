@@ -209,7 +209,7 @@ int pod_watchdog_poll_and_cleanup(pod_watchdog_t *wd)
         uint64_t bitmap0 = atomic_load(&state->vnpu_bitmap[0]);
         uint64_t bitmap1 = atomic_load(&state->vnpu_bitmap[1]);
 
-        for (int vnpu_id = 0; vnpu_id < MAX_VNPU_PER_DIE; vnpu_id++) {
+        for (int vnpu_id = 0; vnpu_id < VNPU_SCHED_MAX_VNPU; vnpu_id++) {
             int idx = vnpu_id / 64;
             int bit = vnpu_id % 64;
             uint64_t bitmap = (idx == 0) ? bitmap0 : bitmap1;

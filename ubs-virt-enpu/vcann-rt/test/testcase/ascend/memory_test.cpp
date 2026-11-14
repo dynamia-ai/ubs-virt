@@ -15,6 +15,7 @@
 #include <runtime/rt.h>
 #include <sys/file.h>
 #include <mockcpp/mockcpp.hpp>
+#include "dcmi_wrapper.h"
 #include "log.h"
 #include "mem_limiter.h"
 #include "npu_manager.h"
@@ -22,6 +23,15 @@
 #include "securec.h"
 
 extern "C" {
+static int stub_memory_resource_info(int logic_id, int card_id, int device_id, size_t *used)
+{
+    (void)logic_id;
+    (void)card_id;
+    (void)device_id;
+    *used = 0;
+    return ENPU_SUCCESS;
+}
+
 int stub_get_mem_used_huge(size_t *used)
 {
     *used = SIZE_MAX;
@@ -47,6 +57,7 @@ protected:
         fd_ = open(stub_lock_path(), O_CREAT | O_RDONLY, 0755); // ut memctl.lock文件,设置为777权限
         MOCKER(lock_path).stubs().will(invoke(stub_lock_path));
         MOCKER(enpu_load_config).stubs().will(invoke(stub_enpu_load_config));
+        MOCKER(enpu_dcmi_get_device_resource_info).stubs().will(invoke(stub_memory_resource_info));
         enpu_global_init();
         MOCKER(load_rt_libraries).stubs().will(invoke(stub_load_rt_libraries));
     }

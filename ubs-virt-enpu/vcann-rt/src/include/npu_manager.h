@@ -24,6 +24,7 @@ using atomic_uint_fast64_t = std::atomic<uint_fast64_t>;
 
 #include "config.h"
 #include "shm_manager.h"
+#include "vnpu_sched_shm_abi.h"
 
 #if defined(__cplusplus)
 extern "C" {
@@ -31,7 +32,7 @@ extern "C" {
 
 #define NPU_CONFIG_PATH "/etc/enpu/vcann-rt/npu_info.config"
 #define MAX_NPU_ID 15
-#define MAX_VNPU 100
+#define MAX_VNPU VNPU_SCHED_MAX_VNPU
 #define MAX_CORE_QUOTA 100
 #define MB_TO_B (1024 * 1024)
 #define MAX_DEVICE_LIST_NUM 64
@@ -43,27 +44,6 @@ typedef enum
     SCHED_POLICY_ELASTIC = 2,
     SCHED_POLICY_BEST_EFFORT = 3,
 } schedule_policy_t;
-
-typedef struct shared_memory {
-    pthread_mutex_t vnpu_schedule_mutex[MAX_VNPU];
-    atomic_uint_fast64_t last_alive_time_ns[MAX_VNPU];
-    atomic_uint_fast64_t last_kernel_time_ns[MAX_VNPU];
-    atomic_uint_fast8_t vnpu_schedule_turn[MAX_VNPU];
-    atomic_uint_fast8_t vnpu_core_limit_quota[MAX_VNPU];
-    atomic_uint_fast8_t vnpu_priority[MAX_VNPU];
-    atomic_int owner;
-    atomic_uint_fast32_t magic_number;
-    atomic_int slide_window_len;
-    atomic_uint_fast64_t last_slide_window_time_ns;
-    pthread_mutex_t npu_utilization_monitor_mutex;
-    atomic_uint_fast64_t vnpu_quota_timeslice[MAX_VNPU];
-    atomic_uint_fast64_t vnpu_cur_timeslice[MAX_VNPU];
-    atomic_uint_fast8_t vnpu_quota_injected_for_turn[MAX_VNPU];
-    atomic_int vnpu_sync_expected[MAX_VNPU];
-    atomic_int vnpu_sync_completed[MAX_VNPU];
-    atomic_uint_fast64_t vnpu_turn_max_sync[MAX_VNPU];
-    atomic_uint_fast64_t vnpu_timeslice_for_turn[MAX_VNPU];
-} vnpu_time_slice_sched_t;
 
 typedef struct npu_info {
     uint32_t pnpu_id;

@@ -21,9 +21,7 @@ BuildRequires:  cmake >= 3.15
 BuildRequires:  gcc >= 9.3
 BuildRequires:  systemd
 BuildRequires:  cjson-devel
-BuildRequires:  libuuid-devel
 Requires:       cjson
-Requires:       libuuid
 Requires(post): systemd
 Requires(preun): systemd
 Requires(postun): systemd

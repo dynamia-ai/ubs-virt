@@ -4,7 +4,9 @@
 
 `enpu-manager`是 ubs-virt-enpu 提供 NPU 显存交换（超分）服务的管理进程，运行在宿主机侧。它在 vCANN-RT 已有的算力切分和显存控制能力之上，引入节点级显存超分机制：允许将冷模型的显存换出到 CPU 侧 swap buffer，把腾出的显存让给其他容器使用，从而提升整卡显存利用率。
 
-enpu-manager 通过 REST API 接收 vNPU 分配/释放/查询请求，生成容器侧 vCANN-RT 所需的 `npu_info.config` 配置文件，并配合 vCANN-RT 完成显存换出/换入的协调。
+enpu-manager 通过 HTTP over UDS 的 REST API 接收 vNPU 分配/释放/查询请求，生成容器侧 vCANN-RT 所需的 `npu_info.config` 配置文件，并配合 vCANN-RT 完成显存换出/换入的协调。
+
+> 本文的 UDS、allocation UUID 和资源查询接口按目标协议描述，联调使用配套实现版本。
 
 显存超分面向冷模型共享场景：多个模型部署在同一 DIE 上，显存需求总量可超过该 DIE 的 HBM 容量，但模型主要交替、间歇访问，同时活跃模型的显存需求之和不超过 HBM 容量。业务还需能够接受换入、换出的传输时延。**不支持多个大模型持续并发推理、同时活跃的显存需求超过该 DIE 的 HBM 容量，并依靠频繁交换维持运行。**此类场景可能出现时延波动或业务异常。详见 [vCANN-RT 显存超分适用场景与使用限制](../vcann-rt/README.md#适用场景与使用限制)。
 
@@ -128,7 +130,7 @@ sudo cp deploy/enpu-manager.service /usr/lib/systemd/system
 sudo systemctl daemon-reload
 ```
 
-手动安装时系统未自动装入 `libcjson` 等运行时依赖，需自行解决（安装 `libcjson` 包或将 `.so` 路径加入 `LD_LIBRARY_PATH`）。
+手动安装时系统未自动装入 `libcjson` 等运行时依赖，需自行解决（安装对应软件包或将 `.so` 路径加入 `LD_LIBRARY_PATH`）。
 
 ## 配置文件
 
@@ -138,7 +140,7 @@ sudo systemctl daemon-reload
 
 | 字段                       | 类型     | 默认值       | 是否可修改 | 说明                                                                                                                                                          |
 |:---------------------------|:---------|:-------------|:-----------|:--------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `rest_port`                | int      | 8080         |  是       | REST API 监听端口。                                                                                                                                            |
+| `socket_path` | string | /run/enpu/enpu-manager.sock | 是 | HTTP over UDS 监听路径。                                                                                                                                            |
 | `config_dir`               | string   | /etc/enpu    |  否       | vCANN-RT 配置根目录（生成 `npu_info.config` 的基础路径）。                                                          |
 | `state_dir`               | string   | /var/lib/enpu-manager |  否       | 状态持久化目录（`checkpoint.json`）。                                                                                                       |
 | `share-strategy`           | string   | compact      |  是       | vNPU 分配策略，可选 `compact` / `anti-fragment`，详见下方表 5。                                                                                              |
@@ -173,19 +175,22 @@ journalctl -u enpu-manager.service -n 100
 ### 方式二：手动启动
 
 ```shell
-enpu-manager [--port 8080]
+sudo install -d -m 0750 /run/enpu
+enpu-manager
 ```
 
-启动成功后日志输出 `REST API listening on 0.0.0.0:8080` 即可对外提供服务。
+使用自定义 socket 路径时，先创建其父目录，并确保运行用户具有写权限。
+
+启动后通过下方 UDS 请求确认服务可用。
 
 ### 验证部署成功
 
-- 通过 `systemctl status enpu-manager` 确认服务状态为 `active (running)`，并查看日志中是否出现 `REST API listening on 0.0.0.0:8080`。如出现 `configured oversub-ratio too large`，需调小 `/etc/enpu/enpu-manager.conf` 中的 `oversub-ratio` 后重启。
+- 通过 `systemctl status enpu-manager` 确认服务状态为 `active (running)`，并检查监听 socket 和服务日志。如出现 `configured oversub-ratio too large`，需调小 `/etc/enpu/enpu-manager.conf` 中的 `oversub-ratio` 后重启。
 
 - 调用 REST API 查询设备列表，确认 enpu-manager 已正确识别节点上的物理 NPU：
 
   ```bash
-  curl http://localhost:8080/api/v1/devices
+  curl --unix-socket /run/enpu/enpu-manager.sock http://localhost/api/v1/devices
   ```
 
   正常返回 JSON，`devices` 数组中应包含每张可用物理卡的 `phy_id / minor_name / aicore_available / hbm_available / oversub_ratio` 等字段。
@@ -193,35 +198,40 @@ enpu-manager [--port 8080]
 - 分配一个测试 vNPU 验证分配链路：
 
   ```bash
-  curl -X POST http://localhost:8080/api/v1/allocate \
+  curl --unix-socket /run/enpu/enpu-manager.sock -X POST http://localhost/api/v1/allocate \
     -H "Content-Type: application/json" \
     -d '{"allocation_id":"550e8400-e29b-41d4-a716-446655440000","aicore_quota":10,"hbm_quota":1024,"hbm_limit":1024,"sched_policy":1}'
   ```
 
-  正常返回包含 `allocation_id / phy_id / vnpu_id / pod_uid / container_name` 等字段，`result=0` 表示分配成功。其中 `allocation_id` 是 UUID 格式的分配标识。
+  正常返回包含 `allocation_id / phy_id / vnpu_id / config_path` 等字段，`result=0` 表示分配成功。
 
 - 查询当前分配记录，确认上一步分配的 vNPU 已登记：
 
   ```bash
-  curl http://localhost:8080/api/v1/allocations
+  curl --unix-socket /run/enpu/enpu-manager.sock http://localhost/api/v1/allocations
   ```
 
 - 在宿主机侧确认 vCANN-RT 配置文件已生成：
 
   ```bash
-  ls /etc/enpu/vcann-rt/
-  # 在 allocations/<allocation_id>/ 下查看 npu_info.config，以创建响应的 config_path 为准
+  ls /etc/enpu/vcann-rt/allocations/
+  # 每个 allocation_id 对应一个目录，包含 npu_info.config
   ```
 
-- 通过上一步的 allocation_id 释放测试 vNPU：
+- 释放测试 vNPU 完成清理（UUID 替换为上一步返回的 allocation_id）：
 
   ```bash
-  curl -X DELETE http://localhost:8080/api/v1/allocations/550e8400-e29b-41d4-a716-446655440000
+  curl --unix-socket /run/enpu/enpu-manager.sock -X DELETE http://localhost/api/v1/allocations/5d861bbe-0c3e-4b10-84ab-4c60c53ad2d4
   ```
 
 ## REST API 使用
 
-enpu-manager 通过 HTTP REST API 接收请求，默认端口 8080，返回 JSON 格式。当前对外开放的接口包含**分配、释放、查询、清理**四类；服务端口上另有若干仅供内部调试使用的接口，不属于对外开放范围，不提供兼容性保证，请勿依赖。
+enpu-manager 通过 HTTP over Unix Domain Socket 接收请求，默认 socket 为 `/run/enpu/enpu-manager.sock`。
+除 `/metrics` 返回 Prometheus 文本外，其余接口返回 JSON。调用者需具备 socket 连接权限；容器调用方挂载 socket 所在目录。
+示例中的 `http://localhost` 用于构造 HTTP 请求，实际连接由 `--unix-socket` 指定。
+
+请求头和正文合计最多 4095 字节；请求超限返回 HTTP 413，接收超时（5 秒）返回 408。
+正文使用 `Content-Length`，不支持 `Transfer-Encoding`；报文不完整或长度字段非法返回 400。
 
 ### API 总览
 
@@ -232,9 +242,11 @@ enpu-manager 通过 HTTP REST API 接收请求，默认端口 8080，返回 JSON
 | `/api/v1/devices`                     | GET    | 列出所有 NPU 设备及其可用资源。             |
 | `/api/v1/devices/{phy_id}`            | GET    | 查询指定物理卡详情（含 oversub_ratio）。    |
 | `/api/v1/allocate`                    | POST   | 分配 vNPU。                                |
-| `/api/v1/allocations/{allocation_id}` | DELETE | 按 allocation_id 释放指定分配。 |
-| `/api/v1/allocations?pod_uid={pod_uid}&container_name={container_name}` | DELETE | 按两个标签唯一匹配后释放分配。 |
+| `/api/v1/allocations/{allocation_id}` | DELETE | 按 UUID 释放指定分配。 |
+| `/api/v1/allocations?pod_uid={pod_uid}&container_name={container_name}` | DELETE | 按两个标签唯一匹配后释放。 |
 | `/api/v1/allocations`                 | GET    | 列出当前所有 vNPU 分配。                    |
+| `/api/v1/resources` | GET | 查询配额、HBM 用量及物理 NPU/vNPU 利用率。 |
+| `/metrics` | GET | 批量返回 Prometheus 指标及 allocation 关联信息。 |
 | `/api/v1/clean`                       | DELETE | 清理当前所有 vNPU 分配。                    |
 
 ### 分配 vNPU
@@ -251,17 +263,18 @@ enpu-manager 通过 HTTP REST API 接收请求，默认端口 8080，返回 JSON
 | `hbm_limit`        | int | 否   | HBM Limit（硬上限），单位 MB。未填时默认等于 `hbm_quota`。                                              |
 | `sched_policy`     | int     | 普通优先级必填 | 调度策略：`1`=fixed-share，`2`=elastic，`3`=best-effort；高优先级可省略，实际使用 `3`。 |
 | `vnpu_priority`    | int     | 否   | vNPU 优先级：`0`=普通优先级（默认），`1`=高优先级。 |
-| `swap_order` | int | 否 | 换出顺序（CLI：`--swap-order`）：`0` 最先换出，`1` 默认，`2` 最后换出；同一顺序优先换出最久未执行的候选。 |
+
+| `swap_order` | int | 否 | 换出顺序：`0` 最先换出，`1` 默认，`2` 最后换出。同一顺序先换出最久未执行的候选。 |
 | `phy_id`           | int     | 否   | 指定物理卡：`-1`=由 enpu-manager 自动选择（默认）；`>=0`=直接分配到该卡（跳过自动决策）。     |
-| `pod_uid`          | string  | 否   | Pod 元数据，可重复，未填时为空字符串。 |
-| `container_name`   | string  | 否   | 容器名元数据，可重复，未填时为空字符串。 |
+| `pod_uid` | string | 否 | Pod 元数据，可重复，未填为空字符串。 |
+| `container_name` | string | 否 | 容器名元数据，可重复，未填为空字符串。 |
 
-> 未填 `hbm_limit` 时默认等于 `hbm_quota`，相当于 `hbm_request == hbm_limit`。**普通优先级采用 `sched_policy=1`（fixed-share）时建议显式传 `hbm_limit` 与 `hbm_quota` 相等**，避免误解。
+创建成功后返回 `allocation_id`（UUID），用于查询或释放；可选标签在 `metadata` 中回显。未传 allocation_id 时每次创建独立分配；重试时复用同一个 allocation_id，重复请求返回 HTTP 409，可通过分配列表查询已有记录。CLI 支持 `--allocation-id`。
 
-CLI 可通过 `--allocation-id <allocation_id>` 指定标识。需要重试去重时，由调用方生成并复用同一个 allocation_id；收到 409 后，通过 `GET /api/v1/allocations` 查询已有记录。未传时每次创建独立分配；释放后不再保留该记录。
+分配接口的 MB 按 1024 × 1024 bytes 换算。`hbm_quota` 与 `hbm_request` 任选一个传入；同时提供时优先使用 `hbm_request`。
+best-effort 仍需提供 `aicore_quota`，但不启用算力限流。`config_path` 是宿主机路径，调用方负责将配置挂载给目标业务容器。
 
-`vnpu_priority` 只接受 JSON 整数 `0` 或 `1`；字符串、小数及其他值会返回 HTTP 400。
-
+CLI 分配时可通过 `--swap-order 0|1|2` 指定换出顺序，未指定时为 1。
 当`vnpu_priority=1`时，若用户显式传入非`0`的`aicore_quota`或非`3`的`sched_policy`，分配成功的响应会通过`warnings`数组对相应字段返回英文提示，并回显最终生效值。未传入的字段、已使用正确值的字段不产生提示；没有提示时省略`warnings`字段。分配失败仍通过`error_msg`说明原因。
 
 例如，同时传入`vnpu_priority=1`、`aicore_quota=20`和`sched_policy=2`时，成功响应中包含：
@@ -278,7 +291,7 @@ CLI 可通过 `--allocation-id <allocation_id>` 指定标识。需要重试去�
 **示例 1：自动选择物理卡，分配 elastic 模式 vNPU**
 
 ```bash
-curl -X POST http://localhost:8080/api/v1/allocate \
+curl --unix-socket /run/enpu/enpu-manager.sock -X POST http://localhost/api/v1/allocate \
   -H "Content-Type: application/json" \
   -d '{
     "allocation_id": "550e8400-e29b-41d4-a716-446655440001",
@@ -293,12 +306,11 @@ curl -X POST http://localhost:8080/api/v1/allocate \
 
 ```json
 {
-  "allocation_id": "550e8400-e29b-41d4-a716-446655440001",
-  "config_path": "/etc/enpu/vcann-rt/allocations/550e8400-e29b-41d4-a716-446655440001/npu_info.config",
+  "allocation_id": "5d861bbe-0c3e-4b10-84ab-4c60c53ad2d4",
+  "config_path": "/etc/enpu/vcann-rt/allocations/5d861bbe-0c3e-4b10-84ab-4c60c53ad2d4/npu_info.config",
   "phy_id": 0,
   "vnpu_id": 5,
-  "pod_uid": "",
-  "container_name": "",
+  "metadata": {"pod_uid": "", "container_name": ""},
   "die_id": "14422CC3-...",
   "shm_id": "14422CC3-...",
   "aicore_quota": 20,
@@ -311,10 +323,10 @@ curl -X POST http://localhost:8080/api/v1/allocate \
 }
 ```
 
-**示例 2：指定物理卡，使用自定义 pod_uid**
+**示例 2：指定物理卡和业务标签，分配 fixed-share 模式 vNPU**
 
 ```bash
-curl -X POST http://localhost:8080/api/v1/allocate \
+curl --unix-socket /run/enpu/enpu-manager.sock -X POST http://localhost/api/v1/allocate \
   -H "Content-Type: application/json" \
   -d '{
     "allocation_id": "550e8400-e29b-41d4-a716-446655440002",
@@ -328,71 +340,469 @@ curl -X POST http://localhost:8080/api/v1/allocate \
   }'
 ```
 
-**示例 3：fixed-share（不支持显存超分，`hbm_quota == hbm_limit`）**
-
-```bash
-curl -X POST http://localhost:8080/api/v1/allocate \
-  -H "Content-Type: application/json" \
-  -d '{
-    "allocation_id": "550e8400-e29b-41d4-a716-446655440003",
-    "aicore_quota": 30,
-    "hbm_quota": 16384,
-    "hbm_limit": 16384,
-    "sched_policy": 1
-  }'
-```
-
-**示例 4：分配高优先级 vNPU**
-
-```bash
-curl -X POST http://localhost:8080/api/v1/allocate \
-  -H "Content-Type: application/json" \
-  -d '{
-    "vnpu_priority": 1,
-    "hbm_quota": 15360,
-    "hbm_limit": 15360,
-    "phy_id": 1,
-    "pod_uid": "high-priority-pod",
-    "container_name": "high-priority-container"
-  }'
-```
-
-此请求无需填写 `aicore_quota` 和 `sched_policy`，最终生效值分别为 `0` 和 `3`。高优先级不预留软件 AI Core 配额；当同卡普通优先级容器也有任务需求时，vCANN-RT 会为其保留周期性提交机会。`swap_order` 控制显存换出顺序，与 `vnpu_priority` 的算力调度优先级无关。
-
 ### 释放 vNPU
 
-`pod_uid` 和 `container_name` 均必填且非空，仅唯一匹配时释放；无匹配返回 404，多个匹配返回 409，参数错误返回 400。
-特殊字符需 URL 编码，CLI 会自动编码。
+`DELETE /api/v1/allocations/{allocation_id}`
+
+停止使用该配置的业务后，按创建结果中的 UUID 释放配额和配置文件。请求无需正文，也无需 Pod/容器标签。
 
 ```bash
-curl -X DELETE 'http://localhost:8080/api/v1/allocations?pod_uid=pod-0&container_name=container-0-5'
+curl --unix-socket /run/enpu/enpu-manager.sock -X DELETE http://localhost/api/v1/allocations/5d861bbe-0c3e-4b10-84ab-4c60c53ad2d4
 ```
+
+成功响应：
+
+```json
+{"result": 0, "error_msg": ""}
+```
+
+UUID 格式非法返回 HTTP 400，分配不存在返回 HTTP 404。
+
+按标签释放：`DELETE /api/v1/allocations?pod_uid={pod_uid}&container_name={container_name}`。
+两个标签均须提供，按精确匹配定位 allocation 后执行释放：匹配一条时成功，无匹配返回 HTTP 404，匹配多条返回 HTTP 409 Conflict 并要求改用 UUID。
+
+```bash
+curl --unix-socket /run/enpu/enpu-manager.sock -X DELETE \
+  'http://localhost/api/v1/allocations?pod_uid=pod-abc&container_name=container-1'
+```
+
+自动回收及重试建议使用创建时返回的 UUID，避免同名业务重新分配后误释放新资源。
 
 ### 清理所有 vNPU 分配
 
-一次性释放当前所有 vNPU 分配（释放 shm / quota / 配置文件），适用于环境重置、批量回收等场景：
+`DELETE /api/v1/clean`
+
+一次性释放当前所有 vNPU 分配及其共享内存、配额和配置文件，适用于环境重置、批量回收。
+请求无需参数和正文。调用前应停止使用这些配置的业务。
 
 ```bash
-curl -X DELETE http://localhost:8080/api/v1/clean
+curl --unix-socket /run/enpu/enpu-manager.sock -X DELETE http://localhost/api/v1/clean
 ```
 
-返回示例：`{"released_count":N,"result":0,"error_msg":""}`，其中 `released_count` 表示本次清理的 vNPU 数量，该接口不会让 enpu-manager 进程退出。
+成功响应示例：
 
-### 查询设备
+```json
+{
+  "released_count": 2,
+  "result": 0,
+  "error_msg": ""
+}
+```
+
+`released_count` 表示本次释放的 vNPU 分配数量，无分配时为 0；`result=0` 表示清理成功。
+
+### 查询设备列表
+
+`GET /api/v1/devices`
+
+返回所有 NPU 设备及其可分配资源，无需请求参数。
 
 ```bash
-# 列出所有设备
-curl http://localhost:8080/api/v1/devices
-
-# 查询单卡详情（含该 die 的 oversub_ratio）
-curl http://localhost:8080/api/v1/devices/0
+curl --unix-socket /run/enpu/enpu-manager.sock http://localhost/api/v1/devices
 ```
+
+响应示例：
+
+```json
+{
+  "devices": [
+    {
+      "phy_id": 0,
+      "minor_name": "Ascend910-0",
+      "uuid": "14422CC3-...",
+      "aicore_available": 80,
+      "hbm_available": 32768,
+      "vnpu_available": 63,
+      "oversub_ratio": 0.5
+    }
+  ]
+}
+```
+
+`aicore_available` 为剩余可分配算力配额（百分数），`hbm_available` 为可分配 HBM 配额（MB），
+`vnpu_available` 为剩余可分配 vNPU 数量，`oversub_ratio` 为显存超分比例（例如 0.5 表示允许超分 50%）。
+无设备时返回 `{"devices":[]}`。实际用量及利用率通过 `/api/v1/resources` 查询。
+
+### 查询设备详情
+
+`GET /api/v1/devices/{phy_id}`
+
+返回指定物理卡的可分配资源、总显存及显存超分比例。
+
+| 参数 | 类型 | 必填 | 说明 |
+|:---|:---|:---|:---|
+| `phy_id` | int | 是 | 路径参数，物理资源 ID，须为非负整数。 |
+
+```bash
+curl --unix-socket /run/enpu/enpu-manager.sock http://localhost/api/v1/devices/0
+```
+
+响应示例：
+
+```json
+{
+  "phy_id": 0,
+  "die_id": "14422CC3-...",
+  "aicore_available": 80,
+  "hbm_available": 32768,
+  "vnpu_available": 63,
+  "total_memory": 65536,
+  "oversub_ratio": 0.5
+}
+```
+
+可分配资源字段与设备列表含义一致；`die_id` 为 DIE 标识，`total_memory` 为设备总显存，单位为 MB。
+指定设备不存在返回 HTTP 404。
 
 ### 查询分配
 
+`GET /api/v1/allocations`
+
+返回当前分配清单，供下游建立 allocation 与设备、业务标签的映射。`config_path` 为该分配在宿主机上的配置文件路径，与创建响应一致，支持自定义配置目录。
+
 ```bash
-curl http://localhost:8080/api/v1/allocations
+curl --unix-socket /run/enpu/enpu-manager.sock http://localhost/api/v1/allocations
 ```
+
+响应示例：
+
+```json
+{
+  "allocations": [
+    {
+      "allocation_id": "5d861bbe-0c3e-4b10-84ab-4c60c53ad2d4",
+      "config_path": "/etc/enpu/vcann-rt/allocations/5d861bbe-0c3e-4b10-84ab-4c60c53ad2d4/npu_info.config",
+      "metadata": {"pod_uid": "pod-abc", "container_name": "container-1"},
+      "phy_id": 0,
+      "vnpu_id": 5,
+      "die_id": "14422CC3-...",
+      "aicore_quota": 20,
+      "hbm_quota": 10240,
+      "hbm_limit": 10240,
+      "sched_policy": 1,
+      "swap_order": 1
+    }
+  ]
+}
+```
+
+无分配时返回 `{"allocations":[]}`。此处 HBM 配额沿用分配接口的 MB 单位。
+
+### 查询资源
+
+`GET /api/v1/resources`
+
+返回算力配额、HBM request/limit 和实际用量、六项物理利用率及两项 vNPU 利用率。
+
+| 参数 | 类型 | 必填 | 说明 |
+|:---|:---|:---|:---|
+| `allocation_id` | string | 否 | 按 UUID 查询单个分配。 |
+| `phy_id` | int | 否 | 按物理资源过滤。 |
+| `vnpu_id` | int | 否 | 查询指定 vNPU，须同时提供 phy_id。 |
+| `pod_uid`、`container_name` | string | 否 | 按非空元数据精确匹配，同时提供时为 AND。 |
+| `detail` | bool | 否 | 默认 false；true 时增加采样时间和数据源返回码等诊断信息。 |
+
+UUID、资源坐标、标签三种选择器互斥；不传选择器查询全部。结果统一放在 `items` 数组中，
+UUID 查询成功时为一项，标签查询可返回多项。资源响应的显存单位为 bytes，利用率为 0～100 百分数。
+
+```bash
+# 查询单个 allocation
+curl --unix-socket /run/enpu/enpu-manager.sock \
+  'http://localhost/api/v1/resources?allocation_id=5d861bbe-0c3e-4b10-84ab-4c60c53ad2d4'
+
+# 按标签查询并附加诊断信息
+curl --unix-socket /run/enpu/enpu-manager.sock \
+  'http://localhost/api/v1/resources?pod_uid=pod-abc&container_name=container-1&detail=true'
+```
+
+单个 allocation 的响应示例（数值为示意）：
+
+```json
+{
+  "items": [
+    {
+      "allocation_id": "5d861bbe-0c3e-4b10-84ab-4c60c53ad2d4",
+      "phy_id": 0,
+      "vnpu_id": 5,
+      "metadata": {"pod_uid": "pod-abc", "container_name": "container-1"},
+      "quota": {
+        "aicore_percent": 20,
+        "core_limit_enabled": true,
+        "scheduling_policy": "fixed-share"
+      },
+      "hbm": {
+        "request_bytes": 10737418240,
+        "limit_bytes": 10737418240,
+        "usage": {"used_bytes": 2147483648, "status": "ok"}
+      },
+      "physical": {
+        "npu_utilization": {"value": 80.0, "status": "ok"},
+        "aicore_utilization": {"value": 75.0, "status": "ok"},
+        "aicpu_utilization": {"value": 10.0, "status": "ok"},
+        "ctrlcpu_utilization": {"value": 5.0, "status": "ok"},
+        "cube_utilization": {"value": 70.0, "status": "ok"},
+        "vector_utilization": {"value": 65.0, "status": "ok"}
+      },
+      "vnpu": {
+        "utilization": {"value": 24.0, "status": "ok"},
+        "aicore_utilization": {"value": 22.5, "status": "ok"}
+      }
+    }
+  ],
+  "result": 0,
+  "error_msg": ""
+}
+```
+
+`quota` 和 HBM 配额来自分配记录；`physical` 为绑定卡的整体指标，`vnpu` 为按工作量归因的估算值，
+不直接由配额推算。HBM 用量为来源容器在绑定设备上的 DCMI 可见进程内存汇总。
+best-effort 下 `core_limit_enabled=false`、`aicore_percent=null`，`scheduling_policy="best-effort"`。
+
+观测指标通过 `status` 表示有效性：`ok/idle` 为有效，`unsupported` 为不支持，`stale` 为过期，
+`unavailable` 或统计异常状态表示数据不可用。无效数值为 null，例如：
+
+```json
+{"used_bytes": null, "status": "stale"}
+```
+
+统计异常状态包括 `inconsistent`、`stats_shm_missing`、`stats_version_mismatch`、`stats_unavailable`、
+`avg_duration_missing`、`dcmi_unavailable` 和 `vnpu_id_out_of_range`。下游仅将 `ok/idle` 当作有效数据，未知状态按不可用处理。
+单项指标失败不影响其他指标返回，此时 HTTP 200、`result=0` 仍表示查询成功。
+
+`detail=true` 时，每个 item 额外增加 `detail`，以下省略部分同类指标诊断字段：
+
+```json
+{
+  "detail": {
+    "window_ms": 1000,
+    "collected_at_ns": 12100000000,
+    "die_id": "14422CC3-...",
+    "shm_id": "14422CC3-...",
+    "raw": {
+      "sum_block_dim": 300,
+      "launch_count": 30,
+      "avg_kernel_duration_ns": 1000000
+    },
+    "calculated": {"work": 300000000, "weight": 0.3},
+    "hbm": {"source_result": 0, "sampled_at_monotonic_ns": 12000000000},
+    "physical": {
+      "npu_utilization": {"source_result": 0, "sampled_at_monotonic_ns": 12090000000}
+    },
+    "vnpu": {
+      "utilization": {"source_result": 0, "sampled_at_monotonic_ns": 12080000000}
+    }
+  }
+}
+```
+
+detail 时间使用单调时钟纳秒，0 表示无对应时间；`window_ms` 仅表示 vNPU 统计窗口。
+这些时间用于诊断，不是 metrics 样本末尾的 Unix 毫秒时间戳。
+
+参数非法返回 HTTP 400；指定 UUID 或物理卡加 vNPU 不存在返回 404；
+集合或标签无匹配返回 200 和空 items；整体查询失败返回 500。
+
+### 查询 Prometheus 指标
+
+`GET /metrics`
+
+一次返回当前节点全部 allocation 及其关联物理卡的指标，不接受请求体和查询参数。
+
+| 项目 | 约定 |
+| --- | --- |
+| Content-Type | `text/plain; version=0.0.4; charset=utf-8` |
+| 编码 | UTF-8，以 LF 分隔，正文末尾保留换行 |
+| 正文上限 | 8 MiB，超限返回失败 |
+| 指标类型 | 全部为 Gauge |
+
+```bash
+curl --fail-with-body -sS --max-time 10 \
+  --unix-socket /run/enpu/enpu-manager.sock \
+  http://localhost/metrics
+```
+
+正常查询、空 allocation 集合或部分指标不可用时返回 HTTP 200；方法错误返回 405；整体查询或格式化失败返回 500。
+
+#### 标签
+
+| 标签 | 含义 |
+| --- | --- |
+| `allocation_id` | manager 生成的分配 UUID，在本次分配生命周期内稳定 |
+| `phy_id` | 节点内物理资源 ID |
+| `vnpu_id` | 物理资源下的 vNPU ID |
+| `pod_uid` | 可选业务元数据，未填写时为空字符串 |
+| `container_name` | 可选业务元数据，未填写时为空字符串 |
+| `metric` | valid 指标所描述的指标名称 |
+
+物理卡指标仅携带 `phy_id`，每张卡每类指标输出一次；allocation 指标携带
+`allocation_id`、`phy_id`、`vnpu_id`、`pod_uid` 和 `container_name`。
+
+`enpu_allocation_info` 每个活动 allocation 输出一条，值固定为 1，用于关联业务元数据、
+vNPU 和物理卡。下游以 `allocation_id` 定位一次分配，以 `phy_id` 关联同一 manager 的物理指标。
+一个物理卡可能关联多个 allocation，关联后的物理利用率不能按 allocation 求和。
+
+#### 指标清单
+
+利用率单位为百分数 0～100，显存单位为 bytes。
+
+| 指标 | 标签 | 含义 |
+| --- | --- | --- |
+| `enpu_npu_utilization_percent` | `phy_id` | 物理 NPU 整体利用率 |
+| `enpu_npu_aicore_utilization_percent` | `phy_id` | 物理 NPU AI Core 利用率 |
+| `enpu_npu_aicpu_utilization_percent` | `phy_id` | 物理 NPU AI CPU 利用率 |
+| `enpu_npu_ctrlcpu_utilization_percent` | `phy_id` | 物理 NPU Ctrl CPU 利用率 |
+| `enpu_npu_cube_utilization_percent` | `phy_id` | 物理 NPU AI Cube 利用率 |
+| `enpu_npu_vector_utilization_percent` | `phy_id` | 物理 NPU Vector Core 利用率 |
+| `enpu_npu_metric_valid` | `phy_id, metric` | 对应物理指标是否有效 |
+| `enpu_allocation_info` | allocation 标签 | allocation 元数据和设备关联，固定为 1 |
+| `enpu_vnpu_aicore_quota_percent` | allocation 标签 | 启用算力限流时的时间共享配额 |
+| `enpu_vnpu_core_limit_enabled` | allocation 标签 | 是否启用算力限流：1 开启，0 关闭 |
+| `enpu_vnpu_hbm_request_bytes` | allocation 标签 | 配置的 HBM 申请量 |
+| `enpu_vnpu_hbm_limit_bytes` | allocation 标签 | 配置的 HBM 上限 |
+| `enpu_vnpu_hbm_used_bytes` | allocation 标签 | 来源业务容器在绑定设备上的 HBM 用量 |
+| `enpu_vnpu_utilization_percent` | allocation 标签 | vNPU 的利用率估算值                   |
+| `enpu_vnpu_aicore_utilization_percent` | allocation 标签 | vNPU 的 AI Core 利用率估算值 |
+| `enpu_vnpu_metric_valid` | allocation 标签、`metric` | 对应 vNPU 观测指标是否有效 |
+
+`enpu_npu_metric_valid` 的 `metric` 可为 `utilization_percent`、
+`aicore_utilization_percent`、`aicpu_utilization_percent`、`ctrlcpu_utilization_percent`、
+`cube_utilization_percent` 或 `vector_utilization_percent`；`enpu_vnpu_metric_valid` 的
+`metric` 可为 `hbm_used_bytes`、`utilization_percent` 或 `aicore_utilization_percent`。
+
+- vNPU 利用率根据近期 block 规模和抽样平均耗时计算工作量权重，再乘对应物理指标；它不是配额使用率。
+- HBM 用量是容器内 DCMI 可见进程在绑定设备上的内存之和。
+- best-effort 模式输出 `enpu_vnpu_core_limit_enabled=0`，省略 `enpu_vnpu_aicore_quota_percent`，其他可用指标照常输出。
+
+#### 有效性与时间戳
+
+数据有效时输出数值样本及 `valid=1`，有效值为 0 时仍明确输出 0。指标不支持、采集失败、
+样本过期或快照异常时省略对应数值样本并输出 `valid=0`。allocation 释放后，其 info、配置和
+观测样本均停止输出。整轮抓取失败由 Prometheus 的 `up=0` 表示。
+
+每条数值样本的格式为：
+
+```text
+指标名{标签} 数值 Unix毫秒时间戳
+```
+
+时间戳表示本次查询完成时间，同一响应统一使用一个时间戳；各数据源的实际采样时间通过 JSON `detail` 查询。
+
+#### 完整响应示例
+
+下面示例覆盖全部基础指标族：同一物理卡上的两个 elastic allocation，算力配额分别为 40% 和 60%。
+各示例独立展示，UUID、资源坐标和数值均为示意值。
+
+```http
+HTTP/1.1 200 OK
+Content-Type: text/plain; version=0.0.4; charset=utf-8
+```
+
+```text
+# HELP enpu_allocation_info allocation 元数据及设备关联。
+# TYPE enpu_allocation_info gauge
+enpu_allocation_info{allocation_id="45d75bc4-9c12-4c5e-87fb-197895599ae1",phy_id="0",vnpu_id="1",pod_uid="pod-a",container_name="infer"} 1 1793066400000
+enpu_allocation_info{allocation_id="5d861bbe-0c3e-4b10-84ab-4c60c53ad2d4",phy_id="0",vnpu_id="2",pod_uid="",container_name=""} 1 1793066400000
+
+# HELP enpu_npu_utilization_percent 物理 NPU 整体利用率，单位为百分数。
+# TYPE enpu_npu_utilization_percent gauge
+enpu_npu_utilization_percent{phy_id="0"} 80 1793066400000
+
+# HELP enpu_npu_aicore_utilization_percent 物理 NPU 的 AI Core 利用率，单位为百分数。
+# TYPE enpu_npu_aicore_utilization_percent gauge
+enpu_npu_aicore_utilization_percent{phy_id="0"} 72 1793066400000
+
+# HELP enpu_npu_aicpu_utilization_percent 物理 NPU 的 AI CPU 利用率，单位为百分数。
+# TYPE enpu_npu_aicpu_utilization_percent gauge
+enpu_npu_aicpu_utilization_percent{phy_id="0"} 15 1793066400000
+
+# HELP enpu_npu_ctrlcpu_utilization_percent 物理 NPU 的 Ctrl CPU 利用率，单位为百分数。
+# TYPE enpu_npu_ctrlcpu_utilization_percent gauge
+enpu_npu_ctrlcpu_utilization_percent{phy_id="0"} 8 1793066400000
+
+# HELP enpu_npu_cube_utilization_percent 物理 NPU 的 AI Cube 利用率，单位为百分数。
+# TYPE enpu_npu_cube_utilization_percent gauge
+enpu_npu_cube_utilization_percent{phy_id="0"} 65 1793066400000
+
+# HELP enpu_npu_vector_utilization_percent 物理 NPU 的 Vector Core 利用率，单位为百分数。
+# TYPE enpu_npu_vector_utilization_percent gauge
+enpu_npu_vector_utilization_percent{phy_id="0"} 32 1793066400000
+
+# HELP enpu_vnpu_utilization_percent vNPU 的 NPU 利用率估算值，单位为百分数。
+# TYPE enpu_vnpu_utilization_percent gauge
+enpu_vnpu_utilization_percent{allocation_id="45d75bc4-9c12-4c5e-87fb-197895599ae1",phy_id="0",vnpu_id="1",pod_uid="pod-a",container_name="infer"} 24 1793066400000
+enpu_vnpu_utilization_percent{allocation_id="5d861bbe-0c3e-4b10-84ab-4c60c53ad2d4",phy_id="0",vnpu_id="2",pod_uid="",container_name=""} 56 1793066400000
+
+# HELP enpu_vnpu_aicore_utilization_percent vNPU 的 AI Core 利用率估算值，单位为百分数。
+# TYPE enpu_vnpu_aicore_utilization_percent gauge
+enpu_vnpu_aicore_utilization_percent{allocation_id="45d75bc4-9c12-4c5e-87fb-197895599ae1",phy_id="0",vnpu_id="1",pod_uid="pod-a",container_name="infer"} 21.6 1793066400000
+enpu_vnpu_aicore_utilization_percent{allocation_id="5d861bbe-0c3e-4b10-84ab-4c60c53ad2d4",phy_id="0",vnpu_id="2",pod_uid="",container_name=""} 50.4 1793066400000
+
+# HELP enpu_vnpu_aicore_quota_percent 启用算力限流时配置的 AI Core 时间共享配额，单位为百分数。
+# TYPE enpu_vnpu_aicore_quota_percent gauge
+enpu_vnpu_aicore_quota_percent{allocation_id="45d75bc4-9c12-4c5e-87fb-197895599ae1",phy_id="0",vnpu_id="1",pod_uid="pod-a",container_name="infer"} 40 1793066400000
+enpu_vnpu_aicore_quota_percent{allocation_id="5d861bbe-0c3e-4b10-84ab-4c60c53ad2d4",phy_id="0",vnpu_id="2",pod_uid="",container_name=""} 60 1793066400000
+
+# HELP enpu_vnpu_core_limit_enabled 是否启用 AI Core 算力限流，1 表示开启，0 表示关闭。
+# TYPE enpu_vnpu_core_limit_enabled gauge
+enpu_vnpu_core_limit_enabled{allocation_id="45d75bc4-9c12-4c5e-87fb-197895599ae1",phy_id="0",vnpu_id="1",pod_uid="pod-a",container_name="infer"} 1 1793066400000
+enpu_vnpu_core_limit_enabled{allocation_id="5d861bbe-0c3e-4b10-84ab-4c60c53ad2d4",phy_id="0",vnpu_id="2",pod_uid="",container_name=""} 1 1793066400000
+
+# HELP enpu_vnpu_hbm_request_bytes 配置的 HBM 申请量，单位为 bytes。
+# TYPE enpu_vnpu_hbm_request_bytes gauge
+enpu_vnpu_hbm_request_bytes{allocation_id="45d75bc4-9c12-4c5e-87fb-197895599ae1",phy_id="0",vnpu_id="1",pod_uid="pod-a",container_name="infer"} 4294967296 1793066400000
+enpu_vnpu_hbm_request_bytes{allocation_id="5d861bbe-0c3e-4b10-84ab-4c60c53ad2d4",phy_id="0",vnpu_id="2",pod_uid="",container_name=""} 4294967296 1793066400000
+
+# HELP enpu_vnpu_hbm_limit_bytes 配置的 HBM 上限，单位为 bytes。
+# TYPE enpu_vnpu_hbm_limit_bytes gauge
+enpu_vnpu_hbm_limit_bytes{allocation_id="45d75bc4-9c12-4c5e-87fb-197895599ae1",phy_id="0",vnpu_id="1",pod_uid="pod-a",container_name="infer"} 6442450944 1793066400000
+enpu_vnpu_hbm_limit_bytes{allocation_id="5d861bbe-0c3e-4b10-84ab-4c60c53ad2d4",phy_id="0",vnpu_id="2",pod_uid="",container_name=""} 8589934592 1793066400000
+
+# HELP enpu_vnpu_hbm_used_bytes 来源业务容器在绑定设备上的 HBM 用量，单位为 bytes。
+# TYPE enpu_vnpu_hbm_used_bytes gauge
+enpu_vnpu_hbm_used_bytes{allocation_id="45d75bc4-9c12-4c5e-87fb-197895599ae1",phy_id="0",vnpu_id="1",pod_uid="pod-a",container_name="infer"} 2147483648 1793066400000
+enpu_vnpu_hbm_used_bytes{allocation_id="5d861bbe-0c3e-4b10-84ab-4c60c53ad2d4",phy_id="0",vnpu_id="2",pod_uid="",container_name=""} 3221225472 1793066400000
+
+# HELP enpu_npu_metric_valid 物理 NPU 指标是否具有有效样本，1 表示有效，0 表示无效。
+# TYPE enpu_npu_metric_valid gauge
+enpu_npu_metric_valid{phy_id="0",metric="utilization_percent"} 1 1793066400000
+enpu_npu_metric_valid{phy_id="0",metric="aicore_utilization_percent"} 1 1793066400000
+enpu_npu_metric_valid{phy_id="0",metric="aicpu_utilization_percent"} 1 1793066400000
+enpu_npu_metric_valid{phy_id="0",metric="ctrlcpu_utilization_percent"} 1 1793066400000
+enpu_npu_metric_valid{phy_id="0",metric="cube_utilization_percent"} 1 1793066400000
+enpu_npu_metric_valid{phy_id="0",metric="vector_utilization_percent"} 1 1793066400000
+
+# HELP enpu_vnpu_metric_valid vNPU 指标是否具有有效样本，1 表示有效，0 表示无效。
+# TYPE enpu_vnpu_metric_valid gauge
+enpu_vnpu_metric_valid{allocation_id="45d75bc4-9c12-4c5e-87fb-197895599ae1",phy_id="0",vnpu_id="1",pod_uid="pod-a",container_name="infer",metric="hbm_used_bytes"} 1 1793066400000
+enpu_vnpu_metric_valid{allocation_id="45d75bc4-9c12-4c5e-87fb-197895599ae1",phy_id="0",vnpu_id="1",pod_uid="pod-a",container_name="infer",metric="utilization_percent"} 1 1793066400000
+enpu_vnpu_metric_valid{allocation_id="45d75bc4-9c12-4c5e-87fb-197895599ae1",phy_id="0",vnpu_id="1",pod_uid="pod-a",container_name="infer",metric="aicore_utilization_percent"} 1 1793066400000
+enpu_vnpu_metric_valid{allocation_id="5d861bbe-0c3e-4b10-84ab-4c60c53ad2d4",phy_id="0",vnpu_id="2",pod_uid="",container_name="",metric="hbm_used_bytes"} 1 1793066400000
+enpu_vnpu_metric_valid{allocation_id="5d861bbe-0c3e-4b10-84ab-4c60c53ad2d4",phy_id="0",vnpu_id="2",pod_uid="",container_name="",metric="utilization_percent"} 1 1793066400000
+enpu_vnpu_metric_valid{allocation_id="5d861bbe-0c3e-4b10-84ab-4c60c53ad2d4",phy_id="0",vnpu_id="2",pod_uid="",container_name="",metric="aicore_utilization_percent"} 1 1793066400000
+```
+
+下游按指标名和标签解析，勿依赖样本顺序或 `HELP` 文案。
+
+#### 下游查询示例
+
+以下 PromQL 假设下游已采集 `/metrics`，抓取任务名为 `enpu`：
+
+```promql
+# 指定业务的 vNPU 利用率
+enpu_vnpu_utilization_percent{job="enpu", pod_uid="pod-a", container_name="infer"}
+
+# HBM 实际用量占配置上限的百分比
+100 * enpu_vnpu_hbm_used_bytes{job="enpu"}
+  / on(job, instance, allocation_id)
+  (enpu_vnpu_hbm_limit_bytes{job="enpu"} > 0)
+
+# allocation 所绑定物理卡的整体利用率
+enpu_allocation_info{job="enpu", pod_uid="pod-a"}
+  * on(job, instance, phy_id) group_left
+  enpu_npu_utilization_percent{job="enpu"}
+
+```
+
+利用率为 Gauge，使用原值或时间聚合，不使用 `rate()`。
 
 ## vNPU 分配约束
 
@@ -418,12 +828,13 @@ curl http://localhost:8080/api/v1/allocations
 
 vNPU 分配成功后，enpu-manager 会在宿主机侧生成 vCANN-RT 所需的配置文件：
 
-**路径**：`/etc/enpu/vcann-rt/allocations/{allocation_id}/npu_info.config`
+**默认路径**：`/etc/enpu/vcann-rt/allocations/{allocation_id}/npu_info.config`，以创建响应中的 `config_path` 为准。
 
 **表 9 npu_info.config 字段**
 
 | 字段                | 说明                                                                                          |
 |:--------------------|:----------------------------------------------------------------------------------------------|
+| `allocation-id` | 分配 UUID。 |
 | `physical-npu-id`   | 物理 NPU id（即 phy_id）。                                                                     |
 | `virtual-npu-id`    | vNPU id（同一 phy 下唯一）。                                                                   |
 | `aicore-quota`      | AICore 配额（%）；高优先级写入 `0`。                                                              |
@@ -477,10 +888,10 @@ vNPU 分配成功后，enpu-manager 会在宿主机侧生成 vCANN-RT 所需的�
 
    ```bash
    # 查询当前所有分配
-   curl http://localhost:8080/api/v1/allocations
+   curl --unix-socket /run/enpu/enpu-manager.sock http://localhost/api/v1/allocations
 
    # 查询所有设备资源
-   curl http://localhost:8080/api/v1/devices
+   curl --unix-socket /run/enpu/enpu-manager.sock http://localhost/api/v1/devices
    ```
 
 6. **`GET /api/v1/allocations` 返回结果中出现 `error_msg` 字段**
@@ -490,5 +901,5 @@ vNPU 分配成功后，enpu-manager 会在宿主机侧生成 vCANN-RT 所需的�
    ```bash
    # 仅释放指定的 vNPU 分配。请勿使用 DELETE /api/v1/clean 全量清理，
    # clean 会释放节点上所有 vNPU 分配，包括正在运行业务的分配
-   curl -X DELETE 'http://localhost:8080/api/v1/allocations?pod_uid=pod-0&container_name=container-0-0'
+   curl --unix-socket /run/enpu/enpu-manager.sock -X DELETE http://localhost/api/v1/allocations/5d861bbe-0c3e-4b10-84ab-4c60c53ad2d4
    ```

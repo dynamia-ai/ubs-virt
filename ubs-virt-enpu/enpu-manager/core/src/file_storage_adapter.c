@@ -90,6 +90,15 @@ static int file_adapter_save(storage_adapter_t *adapter, allocation_t **allocs, 
         cJSON_AddNumberToObject(item, "swap_order", alloc->swap_order);
         cJSON_AddNumberToObject(item, "vnpu_priority", alloc->vnpu_priority);
         cJSON_AddNumberToObject(item, "create_time_ns", alloc->create_time_ns);
+        /* JSON numbers lose uint64 precision; identities must round-trip exactly. */
+        char generation[32];
+        if (snprintf_s(generation, sizeof(generation), sizeof(generation) - 1, "%llu",
+                       (unsigned long long)alloc->resource_generation) < 0 ||
+            cJSON_AddStringToObject(item, "resource_generation", generation) == NULL) {
+            cJSON_Delete(item);
+            cJSON_Delete(root);
+            return ENPU_FAIL;
+        }
         cJSON_AddNumberToObject(item, "update_time_ns", alloc->update_time_ns);
         cJSON_AddNumberToObject(item, "swap_offset", alloc->swap_offset);
         cJSON_AddNumberToObject(item, "swap_size", alloc->swap_size);
@@ -332,6 +341,23 @@ static int file_adapter_load(storage_adapter_t *adapter, allocation_t *allocs, i
         }
         if (create_time_ns) {
             alloc->create_time_ns = (uint64_t)create_time_ns->valuedouble;
+        }
+        cJSON *generation = cJSON_GetObjectItem(item, "resource_generation");
+        if (generation != NULL) {
+            char *end = NULL;
+            errno = 0;
+            if (!cJSON_IsString(generation) || generation->valuestring == NULL || generation->valuestring[0] < '0' ||
+                generation->valuestring[0] > '9') {
+                cJSON_Delete(root);
+                *count = 0;
+                return ENPU_FAIL;
+            }
+            alloc->resource_generation = strtoull(generation->valuestring, &end, 10);
+            if (errno != 0 || *end != '\0') {
+                cJSON_Delete(root);
+                *count = 0;
+                return ENPU_FAIL;
+            }
         }
         if (update_time_ns) {
             alloc->update_time_ns = (uint64_t)update_time_ns->valuedouble;

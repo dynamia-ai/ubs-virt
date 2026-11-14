@@ -12,6 +12,7 @@
 #include "dcmi_adapter.h"
 #include "dcmi_stub_adapter.h"
 #include "dcmi_wrapper.h"
+#include "securec.h"
 
 typedef struct dcmi_stub_context {
     dcmi_adapter_t adapter;

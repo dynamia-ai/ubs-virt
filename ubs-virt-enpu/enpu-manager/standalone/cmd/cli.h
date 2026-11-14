@@ -13,10 +13,9 @@
 #ifndef __CLI_H__
 #define __CLI_H__
 
-#define CLI_DEFAULT_HOST "localhost"
-#define CLI_DEFAULT_PORT "8080"
+#define CLI_DEFAULT_SOCKET_PATH "/run/enpu/enpu-manager.sock"
 
-typedef int (*cli_cmd_func_t)(int argc, char *argv[], const char *host, const char *port);
+typedef int (*cli_cmd_func_t)(int argc, char *argv[], const char *socket_path);
 
 int cli_main(int argc, char *argv[]);
 

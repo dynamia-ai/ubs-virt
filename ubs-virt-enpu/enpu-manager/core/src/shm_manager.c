@@ -23,6 +23,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
+#include <unistd.h>
 #include "log.h"
 #include "securec.h"
 
@@ -59,26 +60,29 @@ int shm_struct_init(const char *shm_id, vnpu_time_slice_sched_t **sched_out)
 
     size_t size = sizeof(vnpu_time_slice_sched_t);
     struct stat st;
-    if (fstat(fd, &st) == 0 && st.st_size >= size) {
+    if (fstat(fd, &st) != 0 || st.st_size < 0 || (st.st_size != 0 && (size_t)st.st_size != size)) {
+        LOG_ERROR("[SHM-MANAGER] Scheduling shm size mismatch: %s", shm_id);
+        close(fd);
+        return ENPU_FAIL;
+    }
+    if ((size_t)st.st_size == size) {
         void *addr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         close(fd);
 
         if (addr == MAP_FAILED) {
-            shm_unlink(shm_id);
             return ENPU_FAIL;
         }
 
         vnpu_time_slice_sched_t *sched = (vnpu_time_slice_sched_t *)addr;
-        if (atomic_load(&sched->magic_number) == MAGIC_INITIALIZED) {
+        if (atomic_load(&sched->magic_number) == VNPU_SCHED_MAGIC_INITIALIZED) {
             *sched_out = sched;
             return ENPU_SUCCESS;
         }
 
+        /* Do not reinitialize mutexes or reset a live domain with a different ABI. */
+        LOG_ERROR("[SHM-MANAGER] Scheduling shm is unready or incompatible: %s", shm_id);
         munmap(addr, size);
-        fd = shm_open(shm_id, O_RDWR, S_IRUSR | S_IWUSR);
-        if (fd == -1) {
-            return ENPU_FAIL;
-        }
+        return ENPU_FAIL;
     }
 
     if (ftruncate(fd, size) == -1) {
@@ -96,13 +100,14 @@ int shm_struct_init(const char *shm_id, vnpu_time_slice_sched_t **sched_out)
     }
 
     vnpu_time_slice_sched_t *sched = (vnpu_time_slice_sched_t *)addr;
+    atomic_store(&sched->magic_number, VNPU_SCHED_MAGIC_INITIALIZING);
 
     pthread_mutexattr_t attr;
     pthread_mutexattr_init(&attr);
     pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
     pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);
 
-    for (int i = 0; i < MAX_VNPU_SCHED; i++) {
+    for (int i = 0; i < VNPU_SCHED_MAX_VNPU; i++) {
         pthread_mutex_init(&sched->vnpu_schedule_mutex[i], &attr);
         atomic_store(&sched->last_alive_time_ns[i], 0ULL);
         atomic_store(&sched->last_kernel_time_ns[i], 0ULL);
@@ -119,13 +124,12 @@ int shm_struct_init(const char *shm_id, vnpu_time_slice_sched_t **sched_out)
     }
 
     pthread_mutex_init(&sched->npu_utilization_monitor_mutex, &attr);
-
     pthread_mutexattr_destroy(&attr);
 
     atomic_store(&sched->owner, -1);
-    atomic_store(&sched->magic_number, MAGIC_INITIALIZED);
     atomic_store(&sched->slide_window_len, 0);
     atomic_store(&sched->last_slide_window_time_ns, 0ULL);
+    atomic_store(&sched->magic_number, VNPU_SCHED_MAGIC_INITIALIZED);
 
     *sched_out = sched;
     return ENPU_SUCCESS;
@@ -142,9 +146,10 @@ int shm_struct_cleanup(const char *shm_id, vnpu_time_slice_sched_t *sched, int v
     }
 
     if (sched != NULL) {
-        for (int i = 0; i < MAX_VNPU_SCHED; i++) {
+        for (int i = 0; i < VNPU_SCHED_MAX_VNPU; i++) {
             pthread_mutex_destroy(&sched->vnpu_schedule_mutex[i]);
         }
+        pthread_mutex_destroy(&sched->npu_utilization_monitor_mutex);
         munmap(sched, sizeof(vnpu_time_slice_sched_t));
     }
 
@@ -195,40 +200,19 @@ int shm_manager_destroy(shm_manager_t *mgr)
     if (mgr == NULL) {
         return ENPU_INVALID_PARAM;
     }
-
     pthread_mutex_lock(&mgr->lock);
-
+    /* Shutdown is not resource release. Preserve shared objects and mutexes
+     * used by existing containers so a new manager can attach to them. */
     for (int i = 0; i < MAX_NPU_PER_NODE; i++) {
-        // vnpu_time_slice_sched_t unlink和munmap在shm_struct_cleanup里处理
         if (mgr->sched_structs[i] != NULL) {
-            int vnpu_count = 0;
-            if (mgr->shm_states[i] != NULL) {
-                uint64_t bitmap0 = atomic_load(&mgr->shm_states[i]->vnpu_bitmap[0]);
-                uint64_t bitmap1 = atomic_load(&mgr->shm_states[i]->vnpu_bitmap[1]);
-                for (int v = 0; v < MAX_VNPU_PER_DIE; v++) {
-                    int idx = v / 64;
-                    int bit = v % 64;
-                    uint64_t bitmap = (idx == 0) ? bitmap0 : bitmap1;
-                    if ((bitmap >> bit) & 1)
-                        vnpu_count++;
-                }
-            }
-            shm_struct_cleanup(mgr->shm_states[i]->shm_id, mgr->sched_structs[i], vnpu_count);
-            mgr->sched_structs[i] = NULL;
+            munmap(mgr->sched_structs[i], sizeof(vnpu_time_slice_sched_t));
         }
-
         if (mgr->shm_states[i] != NULL) {
-            destroy_shm_state(mgr->shm_states[i]);
-            mgr->shm_states[i] = NULL;
+            munmap(mgr->shm_states[i], sizeof(shm_state_t));
         }
     }
-
-    mgr->shm_state_count = 0;
-    mgr->initialized = false;
-
     pthread_mutex_unlock(&mgr->lock);
     pthread_mutex_destroy(&mgr->lock);
-
     free(mgr);
     return ENPU_SUCCESS;
 }
@@ -270,6 +254,9 @@ int shm_manager_get_or_create_shm(shm_manager_t *mgr, int phy_id, const char *di
     }
 
     state = shm_state_posix_shm_create(phy_id, die_id);
+    if (state == NULL && errno == EEXIST) {
+        state = shm_state_posix_shm_attach(phy_id, die_id);
+    }
     if (state == NULL) {
         pthread_mutex_unlock(&mgr->lock);
         return ENPU_FAIL;
@@ -297,6 +284,11 @@ int shm_manager_get_or_create_shm(shm_manager_t *mgr, int phy_id, const char *di
         mgr->sched_structs[phy_id] = sched;
     } else {
         LOG_ERROR("[SHM-MANAGER] shm_struct_init failed, phy_id=%d, shm_id=%s, ret=%d", phy_id, die_id, ret);
+        munmap(state, sizeof(*state));
+        mgr->shm_states[phy_id] = NULL;
+        mgr->shm_state_count--;
+        pthread_mutex_unlock(&mgr->lock);
+        return ret;
     }
 
     atomic_store(&state->initialized, true);
@@ -311,7 +303,7 @@ int shm_manager_register_vnpu(shm_manager_t *mgr, int phy_id, int vnpu_id, int a
         return ENPU_INVALID_PARAM;
     }
 
-    if (vnpu_id >= MAX_VNPU_PER_DIE) {
+    if (vnpu_id >= VNPU_SCHED_MAX_VNPU) {
         return ENPU_INVALID_PARAM;
     }
 
@@ -413,7 +405,7 @@ int shm_manager_add_entry(shm_manager_t *mgr, int phy_id, vnpu_shm_entry_t *entr
         return ENPU_INVALID_PARAM;
     }
 
-    if (entry->vnpu_id < 0 || entry->vnpu_id >= MAX_VNPU_PER_DIE) {
+    if (entry->vnpu_id < 0 || entry->vnpu_id >= VNPU_SCHED_MAX_VNPU) {
         return ENPU_INVALID_PARAM;
     }
 
@@ -956,6 +948,9 @@ shm_state_t *shm_state_posix_shm_create(int phy_id, const char *die_id)
     /* Never truncate or reinitialize an existing object's data and mutex. */
     int fd = shm_open(shm_name, O_CREAT | O_EXCL | O_RDWR, 0644);
     if (fd < 0) {
+        if (errno == EEXIST) {
+            return NULL; /* The caller attaches without resetting a live object. */
+        }
         LOG_ERROR("[SHM-MANAGER] create shm state failed, shm_id=%s, errno=%d", shm_name, errno);
         return NULL;
     }

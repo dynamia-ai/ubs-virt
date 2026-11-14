@@ -9,12 +9,16 @@
 * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 * See the Mulan PSL v2 for more details.
 */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "core_limiter.h"
 #include "common.h"
 #include "dcmi_wrapper.h"
 #include "hash_map.h"
 #include "npu_manager.h"
 #include "runtime_hook.h"
+#include "stream_drain.h"
 #include "utils.h"
 #include "vnpu_stats.h"
 
@@ -23,7 +27,7 @@ uint8_t g_vnpu_id = 0;
 volatile int g_terminate = 0;
 atomic_bool g_sched_locking = false;
 atomic_int hasModelExecuteSync = 0;
-pthread_mutex_t g_sched_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t g_sched_mutex = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
 atomic_bool g_monitor_init = false;
 static atomic_bool g_aclrt_impl_hook_enable = true;
 static atomic_bool g_vnpu_stats_enable = true;
@@ -32,6 +36,7 @@ cache_streams_t g_cache_streams = {.num_streams = 0, .streams = {NULL}};
 
 static bool is_normal_priority_vnpu(int vnpu_id);
 bool is_vnpu_alive(int vnpu_id);
+void restore_streams(rtStream_t stream);
 
 HashMap *stream_map = NULL;
 HashMap *event_map = NULL;
@@ -102,14 +107,16 @@ void set_vnpu_stats_enable(bool enable)
     atomic_store(&g_vnpu_stats_enable, enable);
 }
 
-void restore_streams(rtStream_t stream)
+static void restore_streams_locked(rtStream_t stream)
 {
     if (stream == NULL) {
         return;
     }
 
-    if (hashmap_contains(stream_map, (void *)stream)) {
-        return;
+    for (int i = 0; i < g_cache_streams.num_streams; i++) {
+        if (g_cache_streams.streams[i] == stream) {
+            return;
+        }
     }
 
     if (g_cache_streams.num_streams >= MAX_STREAMS_PER_PROCESS) {
@@ -119,6 +126,9 @@ void restore_streams(rtStream_t stream)
     }
 
     g_cache_streams.streams[g_cache_streams.num_streams++] = stream;
+    if (hashmap_contains(stream_map, stream)) {
+        return;
+    }
     int ret = hashmap_put(stream_map, (void *)stream, NULL, false);
     CHECK_COND_RETURN(ret == -1, "Failed to put stream %p to the hash map.", (void *)stream);
     LOG_DEBUG("Stream %p is added in stream hash map.", (void *)stream);
@@ -179,24 +189,25 @@ static void wait_for_priority_fairness_window(void)
     }
 }
 
-void add_stream(rtStream_t stream)
+static void add_stream_locked(rtStream_t stream)
 {
-    if (hashmap_contains(stream_map, (void *)stream)) {
-        return;
-    }
-    int ret = hashmap_put(stream_map, (void *)stream, NULL, false);
-    CHECK_COND_RETURN(ret == -1, "Failed to put stream %p to the hash map.", (void *)stream);
-    LOG_DEBUG("Stream %p is added in stream hash map.", (void *)stream);
-    return;
+    restore_streams_locked(stream);
 }
 
 void core_limiter(rtStream_t stream, core_function func, void *param)
 {
-    /* Priority admission must also cover high-priority best-effort vNPUs,
-     * which intentionally have no core quota and therefore bypass the normal
-     * policy limiter below. */
+    // Best-effort skips scheduling, not capture/event/task-group bookkeeping.
     if (!is_core_limit()) {
         wait_for_priority_fairness_window();
+        if (get_sched_policy() == SCHED_POLICY_BEST_EFFORT && stream_map != NULL) {
+            int rc = pthread_mutex_lock(&g_sched_mutex);
+            CHECK_COND_RETURN(rc != 0, "Failed to lock stats bookkeeping mutex, error=%d.", rc);
+            restore_streams(stream);
+            if (func != NULL) {
+                func(param, stream);
+            }
+            pthread_mutex_unlock(&g_sched_mutex);
+        }
         return;
     }
     while (!g_terminate) {
@@ -311,36 +322,61 @@ void set_vnpu_and_idle(int vnpu_id, int next_vnpu_id)
     atomic_store(&g_vnpu_sched_context->owner, next_vnpu_id);
 }
 
-void synchronize_and_clear_streams(void)
+/* Keep Runtime synchronization off the scheduler and allow dependent launches
+ * during this bounded drain phase. The worker never changes shared turn state. */
+uint64_t scheduler_drain_turn(uint8_t turn, bool *complete)
 {
-    int remaining_count = 0;
-    for (int i = 0; i < g_cache_streams.num_streams; ++i) {
-        rtStream_t stm = g_cache_streams.streams[i];
-        bool capture = 0;
-        int rc = hashmap_get_capture_status(stream_map, (void *)stm, &capture);
-        CHECK_COND_RETURN(rc == -1, "Failed to get stream %p capture_status from the hash map.", (void *)stm);
-        if (capture) {
-            LOG_DEBUG("Stream %p is in capture, skip synchronization and clear.", (void *)stm);
-            g_cache_streams.streams[remaining_count++] = stm;
-            continue;
-        }
-        LOG_DEBUG("Stream %p is being synchronized.", (void *)stm);
-        RUNTIME_HOOK_CALL(rt_library_entry, rtStreamSynchronize, stm);
-        rc = hashmap_remove(stream_map, (void *)stm);
-        CHECK_COND_RETURN(rc == -1, "Failed to remove stream %p from the hash map.", (void *)stm);
-    }
-    g_cache_streams.num_streams = remaining_count;
-}
-
-// without locks, multiple processes are executed in parallel.
-static uint64_t sync_own_streams_and_measure_ns(void)
-{
+    *complete = false;
     uint64_t begin = ns_now();
-    while (atomic_load(&hasModelExecuteSync) > 0) {
+    uint64_t deadline = begin + SYNC_WAIT_TIMEOUT_NS;
+    if (atomic_load(&g_vnpu_sched_context->owner) != g_vnpu_id ||
+        atomic_load(&g_vnpu_sched_context->vnpu_schedule_turn[g_vnpu_id]) != turn) {
+        return 0;
+    }
+    bool submitted = false;
+    if (stream_drain_finished() && pthread_mutex_trylock(&g_sched_mutex) == 0) {
+        cache_streams_t snapshot = {0};
+        for (int i = 0; i < g_cache_streams.num_streams; ++i) {
+            rtStream_t stream = g_cache_streams.streams[i];
+            if (!stream_is_capturing(stream)) {
+                snapshot.streams[snapshot.num_streams++] = stream;
+            }
+        }
+        submitted = stream_drain_submit(snapshot.streams, snapshot.num_streams, turn);
+        if (submitted) {
+            int remaining = 0;
+            for (int i = 0; i < g_cache_streams.num_streams; ++i) {
+                rtStream_t stream = g_cache_streams.streams[i];
+                if (stream_is_capturing(stream)) {
+                    g_cache_streams.streams[remaining++] = stream;
+                } else {
+                    (void)hashmap_remove(stream_map, stream);
+                }
+            }
+            g_cache_streams.num_streams = remaining;
+        }
+        pthread_mutex_unlock(&g_sched_mutex);
+    }
+    atomic_store(&g_sched_locking, false);
+    while (!g_terminate && !stream_drain_finished() && ns_now() < deadline &&
+           atomic_load(&g_vnpu_sched_context->owner) == g_vnpu_id &&
+           atomic_load(&g_vnpu_sched_context->vnpu_schedule_turn[g_vnpu_id]) == turn) {
         ns_sleep(WAITING_SLEEP_PERIOD);
     }
-    synchronize_and_clear_streams();
-    return ns_now() - begin;
+    atomic_store(&g_sched_locking, true);
+    *complete = submitted && stream_drain_succeeded();
+    uint64_t elapsed = ns_now() - begin;
+    static uint64_t last_warning_ns = 0;
+    if (!*complete && ns_now() - last_warning_ns >= NS_PER_S) {
+        last_warning_ns = ns_now();
+        LOG_WARN("[DRAIN] incomplete: owner=%d vnpu=%u turn=%u stream=%p locking=%d models=%d "
+                 "expected=%d completed=%d elapsed_ns=%llu; continue rotation",
+                 atomic_load(&g_vnpu_sched_context->owner), g_vnpu_id, turn, stream_drain_current_stream(),
+                 atomic_load(&g_sched_locking), atomic_load(&hasModelExecuteSync),
+                 atomic_load(&g_vnpu_sched_context->vnpu_sync_expected[g_vnpu_id]),
+                 atomic_load(&g_vnpu_sched_context->vnpu_sync_completed[g_vnpu_id]), (unsigned long long)elapsed);
+    }
+    return elapsed;
 }
 
 // wait to finish parallel stream synchronization with all sibling processes of vNPU.
@@ -434,6 +470,7 @@ uint64_t add_and_consume_time_slice(uint8_t *turn_id, int *next_vnpu_id)
 void *vnpu_scheduler_flush_thread(void *arg)
 {
     (void)arg;
+    (void)pthread_setname_np(pthread_self(), "enpu-heartbeat");
     while (!g_terminate) {
         uint64_t now = ns_now();
         /* ① vNPU 级心跳：核调度用. 多进程 atomic_store 同一字段安全（单操作原子） */
@@ -588,6 +625,18 @@ void *vnpu_scheduler_thread(void *arg)
     // g_sched_locking = true : user can not launch task by core_limiter
     atomic_store(&g_sched_locking, true);
     while (!g_terminate) {
+        /* Average publication is independent of owner and limiting policy. */
+        uint64_t now = ns_now();
+        if (now - last_avg_update_ns >= VNPU_STATS_WINDOW_NS) {
+            last_avg_update_ns = now;
+            vnpu_stats_publish_local_average();
+        }
+        if (get_sched_policy() == SCHED_POLICY_BEST_EFFORT) {
+            /* No owner rotation, time-slice waiting, or scheduler stream drain. */
+            atomic_store(&g_sched_locking, false);
+            ns_sleep(VNPU_STATS_BUCKET_DURATION_NS);
+            continue;
+        }
         // Distributed thread scheduling.
         // Scheduling is performed only when the owner is the current vnpu or the owner is disabled.
         int owner = atomic_load(&g_vnpu_sched_context->owner);
@@ -606,24 +655,23 @@ void *vnpu_scheduler_thread(void *arg)
             continue;
         }
 
-        uint64_t now = ns_now();
-        if (now - last_avg_update_ns >= VNPU_STATS_WINDOW_NS) {
-            last_avg_update_ns = now;
-            uint64_t kernel_count = 0;
-            uint64_t kernel_avg_time = get_ker_ave_exec_time(&kernel_count);
-            vnpu_stats_set_local_avg_duration(get_vnpu_id(), kernel_avg_time, kernel_count);
-        }
-
         // Consumption time slice. The lock is released to the user process within the specified time.
         uint64_t timeslice = add_and_consume_time_slice(&turn_id, &next_vnpu_id);
 
         if (timeslice > 0) {
             // without locks, multiple processes are executed in parallel.
-            uint64_t my_sync_ns = sync_own_streams_and_measure_ns();
+            bool drained;
+            uint64_t my_sync_ns = scheduler_drain_turn(turn_id, &drained);
+            /* Completed here means the sibling finished its bounded drain phase,
+             * not that Runtime necessarily finished all device work. */
             if (atomic_load(&g_vnpu_sched_context->vnpu_schedule_turn[g_vnpu_id]) == turn_id) {
                 atomic_fetch_max_uint64(&g_vnpu_sched_context->vnpu_turn_max_sync[g_vnpu_id], my_sync_ns);
                 atomic_fetch_add(&g_vnpu_sched_context->vnpu_sync_completed[g_vnpu_id], 1);
-                LOG_DEBUG("vNPU %d pid %d: parallel sync done, my_elapsed=%llu ns.", g_vnpu_id, (int)getpid(),
+                LOG_DEBUG("[DRAIN] phase done: owner=%d vnpu=%u turn=%u locking=%d drained=%d "
+                          "expected=%d completed=%d elapsed_ns=%llu",
+                          atomic_load(&g_vnpu_sched_context->owner), g_vnpu_id, turn_id, atomic_load(&g_sched_locking),
+                          drained, atomic_load(&g_vnpu_sched_context->vnpu_sync_expected[g_vnpu_id]),
+                          atomic_load(&g_vnpu_sched_context->vnpu_sync_completed[g_vnpu_id]),
                           (unsigned long long)my_sync_ns);
             } else {
                 // this process flow synchronization timeout, data discarded
@@ -774,17 +822,28 @@ int vnpu_scheduler_init(vnpu_time_slice_sched_t *vnpu_sched_shm)
 int vnpu_scheduler_start(void)
 {
     int rc = 0;
-    if (get_vnpu_priority() == VNPU_PRIORITY_NORMAL) {
-        pthread_t vnpu_scheduler_tid;
-        rc = pthread_create(&vnpu_scheduler_tid, NULL, vnpu_scheduler_thread, NULL);
-        if (rc != 0) {
-            LOG_ERROR("Failed to create vnpu scheduler thread, error=%d.", rc);
-            return ENPU_FAIL;
-        }
-        pthread_detach(vnpu_scheduler_tid);
+    if (get_sched_policy() != SCHED_POLICY_BEST_EFFORT && stream_drain_start() != 0) {
+        LOG_ERROR("Failed to start stream drain worker.");
+        return ENPU_FAIL;
+    }
+    pthread_t vnpu_scheduler_tid;
+    rc = pthread_create(&vnpu_scheduler_tid, NULL, vnpu_scheduler_thread, NULL);
+    if (rc != 0) {
+        LOG_ERROR("Failed to create vnpu scheduler thread, error=%d.", rc);
+        return ENPU_FAIL;
     }
     /* 立即 detach：下面那次 create 一旦失败就直接返回, 再也无法 join 这个线程, 
      * 不 detach 会泄漏线程描述符和栈.  */
+    pthread_detach(vnpu_scheduler_tid);
+
+    if (get_sched_policy() == SCHED_POLICY_BEST_EFFORT) {
+        LOG_INFO("[VNPU-STATS] Best-effort statistics publisher started: vnpu=%u shm=%s; "
+                 "no scheduling heartbeat, time-slice rotation or scheduler stream synchronization.",
+                 get_vnpu_id(), get_vnpu_shm_id());
+        if (get_vnpu_priority() == VNPU_PRIORITY_NORMAL) {
+            return ENPU_SUCCESS;
+        }
+    }
     pthread_t vnpu_alive_tid;
     rc = pthread_create(&vnpu_alive_tid, NULL, vnpu_scheduler_flush_thread, NULL);
     if (rc != 0) {
@@ -792,6 +851,9 @@ int vnpu_scheduler_start(void)
         return ENPU_FAIL;
     }
     pthread_detach(vnpu_alive_tid);
+    LOG_INFO("[VNPU-STATS] Scheduler and heartbeat started: vnpu=%u shm=%s; "
+             "scheduler publishes duration averages periodically.",
+             get_vnpu_id(), get_vnpu_shm_id());
     return ENPU_SUCCESS;
 }
 
@@ -899,7 +961,10 @@ err_unmap:
     return ENPU_FAIL;
 }
 
-void set_stream_capture(void *param, rtStream_t stream)
+/* 调用者须持有 g_sched_mutex：capture 更新需一致地遍历 g_cache_streams 并修改 stream_map，
+ * 避免与其他 Hook 的登记/删除及调度线程的快照/清理并发，造成漏更新或访问已删除的节点。
+ * 本函数不重复加锁；对外入口 set_stream_capture() 负责加锁。 */
+static void set_stream_capture_locked(void *param, rtStream_t stream)
 {
     bool capture = *(bool *)param;
     if (!capture) {
@@ -921,7 +986,7 @@ void set_stream_capture(void *param, rtStream_t stream)
     LOG_DEBUG("Stream %p capture state set to: %d.", (void *)stream, capture ? 1 : 0);
 }
 
-void set_event_wait_status(void *evt, rtStream_t stm)
+static void set_event_wait_status_locked(void *evt, rtStream_t stm)
 {
     MapValue event_status;
     int rc = hashmap_get(event_map, evt, &event_status);
@@ -936,13 +1001,13 @@ void set_event_wait_status(void *evt, rtStream_t stm)
     }
 }
 
-void set_event_create_status(void *evt)
+static void set_event_create_status_locked(void *evt)
 {
     int rc = hashmap_put(event_map, evt, NULL, false);
     CHECK_COND_RETURN(rc == -1, "Error: Event hash map put event %p failed.", evt);
 }
 
-void set_event_record_status(void *evt, rtStream_t stm)
+static void set_event_record_status_locked(void *evt, rtStream_t stm)
 {
     MapValue event_status;
     int rc = hashmap_get(event_map, evt, &event_status);
@@ -958,7 +1023,7 @@ void set_event_record_status(void *evt, rtStream_t stm)
     }
 }
 
-void remove_stream(void *unused, rtStream_t stm)
+static void remove_stream_locked(void *unused, rtStream_t stm)
 {
     (void)unused;
     LOG_DEBUG("Remove stream %p", stm);
@@ -975,12 +1040,12 @@ void remove_stream(void *unused, rtStream_t stm)
     }
 }
 
-void set_event_destroy_status(void *evt)
+static void set_event_destroy_status_locked(void *evt)
 {
     (void)hashmap_remove(event_map, evt);
 }
 
-bool stream_is_capturing(rtStream_t stm)
+static bool stream_is_capturing_locked(rtStream_t stm)
 {
     if (stream_map == NULL || stm == NULL) {
         return false;
@@ -990,6 +1055,17 @@ bool stream_is_capturing(rtStream_t stm)
     if (rc != 0) {
         return false;
     }
+    return capturing;
+}
+
+bool stream_is_capturing(rtStream_t stm)
+{
+    int rc = pthread_mutex_lock(&g_sched_mutex);
+    if (rc != 0) {
+        return true;
+    }
+    bool capturing = stream_is_capturing_locked(stm);
+    pthread_mutex_unlock(&g_sched_mutex);
     return capturing;
 }
 
@@ -1271,6 +1347,70 @@ void task_update_end(rtStream_t stm)
     st->tmp_block_dim = 0;
     st->tmp_count = 0;
     pthread_mutex_unlock(&g_stats_map_mutex);
+}
+
+void restore_streams(rtStream_t stream)
+{
+    int rc = pthread_mutex_lock(&g_sched_mutex);
+    CHECK_COND_RETURN(rc != 0, "Failed to lock stream bookkeeping: rc=%d", rc);
+    restore_streams_locked(stream);
+    pthread_mutex_unlock(&g_sched_mutex);
+}
+
+void add_stream(rtStream_t stream)
+{
+    int rc = pthread_mutex_lock(&g_sched_mutex);
+    CHECK_COND_RETURN(rc != 0, "Failed to lock stream bookkeeping: rc=%d", rc);
+    add_stream_locked(stream);
+    pthread_mutex_unlock(&g_sched_mutex);
+}
+
+void set_stream_capture(void *param, rtStream_t stream)
+{
+    int rc = pthread_mutex_lock(&g_sched_mutex);
+    CHECK_COND_RETURN(rc != 0, "Failed to lock stream bookkeeping: rc=%d", rc);
+    set_stream_capture_locked(param, stream);
+    pthread_mutex_unlock(&g_sched_mutex);
+}
+
+void set_event_wait_status(void *evt, rtStream_t stm)
+{
+    int rc = pthread_mutex_lock(&g_sched_mutex);
+    CHECK_COND_RETURN(rc != 0, "Failed to lock stream bookkeeping: rc=%d", rc);
+    set_event_wait_status_locked(evt, stm);
+    pthread_mutex_unlock(&g_sched_mutex);
+}
+
+void set_event_create_status(void *evt)
+{
+    int rc = pthread_mutex_lock(&g_sched_mutex);
+    CHECK_COND_RETURN(rc != 0, "Failed to lock stream bookkeeping: rc=%d", rc);
+    set_event_create_status_locked(evt);
+    pthread_mutex_unlock(&g_sched_mutex);
+}
+
+void set_event_record_status(void *evt, rtStream_t stm)
+{
+    int rc = pthread_mutex_lock(&g_sched_mutex);
+    CHECK_COND_RETURN(rc != 0, "Failed to lock stream bookkeeping: rc=%d", rc);
+    set_event_record_status_locked(evt, stm);
+    pthread_mutex_unlock(&g_sched_mutex);
+}
+
+void remove_stream(void *unused, rtStream_t stm)
+{
+    int rc = pthread_mutex_lock(&g_sched_mutex);
+    CHECK_COND_RETURN(rc != 0, "Failed to lock stream bookkeeping: rc=%d", rc);
+    remove_stream_locked(unused, stm);
+    pthread_mutex_unlock(&g_sched_mutex);
+}
+
+void set_event_destroy_status(void *evt)
+{
+    int rc = pthread_mutex_lock(&g_sched_mutex);
+    CHECK_COND_RETURN(rc != 0, "Failed to lock stream bookkeeping: rc=%d", rc);
+    set_event_destroy_status_locked(evt);
+    pthread_mutex_unlock(&g_sched_mutex);
 }
 
 void launch_stats_dispatch(rtStream_t stm, uint32_t block_dim)

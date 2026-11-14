@@ -45,6 +45,14 @@ static void test_uuid_identity_and_labels(void)
     assert(registry != NULL);
     allocation_t first = make_allocation("", "");
     allocation_t second = make_allocation("", "");
+    assert(allocation_id_is_valid(first.allocation_id));
+    assert(first.allocation_id[14] == '4' && strchr("89ab", first.allocation_id[19]) != NULL);
+    char normalized[ALLOCATION_ID_LEN];
+    assert(allocation_id_normalize("550E8400-E29B-41D4-A716-446655440000", normalized));
+    assert(strcmp(normalized, "550e8400-e29b-41d4-a716-446655440000") == 0);
+    assert(!allocation_id_is_valid("550e8400-e29b-41d4-a716-44665544000g"));
+    assert(!allocation_id_is_valid("550e8400_e29b-41d4-a716-446655440000"));
+    assert(!allocation_id_is_valid(NULL) && !allocation_id_is_valid(""));
     assert(strcmp(first.allocation_id, second.allocation_id) != 0);
     assert(allocation_registry_register(registry, &first) == ENPU_SUCCESS);
     assert(allocation_registry_register(registry, &second) == ENPU_SUCCESS);

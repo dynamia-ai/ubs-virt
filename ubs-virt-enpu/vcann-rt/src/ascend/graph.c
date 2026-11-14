@@ -14,6 +14,7 @@
 #include "log.h"
 #include "npu_manager.h"
 #include "runtime_hook.h"
+#include "stream_drain.h"
 #include "vnpu_stats.h"
 
 static void record_model_execute_stats(rtModel_t mdl)
@@ -158,7 +159,16 @@ RUNTIME_HOOK_DEFINE(rtStreamBeginCapture, rtStream_t stm, const rtStreamCaptureM
     LOG_DEBUG("Hook init rtStreamBeginCapture.");
     bool capture = true;
     core_limiter(stm, set_stream_capture, &capture);
+    if (!stream_drain_wait_stream(stm)) {
+        capture = false;
+        set_stream_capture(&capture, stm);
+        return ACL_ERROR_FAILURE;
+    }
     aclError ret = RUNTIME_HOOK_CALL(rt_library_entry, rtStreamBeginCapture, stm, mode);
+    if (ret != ACL_RT_SUCCESS) {
+        capture = false;
+        set_stream_capture(&capture, stm);
+    }
     return ret;
 }
 
@@ -170,7 +180,16 @@ RUNTIME_HOOK_DEFINE(aclmdlRICaptureBeginImpl, aclrtStream stream, aclmdlRICaptur
     LOG_DEBUG("Hook init aclmdlRICaptureBeginImpl.");
     bool capture = true;
     core_limiter(stream, set_stream_capture, &capture);
+    if (!stream_drain_wait_stream(stream)) {
+        capture = false;
+        set_stream_capture(&capture, stream);
+        return ACL_ERROR_FAILURE;
+    }
     aclError ret = RUNTIME_HOOK_CALL(rt_library_entry, aclmdlRICaptureBeginImpl, stream, mode);
+    if (ret != ACL_RT_SUCCESS) {
+        capture = false;
+        set_stream_capture(&capture, stream);
+    }
     return ret;
 }
 
@@ -179,7 +198,7 @@ RUNTIME_HOOK_DEFINE(rtStreamEndCapture, rtStream_t stm, rtModel_t *captureMdl)
     LOG_DEBUG("Hook init rtStreamEndCapture.");
     core_limiter(stm, NULL, NULL);
     aclError ret = RUNTIME_HOOK_CALL(rt_library_entry, rtStreamEndCapture, stm, captureMdl);
-    if (ret == ACL_RT_SUCCESS && is_core_limit()) {
+    if (ret == ACL_RT_SUCCESS && (is_core_limit() || get_sched_policy() == SCHED_POLICY_BEST_EFFORT)) {
         bool capture = false;
         set_stream_capture(&capture, stm);
         if (captureMdl != NULL && *captureMdl != NULL) {
@@ -200,7 +219,7 @@ RUNTIME_HOOK_DEFINE(aclmdlRICaptureEndImpl, aclrtStream stream, aclmdlRI *modelR
     LOG_DEBUG("Hook init aclmdlRICaptureEndImpl.");
     core_limiter(stream, NULL, NULL);
     aclError ret = RUNTIME_HOOK_CALL(rt_library_entry, aclmdlRICaptureEndImpl, stream, modelRI);
-    if (ret == ACL_RT_SUCCESS && is_core_limit()) {
+    if (ret == ACL_RT_SUCCESS && (is_core_limit() || get_sched_policy() == SCHED_POLICY_BEST_EFFORT)) {
         bool capture = false;
         set_stream_capture(&capture, stream);
         if (modelRI != NULL && *modelRI != NULL) {

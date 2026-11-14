@@ -24,6 +24,16 @@ extern "C" {
 
 typedef enum
 {
+    ENPU_DCMI_UTIL_AICORE = 2,
+    ENPU_DCMI_UTIL_AICPU = 3,
+    ENPU_DCMI_UTIL_CTRLCPU = 4,
+    ENPU_DCMI_UTIL_VECTOR = 12,
+    ENPU_DCMI_UTIL_NPU = 13,
+    ENPU_DCMI_UTIL_CUBE = 14,
+} enpu_dcmi_utilization_type;
+
+typedef enum
+{
     SOC_VERSION_ASCEND_950,
     SOC_VERSION_ASCEND_910,
     SOC_VERSION_ASCEND_310
@@ -48,12 +58,23 @@ typedef struct {
 } dcmi_operations;
 
 extern int enpu_dcmi_get_card_info(uint32_t phy_id, int *card_id, int *device_id, int *logic_id, uint8_t soc_version);
+/* Legacy limiter/swap entry: temporary worker thread, generic success/failure.
+ * Query, summation and validation delegate to enpu_dcmi_query_hbm_usage(). */
 extern int enpu_dcmi_get_device_resource_info(int logic_id, int card_id, int device_id, size_t *used);
+/* Shared direct query for monitor, sampler and the legacy threaded wrapper.
+ * No nested thread and no PID filtering.
+ * Returns raw DCMI errors or negative errno for local validation failures.
+ */
+extern int enpu_dcmi_query_hbm_usage(int logic_id, int card_id, int device_id, uint8_t soc_version,
+                                     uint64_t *used_bytes);
 extern int enpu_dcmi_get_device_utilization_rate(int logic_id, int card_id, int device_id,
                                                  unsigned int *utilization_rate);
 extern int enpu_dcmi_get_aicore_utilization_rate(int logic_id, int card_id, int device_id,
                                                  unsigned int *utilization_rate);
 extern int enpu_dcmi_get_aicore_num(int logic_id, int card_id, int device_id, unsigned int *aicore_num);
+/* Raw per-type query: no cross-metric fallback; preserves the original DCMI return code. */
+extern int enpu_dcmi_get_utilization_rate(int logic_id, int card_id, int device_id, uint8_t soc_version, int input_type,
+                                          unsigned int *utilization_rate);
 extern int register_callback(uint8_t soc_version);
 
 #if defined(__cplusplus)

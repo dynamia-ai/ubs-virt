@@ -19,7 +19,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <uuid/uuid.h>
 #include "../internal/npu_allocator_internal.h"
 #include "allocation.h"
 #include "common.h"
@@ -34,6 +33,7 @@
 #include "securec.h"
 #include "shm_manager.h"
 #include "storage_adapter.h"
+#include "vnpu_metrics_reader.h"
 
 #define MAX_EVALS 3
 
@@ -50,7 +50,7 @@
 /* vNPU ID must fit the tree's 64-bit mask and both shared-memory arrays. */
 static bool vnpu_id_is_valid(int32_t vnpu_id)
 {
-    return vnpu_id >= 0 && vnpu_id < (int32_t)(sizeof(uint64_t) * CHAR_BIT) && vnpu_id < MAX_VNPU_SCHED &&
+    return vnpu_id >= 0 && vnpu_id < (int32_t)(sizeof(uint64_t) * CHAR_BIT) && vnpu_id < VNPU_SCHED_MAX_VNPU &&
            vnpu_id < MAX_VNPU_PER_DIE;
 }
 
@@ -300,6 +300,14 @@ int npu_allocator_init(npu_allocator_t *a)
     int count = 0;
     allocation_registry_list(a->registry, existing, &count);
     for (int i = 0; i < count; i++) {
+        if (!allocation_id_is_valid(existing[i].allocation_id)) {
+            allocation_registry_destroy(registry_with_adapter);
+            storage_adapter_destroy(storage);
+            pthread_mutex_unlock(&a->lock);
+            ERR("Invalid allocation_id while attaching checkpoint storage: index=%d value=%s", i,
+                existing[i].allocation_id);
+            return ENPU_FAIL;
+        }
         if (allocation_registry_register(registry_with_adapter, &existing[i]) != ENPU_SUCCESS) {
             allocation_registry_destroy(registry_with_adapter);
             storage_adapter_destroy(storage);
@@ -530,14 +538,11 @@ int npu_allocator_allocate(npu_allocator_t *a, alloc_request_t *req, alloc_respo
         resp->result = ENPU_FAIL;
         return ENPU_FAIL;
     }
-    if (!allocation_id_is_valid(req->allocation_id)) {
+    if (!allocation_id_normalize(req->allocation_id, req->allocation_id)) {
         alloc_snprintf(resp->error_msg, MAX_PATH_LEN, "allocation_id must be a UUID");
         resp->result = ENPU_INVALID_PARAM;
         return ENPU_INVALID_PARAM;
     }
-    uuid_t id;
-    uuid_parse(req->allocation_id, id);
-    uuid_unparse_lower(id, req->allocation_id);
 
     if (req->vnpu_priority != VNPU_PRIORITY_NORMAL && req->vnpu_priority != VNPU_PRIORITY_HIGH) {
         alloc_snprintf(resp->error_msg, MAX_PATH_LEN, "vnpu_priority must be 0 (normal) or 1 (high), got %d",
@@ -704,6 +709,13 @@ int npu_allocator_allocate(npu_allocator_t *a, alloc_request_t *req, alloc_respo
                                                                                                   SWAP_ORDER_DEFAULT;
     alloc_copy_str(alloc.die_id, DIE_ID_LEN, npu_node_get_die_id(node));
     alloc.create_time_ns = (uint64_t)time(NULL) * 1000000000ULL;
+    struct timespec generation_time = {0};
+    if (clock_gettime(CLOCK_MONOTONIC, &generation_time) == 0) {
+        alloc.resource_generation =
+            (uint64_t)generation_time.tv_sec * 1000000000ULL + (uint64_t)generation_time.tv_nsec;
+    } else {
+        ERR("Allocation generation clock failed; HBM sampling will remain unavailable");
+    }
 
     a->rollback_log->step_count = 0;
 
@@ -778,9 +790,24 @@ int npu_allocator_allocate(npu_allocator_t *a, alloc_request_t *req, alloc_respo
     registry_alloc.vnpu_priority = alloc.vnpu_priority;
     registry_alloc.swap_order = alloc.swap_order;
     registry_alloc.create_time_ns = alloc.create_time_ns;
+    registry_alloc.resource_generation = alloc.resource_generation;
     alloc_copy_str(registry_alloc.pod_uid, MAX_UUID_LEN, req->pod_uid);
     alloc_copy_str(registry_alloc.container_name, MAX_NAME_LEN, req->container_name);
     alloc_copy_str(registry_alloc.shm_id, SHM_ID_LEN, resp->shm_id);
+
+    /* Recovered allocations may carry an earlier boot's monotonic generation.
+     * Seed above the last slot fence before reusing the resource, even across
+     * manager restarts. This is a read-only peek; allocation never repairs stats. */
+    vnpu_stats_snapshot_t prior_stats = {0};
+    if (registry_alloc.vnpu_id >= 0 && registry_alloc.vnpu_id < VNPU_STATS_MAX_VNPU &&
+        vnpu_metrics_reader_snapshot(registry_alloc.shm_id, &prior_stats) == VNPU_STATS_READER_OK) {
+        uint64_t prior = prior_stats.hbm[registry_alloc.vnpu_id].requested_generation;
+        if (prior >= registry_alloc.resource_generation) {
+            registry_alloc.resource_generation = prior == UINT64_MAX ? 0 : prior + 1;
+        }
+    }
+    LOG_DEBUG("[HBM-STATS] Allocation generation: phy=%d vnpu=%d generation=%llu", registry_alloc.phy_id,
+              registry_alloc.vnpu_id, (unsigned long long)registry_alloc.resource_generation);
 
     vnpu_config_t config = {.phy_npu_id = registry_alloc.phy_id,
                             .vnpu_id = registry_alloc.vnpu_id,
@@ -788,8 +815,9 @@ int npu_allocator_allocate(npu_allocator_t *a, alloc_request_t *req, alloc_respo
                             .memory_request = registry_alloc.hbm_quota,
                             .memory_limit = registry_alloc.hbm_limit,
                             .scheduling_policy = registry_alloc.sched_policy,
-                            .vnpu_priority = registry_alloc.vnpu_priority};
+                            .resource_generation = registry_alloc.resource_generation};
     alloc_copy_str(config.allocation_id, ALLOCATION_ID_LEN, registry_alloc.allocation_id);
+    config.vnpu_priority = registry_alloc.vnpu_priority;
     alloc_copy_str(config.shm_id, SHM_ID_LEN, registry_alloc.shm_id);
 
     ret = config_manager_write_config(a->config_mgr, registry_alloc.allocation_id, &config);
@@ -1019,6 +1047,7 @@ int npu_allocator_recover(npu_allocator_t *a)
             .memory_request = alloc->hbm_quota,
             .memory_limit = alloc->hbm_limit,
             .scheduling_policy = alloc->sched_policy,
+            .resource_generation = alloc->resource_generation,
             .vnpu_priority = alloc->vnpu_priority,
         };
         alloc_copy_str(config.allocation_id, ALLOCATION_ID_LEN, alloc->allocation_id);
@@ -1214,7 +1243,7 @@ int npu_allocator_get_last_kernel_time_ns(npu_allocator_t *a, int phy_id, int vn
 {
     CHECK(a, ENPU_INVALID_PARAM);
     CHECK(last_kernel_time_ns, ENPU_INVALID_PARAM);
-    if (vnpu_id < 0 || vnpu_id >= MAX_VNPU_SCHED) {
+    if (vnpu_id < 0 || vnpu_id >= VNPU_SCHED_MAX_VNPU) {
         return ENPU_INVALID_PARAM;
     }
 

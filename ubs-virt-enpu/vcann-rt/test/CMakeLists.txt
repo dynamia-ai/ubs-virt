@@ -16,7 +16,10 @@ include(${PROJECT_SOURCE_DIR}/scripts/cmake/gtest.cmake)
 include(${PROJECT_SOURCE_DIR}/scripts/cmake/mockcpp.cmake)
 
 set(VNPU_SRC_FILES
+    ${PROJECT_SOURCE_DIR}/../common/src/allocation_id.c
     ${PROJECT_SOURCE_DIR}/src/core_limiter.c
+    ${PROJECT_SOURCE_DIR}/src/hbm_sampler.c
+    ${PROJECT_SOURCE_DIR}/src/stream_drain.c
     ${PROJECT_SOURCE_DIR}/src/mem_limiter.c
     ${PROJECT_SOURCE_DIR}/src/npu_manager.c
     ${PROJECT_SOURCE_DIR}/src/log.c
@@ -73,6 +76,7 @@ add_executable(vnpu_test
 
 target_include_directories(vnpu_test PRIVATE
     ${PROJECT_SOURCE_DIR}/src/include
+    ${PROJECT_SOURCE_DIR}/../common/include
     ${CMAKE_CURRENT_SOURCE_DIR}/stub
 )
 
@@ -132,6 +136,7 @@ foreach(swap_test memory_tracker_test swap_executor_test swap_hook_test)
     )
     target_include_directories(${swap_test} PRIVATE
         ${PROJECT_SOURCE_DIR}/src/include
+        ${PROJECT_SOURCE_DIR}/../common/include
         ${CMAKE_CURRENT_SOURCE_DIR}/stub
     )
     target_link_libraries(${swap_test} PRIVATE
