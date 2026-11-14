@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - 'ubs-virt-enpu/vcann-rt/**'
+      - 'ubs-virt-enpu/common/**'
       - 'LICENSE'
       - 'packaging/enpu-runtime/**'
       - '.github/workflows/enpu-runtime-latest.yml'

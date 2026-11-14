@@ -9,7 +9,12 @@ commit=$(git -C "$root" rev-parse --verify "$source_ref^{commit}")
 # The source release is independent of the packaging revision.
 git -C "$root" cat-file -e "$commit^{commit}"
 mkdir -p "$output"
-git -C "$root" archive --format=tar "$commit" ubs-virt-enpu/vcann-rt > "$output/source.tar"
+source_paths=(ubs-virt-enpu/vcann-rt)
+# Newer runtimes share sources with the manager; older fixed releases do not.
+if git -C "$root" cat-file -e "$commit:ubs-virt-enpu/common" 2>/dev/null; then
+    source_paths+=(ubs-virt-enpu/common)
+fi
+git -C "$root" archive --format=tar "$commit" "${source_paths[@]}" > "$output/source.tar"
 git -C "$root" show "$commit:LICENSE" > "$output/LICENSE.ubs-virt"
 cp "$root/packaging/enpu-runtime/"{Dockerfile,build-runtime.sh} "$output/"
 python3 - "$output" "$commit" "$source_label" <<'PY'
