@@ -180,9 +180,9 @@ void mcs_wait_for_idle(mcs_shared_state_t *state, int my_vnpu_id)
 }
 
 /* Anti-starvation burst limit: how many high-priority kernel launches
- * entitle one normal-priority launch while a high-priority vNPU keeps the
- * device busy. Tunable via MCS_STARVATION_LIMIT (>= 1); default 300. Read
- * once per process. */
+ * entitle each normal-priority vNPU to one launch while a high-priority vNPU
+ * is active. Tunable via MCS_STARVATION_LIMIT (>= 1); default 300. Read once
+ * per process. */
 static uint64_t mcs_high_launch_burst_limit(void)
 {
     static int64_t limit = -1;
@@ -201,6 +201,31 @@ static uint64_t mcs_high_launch_burst_limit(void)
     return (uint64_t)limit;
 }
 
+static void mcs_reset_launch_burst(mcs_shared_state_t *state)
+{
+    state->high_launch_count = 0;
+    (void)memset(state->normal_launch_pending, 0, sizeof(state->normal_launch_pending));
+}
+
+static void mcs_grant_normal_launch_burst(mcs_shared_state_t *state)
+{
+    for (int i = 0; i < MCS_MAX_VNPU; i++) {
+        if (state->vnpu_priority[i] == 0) {
+            state->normal_launch_pending[i] = 1;
+        }
+    }
+}
+
+static void mcs_count_high_launch(mcs_shared_state_t *state)
+{
+    const uint64_t limit = mcs_high_launch_burst_limit();
+    state->high_launch_count++;
+    if (state->high_launch_count >= limit) {
+        state->high_launch_count = 0;
+        mcs_grant_normal_launch_burst(state);
+    }
+}
+
 void mcs_before_launch(mcs_shared_state_t *state, int vnpu_id, uint8_t my_priority)
 {
     if (state == NULL || vnpu_id < 0 || vnpu_id >= MCS_MAX_VNPU) {
@@ -208,26 +233,28 @@ void mcs_before_launch(mcs_shared_state_t *state, int vnpu_id, uint8_t my_priori
     }
 
     if (my_priority == 1) {
-        /* High priority: never waits; every launch feeds the burst counter
-         * that eventually entitles a normal-priority launch. */
-        (void)__atomic_fetch_add(&state->high_launch_count, 1ULL, __ATOMIC_RELAXED);
+        (void)pthread_mutex_lock(&state->mcs_mutex);
         state->last_kernel_time_ns[vnpu_id] = mcs_ns_now();
+        mcs_count_high_launch(state);
+        (void)pthread_mutex_unlock(&state->mcs_mutex);
         return;
     }
 
-    /* Normal priority: wait only while a high-priority vNPU is active
-     * (5ms window) AND its burst count has not reached the limit. The 5ms
-     * idle rule is unchanged; the burst limit prevents starvation when a
-     * high-priority task launches continuously. */
-    const uint64_t limit = mcs_high_launch_burst_limit();
-    while (mcs_has_high_priority_active(state, vnpu_id) &&
-           __atomic_load_n(&state->high_launch_count, __ATOMIC_RELAXED) < limit) {
+    for (;;) {
+        (void)pthread_mutex_lock(&state->mcs_mutex);
+        if (!mcs_has_high_priority_active(state, vnpu_id)) {
+            mcs_reset_launch_burst(state);
+            (void)pthread_mutex_unlock(&state->mcs_mutex);
+            break;
+        }
+        if (state->normal_launch_pending[vnpu_id] != 0) {
+            state->normal_launch_pending[vnpu_id] = 0;
+            (void)pthread_mutex_unlock(&state->mcs_mutex);
+            break;
+        }
+        (void)pthread_mutex_unlock(&state->mcs_mutex);
         mcs_ns_sleep(MCS_WAIT_SLEEP_NS);
     }
 
-    /* Passed the gate: this normal-priority launch consumes the entitlement
-     * and restarts the count, so at most one normal launch slips through
-     * per burst limit of high-priority launches. */
-    (void)__atomic_exchange_n(&state->high_launch_count, 0ULL, __ATOMIC_RELAXED);
     state->last_kernel_time_ns[vnpu_id] = mcs_ns_now();
 }

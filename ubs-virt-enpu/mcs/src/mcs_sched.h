@@ -23,25 +23,25 @@ extern "C" {
 
 /* MCS_MAX_VNPU is defined in mcs_config.h (single source). */
 
-/* Layout version 2: added high_launch_count. Bump whenever the shared-state
- * layout changes so stale shm files are re-initialized instead of being
- * interpreted with garbage in the new fields. */
+/* Added per-normal-vNPU pending flags. Bump whenever the
+ * shared-state layout changes so stale shm files are re-initialized instead
+ * of being interpreted with garbage in the new fields. */
 #define MCS_MAGIC_INITIALIZING 0x4D435300U /* "MCS\0" */
-#define MCS_MAGIC_INITIALIZED 0x4D435301U  /* "MCS\1" */
+#define MCS_MAGIC_INITIALIZED 0x4D435303U  /* "MCS\3" */
 #define MCS_NO_TASK_TIMEOUT_NS 5000000ULL  /* 5ms timeout for detecting idle vNPU */
 #define MCS_WAIT_SLEEP_NS 100000ULL        /* 100us sleep when polling */
 #define MCS_HIGH_LAUNCH_BURST_DEFAULT \
-    300ULL /* anti-starvation: high-priority launches that entitle one normal launch */
+    300ULL /* anti-starvation: high-priority launches that entitle each normal vNPU to one launch */
 
 typedef struct {
     pthread_mutex_t mcs_mutex;
     uint64_t last_kernel_time_ns[MCS_MAX_VNPU];
-    /* Anti-starvation: cumulative count of high-priority kernel launches
-     * since the last normal-priority launch. When it reaches the burst
-     * limit, one normal-priority launch is allowed through even if a
-     * high-priority vNPU is still active within the 5ms window. Reset to 0
-     * by the normal-priority launch that consumes the entitlement. */
+    /* Bounded count shared by all high-priority vNPUs; reset at each burst
+     * and when all high-priority vNPUs become idle. */
     uint64_t high_launch_count;
+    /* Per-normal-vNPU entitlements, invalidated when all high-priority vNPUs
+     * become idle so stale credits cannot be used after high activity resumes. */
+    uint8_t normal_launch_pending[MCS_MAX_VNPU];
     uint8_t vnpu_priority[MCS_MAX_VNPU];
     uint32_t magic_number;
 } mcs_shared_state_t;
@@ -55,10 +55,9 @@ void mcs_mark_active(mcs_shared_state_t *state, int vnpu_id);
 int mcs_has_high_priority_active(mcs_shared_state_t *state, int my_vnpu_id);
 void mcs_wait_for_idle(mcs_shared_state_t *state, int my_vnpu_id);
 
-/* Per-launch hook: high priority increments the burst counter; normal
- * priority waits while a high-priority vNPU is active AND the burst counter
- * is below the limit, then consumes the entitlement by resetting the
- * counter, and marks itself active. */
+/* Per-launch hook: high priority advances the bounded burst counter and
+ * grants all normal vNPUs at each limit. Normal priority waits while a
+ * high-priority vNPU is active and its own pending flag is clear. */
 void mcs_before_launch(mcs_shared_state_t *state, int vnpu_id, uint8_t my_priority);
 
 #if defined(__cplusplus)

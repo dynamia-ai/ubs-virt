@@ -177,7 +177,7 @@ docker run -it --name=${container_name} \
 | `LD_PRELOAD` | 运行 | 无 | 预加载MCS动态库`libmcs.so`，使能MCS能力。 |
 | `MCS_CONFIG` | 运行 | `/etc/enpu/mcs/mcs_config.config` | vNPU配置文件路径。 |
 | `ENPU_LOG_LEVEL` | 运行 | `3` | 日志级别，FATAL(0), ERROR(1), WARN(2), INFO(3), DEBUG(4)。 |
-| `MCS_STARVATION_LIMIT` | 运行 | `300` | 反饿死突发上限，高优先级vNPU连续发射多少个kernel后放行一个普通优先级launch，需配置为>=1的整数。 |
+| `MCS_STARVATION_LIMIT` | 运行 | `300` | 反饿死突发上限，高优先级vNPU累计发射指定数量的kernel后，每个普通优先级vNPU可分别放行一个launch，需配置为>=1的整数。 |
 | `ASCEND_HOME_PATH` | 编译 | `/usr/local/Ascend/cann` | CANN安装路径，提供libboundscheck头文件与库，可通过`source /path/to/cann/set_env.sh`设置。 |
 
 ## 约束

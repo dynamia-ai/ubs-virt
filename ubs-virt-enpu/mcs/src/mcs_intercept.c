@@ -277,10 +277,10 @@ __attribute__((visibility("default"))) rtError_t rtGetAiCoreCount(uint32_t *aiCo
 }
 
 /* Helper: handle priority scheduling before kernel launch.
- * High priority increments the anti-starvation burst counter; normal
- * priority waits while a high-priority vNPU is active AND the burst counter
- * is below the limit (5ms idle rule unchanged), then consumes the
- * entitlement and resets the counter. See mcs_before_launch. */
+ * High priority advances the bounded anti-starvation counter. Each completed
+ * burst grants one independent pending launch to every normal-priority vNPU.
+ * When all high-priority vNPUs become idle, the count and pending grants are
+ * invalidated so resumed high-priority work starts a new scheduling cycle. */
 static inline void mcs_before_kernel_launch(void)
 {
     if (!g_mcs_initialized || g_mcs_state == NULL) {
