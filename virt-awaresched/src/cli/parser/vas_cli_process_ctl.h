@@ -20,7 +20,6 @@ namespace vas::common {
 
 class VasCliProcessCtl {
 public:
-    static void SignalHandler(int signum);
     static VasRet MainExecuteProcess(const int &argc, char *argv[]);
 };
 } // namespace vas::common

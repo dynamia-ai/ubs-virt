@@ -62,7 +62,6 @@ cd virt-awaresched
 
 ```txt
 virt-awaresched
-├── 3rdparty # 依赖二方/三方件
 ├── cmake # cmake工具封装
 ├── docs # 文档
 ├── scripts # 开发使用脚本
@@ -70,13 +69,12 @@ virt-awaresched
 ├── src # 源码目录
 │   ├── cli # cli框架
 │   ├── include # 头文件目录
-│   ├── libvirt_module # libvirt动态加载
 │   ├── log # 日志模块
 │   ├── util # 工具方法
 │   ├── vasctl # vasctl
 │   │   └── arg_parse # 二进制指令解析
 │   └── vasd # vas-daemon
-│       ├── acquire # 信息采集
+│       ├── acquire # 信息采集（含 libvirt 交互）
 │       ├── api # api接口
 │       ├── arg_parse # 二进制指令解析
 │       ├── cluster_sched # 调度模块

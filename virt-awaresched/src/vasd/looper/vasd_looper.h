@@ -14,6 +14,7 @@
 #define VASD_CONTROLLER_H
 
 #include <cstdint>
+#include <mutex>
 #include <thread>
 
 #include "def.h"
@@ -38,6 +39,7 @@ private:
     static SocketServer server;
     static std::thread eventThread;
     static std::thread timerThread;
+    static std::mutex stopMutex;
 
     static void VmEventHandler();
     static void ClusterCompactionTimer();

@@ -10,11 +10,12 @@
  * See the Mulan PSL v2 for more details.
  */
 
-#include <csignal>
+#include <pthread.h>
+#include <signal.h>
+#include <cstdlib>
 #include <iostream>
 
 #include "cluster_sched.h"
-#include "conf.h"
 #include "libvirt_helper.h"
 #include "logger.h"
 #include "vas_cli_parse.h"
@@ -30,28 +31,25 @@ using namespace vas::cli::reg;
 using namespace vas::sched::acquire;
 using namespace vas::security;
 
-namespace vas::sched {
-void SignalHandler(int signum)
-{
-    std::cout << "Received signal " << signum << std::endl;
-    if (signum == SIGPIPE) {
-        std::cout << "SIGPIPE signal received, ignore it." << std::endl;
-        return;
-    }
-
-    Conf::exitFlag.store(true);
-    VasdLooper::Stop();
-}
-} // namespace vas::sched
-
 int main(int argc, char *argv[])
 {
     constexpr int maxCliArgs = 20;
 
     try {
-        if (signal(SIGINT, SignalHandler) == SIG_ERR || signal(SIGTERM, SignalHandler) == SIG_ERR ||
-            signal(SIGPIPE, SignalHandler) == SIG_ERR) {
-            std::cout << "Failed to set signal handler." << std::endl;
+        struct sigaction ignoreSigpipe {
+        };
+        ignoreSigpipe.sa_handler = SIG_IGN;
+        sigemptyset(&ignoreSigpipe.sa_mask);
+        if (sigaction(SIGPIPE, &ignoreSigpipe, nullptr) != 0) {
+            std::cout << "Failed to ignore SIGPIPE." << std::endl;
+            exit(EXIT_FAILURE);
+        }
+        sigset_t exitSignalSet{};
+        sigemptyset(&exitSignalSet);
+        sigaddset(&exitSignalSet, SIGINT);
+        sigaddset(&exitSignalSet, SIGTERM);
+        if (pthread_sigmask(SIG_BLOCK, &exitSignalSet, nullptr) != 0) {
+            std::cout << "Failed to block daemon exit signals." << std::endl;
             exit(EXIT_FAILURE);
         }
 

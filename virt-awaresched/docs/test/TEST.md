@@ -27,15 +27,76 @@
 
 ## 环境准备
 
+单元测试支持以下两种运行方式：
+
+* 方式一：在物理机中直接运行 UT
+* 方式二：在预编译容器中运行 UT
+
+### 方式一：在物理机中运行 UT
+
 1. 开发环境搭建参考《构建指导》。
 
-2. 推荐在`openEuler Linux (ARM64)`下执行项目构建，进入vir-awaresched所在目录。
+2. 推荐在`openEuler Linux (ARM64)`下执行项目构建，进入virt-awaresched所在目录。
 
 3. 执行以下命令：
 
     ```shell
     bash build.sh test
     ```
+
+### 方式二：在预编译容器中运行 UT
+
+#### 使用限制
+
+预编译镜像中已经安装 `virt-awaresched` 编译构建和 UT 所需的构建工具及系统依赖。构建和 UT 使用同一个 `oe2403-v1` 容器即可完成。
+
+源码编译和 UT 不需要将宿主机的 `/lib/modules` 等目录挂载到容器，也不需要授予容器额外的内核权限。
+
+首次构建 UT 时，构建系统会下载 GoogleTest、MockCpp 及 MockCpp ARM64 补丁，需确保容器可以访问 `cmake/gtest.cmake` 和 `cmake/mockcpp.cmake` 中配置的下载地址。
+
+#### 拉取镜像并启动容器
+
+该镜像允许匿名拉取，执行：
+
+```shell
+docker pull swr.cn-north-4.myhuaweicloud.com/ubscore/ubs-virt:oe2403-v1
+```
+
+> 若返回 `denied` 或 `unauthorized`，请向镜像仓库管理员申请读取权限后重试。
+
+启动容器：
+
+```shell
+docker run -it \
+    --name=ubs-virt \
+    swr.cn-north-4.myhuaweicloud.com/ubscore/ubs-virt:oe2403-v1 \
+    /bin/bash
+```
+
+#### 在容器中运行 UT
+
+进入容器后，拉取源码并执行：
+
+```shell
+git clone -b openEuler-24.03-LTS-SP3 \
+    https://gitcode.com/openeuler/ubs-virt.git \
+    /home/ubs-virt-src
+cd /home/ubs-virt-src/virt-awaresched
+bash build.sh test
+```
+
+`bash build.sh test` 会在该容器中完成 UT 的构建并运行全部用例，无需额外执行依赖安装步骤，也无需为 UT 另行创建容器。
+
+#### 结果判断
+
+脚本退出码为`0`，且日志汇总输出`PASSED`（无`FAILED`用例），表示UT全部通过，示例如下：
+
+```text
+[==========] 184 tests from 18 test suites ran.
+[  PASSED  ] 184 tests.
+```
+
+若运行指定用例，可通过`--gtest_filter`过滤，用法见下文"增加单元测试用例"。
 
 ---
 

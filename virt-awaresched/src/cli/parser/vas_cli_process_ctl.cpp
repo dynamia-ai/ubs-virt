@@ -11,9 +11,13 @@
  */
 #include "vas_cli_process_ctl.h"
 
-#include <sys/time.h>
+#include <chrono>
+#include <condition_variable>
 #include <csignal>
+#include <cstdlib>
 #include <iostream>
+#include <mutex>
+#include <thread>
 
 #include "args_util.h"
 #include "def.h"
@@ -22,21 +26,6 @@
 
 namespace vas::common {
 using namespace vas::cli::framework;
-
-/**
- * @brief Handle timeout signal
- *
- * Prints timeout error message and exits the process
- *
- * @param signum Signal number received
- */
-void VasCliProcessCtl::SignalHandler(int signum)
-{
-    if (signum == SIGALRM) {
-        VasCliParse::PrintWithWordWrap("ERROR: Timeout " + std::to_string(CLI_TIMEOUT_SECONDS) + "s.\n");
-    }
-    exit(signum);
-}
 
 /**
  * @brief Process command with timeout mechanism
@@ -57,22 +46,35 @@ VasRet VasCliProcessCtl::MainExecuteProcess(const int &argc, char *argv[])
     if (ret != VAS_OK) {
         return ret;
     }
-    if (signal(SIGALRM, SignalHandler) == SIG_ERR) {
-        std::cout << "Failed to set signal handler for SIGALRM." << std::endl;
-        exit(EXIT_FAILURE);
+    std::mutex timeoutMutex;
+    std::condition_variable timeoutCondition;
+    bool commandFinished = false;
+    std::thread timeoutThread([&timeoutMutex, &timeoutCondition, &commandFinished]() {
+        std::unique_lock<std::mutex> lock(timeoutMutex);
+        if (timeoutCondition.wait_for(lock, std::chrono::seconds(CLI_TIMEOUT_SECONDS),
+                                      [&commandFinished]() { return commandFinished; })) {
+            return;
+        }
+        lock.unlock();
+        VasCliParse::PrintWithWordWrap("ERROR: Timeout " + std::to_string(CLI_TIMEOUT_SECONDS) + "s.\n");
+        std::_Exit(SIGALRM);
+    });
+    auto stopTimeout = [&]() {
+        {
+            std::lock_guard<std::mutex> lock(timeoutMutex);
+            commandFinished = true;
+        }
+        timeoutCondition.notify_one();
+        timeoutThread.join();
+    };
+
+    try {
+        ret = VasCliResEcho::GetInstance().ExecuteCommand();
+    } catch (...) {
+        stopTimeout();
+        throw;
     }
-    itimerval timer{};
-    timer.it_value.tv_sec = CLI_TIMEOUT_SECONDS;
-    timer.it_value.tv_usec = 0;
-    timer.it_interval.tv_sec = 0;
-    timer.it_interval.tv_usec = 0;
-    setitimer(ITIMER_REAL, &timer, nullptr);
-    ret = VasCliResEcho::GetInstance().ExecuteCommand();
-    if (ret != VAS_OK) {
-        setitimer(ITIMER_REAL, nullptr, nullptr);
-        return ret;
-    }
-    setitimer(ITIMER_REAL, nullptr, nullptr);
-    return VAS_OK;
+    stopTimeout();
+    return ret;
 }
 } // namespace vas::common

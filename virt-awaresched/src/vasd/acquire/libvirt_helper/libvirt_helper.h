@@ -14,6 +14,7 @@
 #define LIBVIRT_HELPER_H
 
 #include <map>
+#include <mutex>
 
 #include <libvirt/libvirt.h>
 #include <libvirt/virterror.h>
@@ -90,8 +91,6 @@ private:
     static std::mutex dataMutex_;
     static VmInfoMap vmInfoMapCache;
 
-    mutable std::mutex connMutex_{};
-
     static void UpdateCache(const VmInfoMap &vmInfoMap);
     static void GetLastError();
     static void FreeDomains(virDomainPtr *domains, const size_t &domainNums);
@@ -108,13 +107,14 @@ private:
     VasRet Connect();
     void CloseConn();
     VasRet Reconnect();
-    VasRet ConnectWithoutLock();
-    void CloseConnWithoutLock();
     bool IsConnectAlive() const;
     VasRet CheckWithReconnect();
     VasRet GetDomainList(virDomainPtr *&domains, int &numDomains) const;
     VasRet RegisterDomainEvent(const virConnectDomainEventCallback &EventCallback) const;
+    VasRet ConnectLocked();
+    void CloseConnLocked();
 
+    mutable std::mutex virConnectMutex_;
     virConnectPtr virConnect{};
 };
 } // namespace vas::sched::acquire

@@ -45,9 +45,7 @@ VasRet LibvirtHelper::Init()
  */
 void LibvirtHelper::DeInit()
 {
-    if (IsConnectAlive()) {
-        CloseConn();
-    }
+    CloseConn();
 }
 
 /**
@@ -106,7 +104,7 @@ VasRet LibvirtHelper::GetVmInfoList(VmInfoMap &vmInfoMap)
  */
 VasRet LibvirtHelper::GetDomainConnByUUID(const std::string &uuid, virDomainPtr &domainConn) const
 {
-    std::lock_guard lock(connMutex_);
+    std::lock_guard<std::mutex> lock(virConnectMutex_);
     if (!virConnect) {
         LOG_ERROR("Libvirt connect is not ready. uuid=" + uuid);
         return VAS_ERROR;
@@ -188,7 +186,7 @@ VasRet LibvirtHelper::RunEventDefaultImpl(const virConnectDomainEventCallback &E
  */
 VasRet LibvirtHelper::RegisterDomainEvent(const virConnectDomainEventCallback &EventCallback) const
 {
-    std::lock_guard lock(connMutex_);
+    std::lock_guard<std::mutex> lock(virConnectMutex_);
     if (!virConnect) {
         LOG_ERROR("Libvirt connect is not ready, domain event registry failed.");
         return VAS_ERROR;
@@ -564,11 +562,11 @@ VasRet LibvirtHelper::RegisterEventDefaultImpl()
  */
 VasRet LibvirtHelper::Connect()
 {
-    std::lock_guard lock(connMutex_);
-    return ConnectWithoutLock();
+    std::lock_guard<std::mutex> lock(virConnectMutex_);
+    return ConnectLocked();
 }
 
-VasRet LibvirtHelper::ConnectWithoutLock()
+VasRet LibvirtHelper::ConnectLocked()
 {
     try {
         LOG_INFO("Start to get libvirt connect");
@@ -590,11 +588,11 @@ VasRet LibvirtHelper::ConnectWithoutLock()
  */
 void LibvirtHelper::CloseConn()
 {
-    std::lock_guard lock(connMutex_);
-    CloseConnWithoutLock();
+    std::lock_guard<std::mutex> lock(virConnectMutex_);
+    CloseConnLocked();
 }
 
-void LibvirtHelper::CloseConnWithoutLock()
+void LibvirtHelper::CloseConnLocked()
 {
     LOG_INFO("Start to close libvirt connect");
     if (!virConnect) {
@@ -611,9 +609,9 @@ void LibvirtHelper::CloseConnWithoutLock()
  */
 VasRet LibvirtHelper::Reconnect()
 {
-    std::lock_guard lock(connMutex_);
-    CloseConnWithoutLock();
-    return ConnectWithoutLock();
+    std::lock_guard<std::mutex> lock(virConnectMutex_);
+    CloseConnLocked();
+    return ConnectLocked();
 }
 
 /**
@@ -622,7 +620,7 @@ VasRet LibvirtHelper::Reconnect()
  */
 bool LibvirtHelper::IsConnectAlive() const
 {
-    std::lock_guard lock(connMutex_);
+    std::lock_guard<std::mutex> lock(virConnectMutex_);
     if (virConnect && virConnectIsAlive(virConnect) > 0) {
         return true;
     }
@@ -654,7 +652,7 @@ VasRet LibvirtHelper::CheckWithReconnect()
  */
 VasRet LibvirtHelper::GetDomainList(virDomainPtr *&domains, int &numDomains) const
 {
-    std::lock_guard lock(connMutex_);
+    std::lock_guard<std::mutex> lock(virConnectMutex_);
     if (!virConnect) {
         LOG_ERROR("Libvirt connect is not ready, get vm domain list failed.");
         return VAS_ERROR;
