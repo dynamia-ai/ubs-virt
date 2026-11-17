@@ -15,11 +15,6 @@ on:
         description: Pull request merge commit
         required: true
         type: string
-    secrets:
-      DEPENDENCY_TOKEN:
-        description: Token used to clone the private dependency repository
-        required: true
-
 env:
   PR_ID: ${{ inputs.pr_id }}
   TARGET_BRANCH: ${{ inputs.target_branch }}
@@ -204,8 +199,6 @@ stages:
               allow-unsafe-pr-checkout: true
 
           - name: Build changed modules
-            env:
-              DEPENDENCY_TOKEN: ${{ secrets.DEPENDENCY_TOKEN }}
             run: |
               set -eo pipefail
 
@@ -225,7 +218,7 @@ stages:
               )"
               echo "Changed modules: ${module_list}"
 
-              sudo dnf install -y dnf-plugins-core
+              sudo dnf install -y dnf-plugins-core curl tar
 
               for module in ${module_list}; do
                 case "${module}" in
@@ -252,13 +245,12 @@ stages:
 
                       cd vcann-rt
 
-                      GIT_TERMINAL_PROMPT=0 \
-                      git \
-                        -c credential.helper='!f() { echo "username=huangxiaojun"; echo "password=${DEPENDENCY_TOKEN}"; }; f' \
-                        clone -b main \
-                        https://gitcode.com/BeiMing_Dev/build_dependency.git
-
-                      sudo tar -zxf build_dependency/Ascend.tar.gz -C /usr/local/
+                      curl --fail --location --silent --show-error \
+                        --retry 3 --retry-delay 2 --connect-timeout 30 \
+                        --output /tmp/Ascend.tar.gz \
+                        'https://ascend-triton-open.obs.cn-north-4.myhuaweicloud.com/ubscore/Ascend.tar.gz'
+                      test -s /tmp/Ascend.tar.gz
+                      sudo tar -zxf /tmp/Ascend.tar.gz -C /usr/local/
                       sudo chmod 755 -R /usr/local/Ascend
                       ls -al /usr/local/Ascend/cann-8.5.0/lib64
 
@@ -320,8 +312,6 @@ stages:
               allow-unsafe-pr-checkout: true
 
           - name: Run DT for changed modules
-            env:
-              DEPENDENCY_TOKEN: ${{ secrets.DEPENDENCY_TOKEN }}
             run: |
               set -eo pipefail
 
@@ -391,6 +381,8 @@ stages:
 
               sudo dnf install -y \
                 dnf-plugins-core \
+                curl \
+                tar \
                 perl-Capture-Tiny \
                 patch \
                 python3-pip
@@ -428,13 +420,12 @@ stages:
 
                       cd vcann-rt
 
-                      GIT_TERMINAL_PROMPT=0 \
-                      git \
-                        -c credential.helper='!f() { echo "username=huangxiaojun"; echo "password=${DEPENDENCY_TOKEN}"; }; f' \
-                        clone -b main \
-                        https://gitcode.com/BeiMing_Dev/build_dependency.git
-
-                      sudo tar -zxf build_dependency/Ascend.tar.gz -C /usr/local/
+                      curl --fail --location --silent --show-error \
+                        --retry 3 --retry-delay 2 --connect-timeout 30 \
+                        --output /tmp/Ascend.tar.gz \
+                        'https://ascend-triton-open.obs.cn-north-4.myhuaweicloud.com/ubscore/Ascend.tar.gz'
+                      test -s /tmp/Ascend.tar.gz
+                      sudo tar -zxf /tmp/Ascend.tar.gz -C /usr/local/
                       sudo chmod 755 -R /usr/local/Ascend
 
                       source /usr/local/Ascend/cann-8.5.0/set_env.sh

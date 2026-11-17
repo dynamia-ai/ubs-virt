@@ -176,8 +176,6 @@ jobs:
     name: Build and test
     needs: [mark_running]
     uses: ./.gitcode/workflows/pr-ci.yml
-    secrets:
-      DEPENDENCY_TOKEN: ${{ secrets.DEPENDENCY_TOKEN }}
     with:
       pr_id: ${{ atomgit.event.pull_request.number }}
       target_branch: ${{ atomgit.event.pull_request.base.ref }}
