@@ -101,7 +101,7 @@ TEST_F(TestLibvirtHelper, CheckWithReconnectTest)
     EXPECT_EQ(LibvirtHelper::GetInstance().CheckWithReconnect(), VAS_OK);
     MOCKER(&LibvirtHelper::IsConnectAlive).reset();
 
-    // Reconnect holds connMutex_ and calls the *WithoutLock internals directly,
+    // Reconnect holds virConnectMutex_ and calls the *Locked internals directly,
     // so mock the libvirt C layer instead of the CloseConn/Connect members.
     MOCKER(&LibvirtHelper::IsConnectAlive).stubs().will(returnValue(false));
     MOCKER(virConnectClose).stubs().will(invoke(TestVirConnectCloseReturnZero));
@@ -278,7 +278,7 @@ TEST_F(TestLibvirtHelper, RunEventDefaultImplTest)
         .then(returnValue(VAS_ERROR));
     MOCKER(virEventRunDefaultImpl).stubs().will(invoke(VirEventRunDefaultImplError));
     MOCKER(&LibvirtHelper::IsConnectAlive).stubs().will(returnValue(false));
-    // Reconnect calls the *WithoutLock internals: mock the libvirt C layer
+    // Reconnect calls the *Locked internals: mock the libvirt C layer
     // (1st open fails -> retry loop, later opens succeed).
     MOCKER(virConnectClose).stubs().will(invoke(TestVirConnectCloseReturnZero));
     MOCKER(virConnectOpen).stubs().will(invoke(TestVirConnectOpenError)).then(invoke(TestVirConnectOpen));

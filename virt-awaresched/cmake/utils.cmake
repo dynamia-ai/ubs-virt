@@ -96,63 +96,6 @@ function(setup_coverage)
 	endif ()
 endfunction()
 
-macro(download_dep dep_name)
-	add_custom_target(build_${dep_name}
-			COMMAND bash ${PROJECT_SOURCE_DIR}/scripts/download_dep.sh ${dep_name}
-			COMMENT "Download dep ${dep_name}"
-			WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-	)
-endmacro()
-
-macro(install_lib_share lib_name)
-	file(GLOB ${lib_name}_LIBS ${PROJECT_DEPS_DIR}/${lib_name}/lib/*.so)
-	file(GLOB ${lib_name}_LINKS ${PROJECT_DEPS_DIR}/${lib_name}/lib/*.so.*)
-	install(FILES ${${lib_name}_LIBS} ${${lib_name}_LINKS} DESTINATION lib PERMISSIONS OWNER_READ)
-endmacro()
-
-macro(install_lib_static lib_name filename)
-	file(GLOB ${lib_name}_LIBS ${PROJECT_DEPS_DIR}/${lib_name}/lib/${filename})
-	file(GLOB ${lib_name}_LINKS ${PROJECT_DEPS_DIR}/${lib_name}/lib/${filename})
-	install(FILES ${${lib_name}_LIBS} ${${lib_name}_LINKS} DESTINATION lib PERMISSIONS OWNER_READ)
-endmacro()
-
-macro(install_3rd_include lib_name filename)
-	file(GLOB ${lib_name}_LIBS ${PROJECT_DEPS_DIR}/${lib_name}/include/${filename})
-	install(FILES ${${lib_name}_LIBS}
-			DESTINATION ${PROJECT_SOURCE_DIR}/output/include
-			PERMISSIONS OWNER_READ)
-endmacro()
-
-macro(install_include include_name include_header)
-	file(GLOB ${include_name}_LIBS
-			${PROJECT_SOURCE_DIR}/src/${include_name}/${include_header})
-	install(FILES ${${include_name}_LIBS}
-			DESTINATION ${PROJECT_SOURCE_DIR}/output/include
-			PERMISSIONS OWNER_READ)
-endmacro()
-
-macro(install_bin bin_name)
-	file(GLOB ${bin_name}_BINS ${PROJECT_DEPS_DIR}/${bin_name}/bin/*)
-	install(FILES ${${bin_name}_BINS}
-	       DESTINATION ${PROJECT_SOURCE_DIR}/output/bin
-		   PERMISSIONS OWNER_READ OWNER_EXECUTE)
-endmacro()
-
-macro(install_dep dep_name)
-	add_custom_target(install_${dep_name}
-			COMMAND mkdir -p ${CMAKE_SOURCE_DIR}/deps
-			COMMAND rm -rf ${dep_name}/*
-			COMMAND tar -xzf ${CMAKE_SOURCE_DIR}/.deps/${dep_name}_aarch64.tar.gz -C ${CMAKE_SOURCE_DIR}/deps
-			COMMENT "Install dep ${dep_name} into /deps/${dep_name}."
-			WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-	)
-endmacro()
-
-macro(install_lib lib_name)
-	file(GLOB ${lib_name}_LIBS "${PROJECT_DEPS_DIR}/${lib_name}/lib/*.so*" "${PROJECT_DEPS_DIR}/${lib_name}/lib64/*.so*" "${PROJECT_DEPS_DIR}/${lib_name}/lib/*.ko")
-	file(COPY ${${lib_name}_LIBS} DESTINATION ${CMAKE_BINARY_DIR}/lib/ FILE_PERMISSIONS OWNER_READ OWNER_EXECUTE)
-endmacro()
-
 macro(add_ut module)
 	set(UT_BINARY ${CMAKE_PROJECT_NAME}_${module}_ut)
 	file(GLOB_RECURSE TEST_SOURCES LIST_DIRECTORIES false

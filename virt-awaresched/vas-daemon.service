@@ -9,7 +9,7 @@ Group=root
 RestartSec=5s
 CPUQuota=100%
 MemoryLimit=128M
-ExecStart=/usr/local/vas/bin/vas_daemon start server -smt true --sched-policy affinity --dynamic-util-thresh 85 --skip-cpuset "" --range-affinity true
+ExecStart=/usr/bin/vas_daemon start server -smt true --sched-policy affinity --dynamic-util-thresh 85 --skip-cpuset "" --range-affinity true
 Restart=on-failure
 [Install]
 WantedBy=multi-user.target

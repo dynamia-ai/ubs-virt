@@ -62,25 +62,11 @@ FetchContent_Populate(_mockcpp_src)
 
 # --- Patch: apply ARM64 support patch ---
 
-# 检查是否已打过补丁（通过是否存在新增的 ARM64 文件）
-
+# 使用仓库内补丁文件，避免构建时依赖外部网络资源
 if (EXISTS "${_mockcpp_src_SOURCE_DIR}/src/JmpCodeAARCH64.h")
     message(STATUS "ARM64 patch already applied, skipping.")
 else()
-    set(PATCH_FILE_URL "https://raw.gitcode.com/openeuler/ubs-engine/blobs/b4c3419ac556a7fd9e169c67d5f05bb422c6a49e/mockcpp_support_arm64.patch")
-    set(PATCH_FILE "${_mockcpp_src_SOURCE_DIR}/mockcpp_support_arm64.patch")
-
-    message(STATUS "Downloading mockcpp patch from ${PATCH_FILE_URL}")
-    file(DOWNLOAD ${PATCH_FILE_URL} ${PATCH_FILE}
-            STATUS download_status
-            LOG download_log
-    )
-
-    list(GET download_status 0 status_code)
-    if(NOT status_code EQUAL 0)
-        list(GET download_status 1 error_message)
-        message(FATAL_ERROR "Failed to download patch: ${error_message}\nlog: ${download_log}")
-    endif()
+    set(PATCH_FILE "${CMAKE_CURRENT_LIST_DIR}/patches/mockcpp_support_arm64.patch")
 
     if(EXISTS "${PATCH_FILE}")
         message(STATUS "Applying mockcpp patch: ${PATCH_FILE}")

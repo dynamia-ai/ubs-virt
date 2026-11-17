@@ -1,64 +1,54 @@
-%global version    1.0.0
-%global release_version 2
-%global __strip /bin/true
+Name:           virt-awaresched
+Version:        1.0.0
+Release:        2%{?dist}
+Summary:        Virtual machine aware scheduling and tuning service
+License:        Mulan PSL v2
+URL:            https://gitcode.com/openeuler/ubs-virt
+Source0:        %{name}-%{version}.tar.gz
 
-Name:       ubs-virt
-Version:    1.0.0
-Release:    2
-Summary:    ubs-virt
-License:    MulanPSL2
-Source0:    %{name}.tar.gz
-Provides:      %{name}
-BuildRoot:     %{buildroot}
-ExclusiveArch: %arm64
+ExclusiveArch:  aarch64
+# Keep the package arch marked as aarch64 even when building on a cross (x86_64) host
+BuildArch:      aarch64
 
-BuildRequires:  gcc-c++ gcc cmake make
-BuildRequires:  patch libvirt-devel libboundscheck
+# Binaries are stripped (-s) at link stage; no debug info to extract
+%global debug_package %{nil}
+
+%global service_name vas-daemon.service
+
+BuildRequires:  gcc
+BuildRequires:  gcc-c++
+BuildRequires:  cmake
+BuildRequires:  make
+BuildRequires:  patch
+BuildRequires:  systemd
+BuildRequires:  libvirt-devel
+BuildRequires:  libboundscheck
 Requires:       libvirt
 Requires:       libboundscheck
-Requires:       libcap
-
-buildArch     : aarch64
-ExclusiveArch : aarch64
+Requires:       systemd
 
 %description
-ubs-virt
-
-%define service_name vas-daemon.service
-%define project_dir %{_builddir}/%{name}/virt-awaresched
-%define debug_package %{nil}
-
-%package -n virt-awaresched
-Summary: virt-awaresched
-%description -n virt-awaresched
-virt-awaresched build
+virt-awaresched (VSched) is a virtual machine aware scheduling and tuning
+service based on the Kunpeng CPU topology (numa->cluster->core->cpu).
+It contains the vas_daemon daemon and the vasctl CLI tool, which provide
+vCPU static/dynamic binding and CPU fragment consolidation to reduce
+meaningless vCPU migration and improve VM linearity. Only the aarch64
+architecture is supported for both build and runtime.
 
 %prep
-%setup -q -T -a 0 -c -n ubs-virt
+%autosetup -p1
 
 %build
-#build virt-awaresched
-if cd virt-awaresched; then
-    if ! bash build.sh; then
-        echo "[ERROR] Failed to build virt-awaresched"
-        exit 1
-    fi
-else
-    echo "[ERROR] Failed to change directory to virt-awaresched"
-    exit 1
-fi
+bash build.sh
 
 %install
-#install virt-awaresched
-mkdir -p %{buildroot}/var/log/vas
-mkdir -p %{buildroot}/usr/local/vas/bin
-mkdir -p %{buildroot}/usr/local/bin
-mkdir -p %{buildroot}/var/run/vas
-ls -l  %{buildroot}/var/run
-cp %{project_dir}/build/bin/vas_daemon %{buildroot}/usr/local/vas/bin/
-cp %{project_dir}/build/bin/vasctl %{buildroot}/usr/local/bin/
-mkdir -p %{buildroot}/usr/lib/systemd/system
-cp %{project_dir}/%{service_name} %{buildroot}/usr/lib/systemd/system/
+install -d -m 0755 %{buildroot}%{_bindir}
+install -d -m 0755 %{buildroot}%{_unitdir}
+install -p -m 0500 build/bin/vas_daemon %{buildroot}%{_bindir}/vas_daemon
+install -p -m 0500 build/bin/vasctl %{buildroot}%{_bindir}/vasctl
+install -p -m 0644 vas-daemon.service %{buildroot}%{_unitdir}/%{service_name}
+install -d -m 0750 %{buildroot}/var/log/vas
+install -d -m 0700 %{buildroot}/var/run/vas
 
 %pre
 set -e
@@ -70,15 +60,14 @@ fi
 %post
 set -e
 systemctl daemon-reload
-systemctl enable vas-daemon.service
-if ! systemctl is-active --quiet vas-daemon.service; then
-    systemctl start vas-daemon.service
+systemctl enable %{service_name}
+if ! systemctl is-active --quiet %{service_name}; then
+    systemctl start %{service_name}
 fi
 
 %preun
 set -e
 if [ "$1" -ne 0 ]; then
-    echo "skip preun"
     exit 0
 fi
 if systemctl cat %{service_name} >/dev/null 2>&1 ; then
@@ -88,36 +77,24 @@ fi
 if systemctl list-units --type=service | grep -q %{service_name}; then
     systemctl reset-failed %{service_name} || true
 fi
-service_file="/etc/systemd/system/vas-daemon.service"
-if [ -f "$service_file" ]; then
-    rm -rf $service_file
-fi
 systemctl daemon-reload
 
 %postun
 if [ "$1" -ne 0 ]; then
-    echo "skip preun"
     exit 0
 fi
-if [ -d /usr/local/vas ]; then
-    rm -rf /usr/local/vas
-fi
-if [ -d /var/run/vas ]; then
-    rm -rf /var/run/vas
-fi
+rm -rf /var/log/vas /var/run/vas
 
-%files -n virt-awaresched
-%attr(0550, root, root) %dir /usr/local/vas
-%attr(0500, root, root) %dir /usr/local/vas/bin
-%attr(0750, root, root) %dir /var/log/vas
-%attr(0700, root, root) %dir /var/run/vas
-%attr(0500, root, root) /usr/local/vas/bin/vas_daemon
-%attr(0500, root, root) /usr/local/bin/vasctl
-%attr(0644, root, root) /usr/lib/systemd/system/vas-daemon.service
+%files
+%attr(0500,root,root) %{_bindir}/vas_daemon
+%attr(0500,root,root) %{_bindir}/vasctl
+%attr(0644,root,root) %{_unitdir}/%{service_name}
+%dir %attr(0750,root,root) /var/log/vas
+%dir %attr(0700,root,root) /var/run/vas
 
 %changelog
 * Fri Apr 24 2026 Zeren Lu <luzeren@h-partners.com> - 1.0.0-2
 - Package init
 
 * Fri Apr 24 2026 Zeren Lu <luzeren@h-partners.com> - 1.0.0-1
-- 
+-

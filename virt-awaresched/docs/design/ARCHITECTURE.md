@@ -141,15 +141,16 @@
 
 | 元素                            | 类型     | owner     | 权限  | 其它说明              |
 |:------------------------------|:-------|:----------|:----|:------------------|
-| /usr/local/vas                | 目录     | root:root | 550 | 服务主目录             |
-| /usr/local/vas/bin            | 目录     | root:root | 500 | 服务可执行文件目录         |
-| /usr/local/vas/bin/vas_daemon | 可执行文件  | root:root | 500 | daemon服务可执行文件     |
-| /usr/local/bin/vasctl         | 可执行文件  | root:root | 500 | vas cli指令可执行文件    |
-| /var/log/vas                  | 目录     | root:root | 750 | 日志目录              |
-| /var/log/vas/vasd.log         | 日志文件   | root:root | 640 | 日志文件              |
-| /var/log/vas/vasd.log.1       | 归档日志文件 | root:root | 440 | 归档日志文件            |
-| /var/run/vas                  | 目录     | root:root | 700 | 运行时目录             |
-| /var/run/vas/vas_uds.sock     | uds文件  | root:root | 600 | ctl与daemon服务通信uds |
+| 元素                                        | 类型         | owner     | 权限 | 其它说明                |
+|:--------------------------------------------|:-------------|:----------|:-----|:------------------------|
+| /usr/bin/vas_daemon                         | 可执行文件   | root:root | 0500 | daemon 服务可执行文件   |
+| /usr/bin/vasctl                             | 可执行文件   | root:root | 0500 | vasctl 运维命令         |
+| /usr/lib/systemd/system/vas-daemon.service  | systemd 单元 | root:root | 0644 | 服务单元文件            |
+| /var/log/vas                                | 目录         | root:root | 0750 | 日志目录                |
+| /var/log/vas/vasd.log                       | 日志文件     | root:root | 0640 | 运行时日志文件          |
+| /var/log/vas/vasd.log.1                     | 归档日志文件 | root:root | 0440 | 归档日志文件            |
+| /var/run/vas                                | 目录         | root:root | 0700 | 运行时目录              |
+| /var/run/vas/vas_uds.sock                   | uds 文件     | root:root | 0600 | ctl与daemon服务通信uds  |
 
 ### 暴露面设计
 

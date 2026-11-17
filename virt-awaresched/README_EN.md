@@ -62,7 +62,6 @@ The build artifacts are located in the `cmake-build-*` directory, and the RPM pa
 
 ```txt
 virt-awaresched
-├── 3rdparty # Second-party/Third-party dependencies
 ├── cmake # CMake tool encapsulation
 ├── docs # Documents
 ├── scripts # Scripts for development
@@ -70,13 +69,12 @@ virt-awaresched
 ├── src # Source code directory
 │   ├── cli # CLI framework
 │   ├── include # Header file directory
-│   ├── libvirt_module # libvirt dynamic loading
 │   ├── log # Log module
 │   ├── util # Tool methods
 │   ├── vasctl # vasctl
 │   │   └── arg_parse # Binary instruction parsing
 │   └── vasd # vas-daemon
-│       ├── acquire # Information collection
+│       ├── acquire # Information collection (incl. libvirt interaction)
 │       ├── api # API
 │       ├── arg_parse # Binary instruction parsing
 │       ├── cluster_sched # Scheduling module

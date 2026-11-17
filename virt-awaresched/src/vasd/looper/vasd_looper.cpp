@@ -12,6 +12,10 @@
 
 #include "vasd_looper.h"
 
+#include <pthread.h>
+#include <signal.h>
+#include <atomic>
+
 #include "api.h"
 #include "cluster_sched.h"
 #include "conf.h"
@@ -24,27 +28,61 @@ namespace vas::sched {
 SocketServer VasdLooper::server{};
 std::thread VasdLooper::eventThread{};
 std::thread VasdLooper::timerThread{};
+std::mutex VasdLooper::stopMutex{};
 constexpr int16_t THREAD_SLEEP = 100;
 
 void VasdLooper::Run()
 {
+    sigset_t exitSignalSet{};
+    sigemptyset(&exitSignalSet);
+    sigaddset(&exitSignalSet, SIGINT);
+    sigaddset(&exitSignalSet, SIGTERM);
+    sigset_t previousSignalSet{};
+    if (pthread_sigmask(SIG_BLOCK, &exitSignalSet, &previousSignalSet) != 0) {
+        LOG_ERROR("Failed to block daemon exit signals.");
+        return;
+    }
+
     // Listening to VM events
     VmEventProcess::Run();
     // Handling Virtual Machine Queue Events
     eventThread = std::thread(&VmEventHandler);
     // Periodically organize the CPU
     timerThread = std::thread(&ClusterCompactionTimer);
+    std::atomic<bool> signalReceived{false};
+    std::thread signalThread([&exitSignalSet, &signalReceived]() {
+        int receivedSignal = 0;
+        if (sigwait(&exitSignalSet, &receivedSignal) != 0) {
+            LOG_ERROR("Failed to wait for daemon exit signal.");
+            return;
+        }
+        signalReceived.store(true);
+        LOG_INFO("Received signal " + std::to_string(receivedSignal));
+        Stop();
+    });
     // socketServer start
     StartSocketServer();
+
+    if (!signalReceived.load()) {
+        pthread_kill(signalThread.native_handle(), SIGTERM);
+    }
+    signalThread.join();
+    pthread_sigmask(SIG_SETMASK, &previousSignalSet, nullptr);
 }
 
 void VasdLooper::Stop()
 {
+    Conf::exitFlag.store(true);
+    std::lock_guard<std::mutex> lock(stopMutex);
     VmEventProcess::Stop();
     server.CloseServer();
     // join thread wait for exit
-    eventThread.join();
-    timerThread.join();
+    if (eventThread.joinable()) {
+        eventThread.join();
+    }
+    if (timerThread.joinable()) {
+        timerThread.join();
+    }
 }
 
 /**

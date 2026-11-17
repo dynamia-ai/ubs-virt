@@ -39,7 +39,7 @@ void TestVasdLooper::TearDown()
 
 void ThreadMock()
 {
-    while (!TestVasdLooper::testExitFlag.load()) {
+    while (!TestVasdLooper::testExitFlag.load() && !Conf::exitFlag.load()) {
         sleep(1);
     }
 }
@@ -105,13 +105,14 @@ VasRet SocketMsgHandlerMock(const std::string &cmd, std::string &resStr)
 TEST_F(TestVasdLooper, testRunAndStop)
 {
     MOCKER_CPP(&VmEventProcess::Run, void()).stubs().will(returnValue(nullptr));
+    MOCKER_CPP(&VmEventProcess::Stop, void()).stubs().will(returnValue(nullptr));
+    MOCKER_CPP(&SocketServer::CloseServer, void (SocketServer::*)()).stubs().will(returnValue(nullptr));
     MOCKER(VasdLooper::VmEventHandler).stubs().will(invoke(ThreadMock));
     MOCKER(VasdLooper::ClusterCompactionTimer).stubs().will(invoke(ThreadMock));
     MOCKER(VasdLooper::StartSocketServer).stubs().will(returnValue(nullptr));
     EXPECT_NO_THROW(VasdLooper::Run());
-    MOCKER_CPP(&VmEventProcess::Stop, void()).stubs().will(returnValue(nullptr));
-    MOCKER_CPP(&SocketServer::CloseServer, void (SocketServer::*)()).stubs().will(returnValue(nullptr));
     testExitFlag.store(true);
+    EXPECT_NO_THROW(VasdLooper::Stop());
     EXPECT_NO_THROW(VasdLooper::Stop());
 }
 
