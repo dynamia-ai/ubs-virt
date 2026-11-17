@@ -139,7 +139,7 @@ static int mcs_do_init(int32_t dev_id)
 
     LOG_INFO("Memory quota=%d MB", g_mcs_config.memory_quota);
 
-    LOG_INFO("Initialized vNPU %d, priority=%d, limited aicube=%d", g_vnpu_id, g_mcs_config.vnpu_priority,
+    LOG_INFO("Initialized vNPU %d, vnpu_priority=%d, limited aicube=%d", g_vnpu_id, g_mcs_config.vnpu_priority,
              mcs_get_limited_aicube());
 
     g_mcs_initialized = 1;

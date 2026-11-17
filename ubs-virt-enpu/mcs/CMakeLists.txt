@@ -53,3 +53,11 @@ target_link_options(mcs PRIVATE
 )
 
 target_compile_options(mcs PRIVATE ${COMPILE_OPTIONS})
+
+option(BUILD_TESTS "Build tests" OFF)
+option(ENABLE_COVERAGE "Enable coverage reporting" OFF)
+
+if(BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(test)
+endif()

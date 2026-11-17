@@ -25,7 +25,6 @@ mcs_config_t g_mcs_config;
 #define MCS_CONFIG_KEY_AICORE_QUOTA "aicore-quota"
 #define MCS_CONFIG_KEY_MEMORY_QUOTA "memory-quota"
 #define MCS_CONFIG_KEY_VNPU_PRIORITY "vnpu_priority"
-#define MCS_CONFIG_KEY_PRIORITY_LEGACY "priority" /* deprecated, accepted for old configs */
 #define MCS_CONFIG_KEY_SHM_ID "shm-id"
 #define MCS_MAX_LINE_LENGTH 256
 
@@ -179,23 +178,6 @@ int mcs_load_config(const char *file_path, mcs_config_t *cfg)
             if (mcs_parse_int32(value, &prio) != 0 || prio < 0 || prio > 1) {
                 fprintf(stderr, "[MCS] FATAL: invalid vnpu_priority '%s' (must be 0 or 1) - refusing to start\n",
                         value);
-                (void)fclose(fp);
-                (void)memset(cfg, 0, sizeof(*cfg));
-                return -1;
-            }
-            cfg->vnpu_priority = (uint8_t)prio;
-        } else if (strcmp(key, MCS_CONFIG_KEY_PRIORITY_LEGACY) == 0) {
-            /* Deprecated key: still accepted so existing deployments keep
-             * working; if both keys appear, the last one in the file wins.
-             * Same strict validation as vnpu_priority. */
-            static int legacy_warned = 0;
-            int32_t prio = 0;
-            if (!legacy_warned) {
-                legacy_warned = 1;
-                fprintf(stderr, "[MCS] warning: config key 'priority' is deprecated, use 'vnpu_priority' instead\n");
-            }
-            if (mcs_parse_int32(value, &prio) != 0 || prio < 0 || prio > 1) {
-                fprintf(stderr, "[MCS] FATAL: invalid priority '%s' (must be 0 or 1) - refusing to start\n", value);
                 (void)fclose(fp);
                 (void)memset(cfg, 0, sizeof(*cfg));
                 return -1;

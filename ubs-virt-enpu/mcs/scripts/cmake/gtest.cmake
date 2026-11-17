@@ -1,0 +1,36 @@
+# -----------------------------------------------------------------------------------------------------------
+# Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
+# ubs-virt-enpu is licensed under Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#          http://license.coscl.org.cn/MulanPSL2
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+# -----------------------------------------------------------------------------------------------------------
+
+include(FetchContent)
+
+set(BUILD_GMOCK ON CACHE BOOL "" FORCE)
+set(BUILD_GTEST ON CACHE BOOL "" FORCE)
+set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+set(GOOGLETEST_URL "https://gitcode.com/cann-src-third-party/googletest/releases/download/v1.14.0/googletest-1.14.0.tar.gz")
+
+message(STATUS "Downloading googletest src from ${GOOGLETEST_URL}")
+
+if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.24)
+    FetchContent_Declare(
+        googletest
+        URL ${GOOGLETEST_URL}
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    )
+else()
+    FetchContent_Declare(
+        googletest
+        URL ${GOOGLETEST_URL}
+    )
+endif()
+
+FetchContent_MakeAvailable(googletest)
